@@ -1,10 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage } from "@langchain/core/messages";
+import type { ChatResult } from "@langchain/core/outputs";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import { isTurnInFlight } from "@/graph/inflight";
 import {
   FOLLOWUP_SKIP_SENTINEL,
   isNudgeSilent,
@@ -284,6 +288,56 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(outcome).toBe("messaged");
     expect(s.messages).toEqual([[900, "Pagamento confirmado!"]]);
     expect(s.notes).toEqual([]);
+  });
+
+  // A follow-up invokes on the SAME memory thread a reactive turn does, so it is the second producer
+  // of the compaction claim (src/graph/inflight.ts). Left unclaimed, a compaction firing while a
+  // nudge is thinking has its rewrite undone the moment the nudge finishes, because an invoke saves
+  // the state it loaded when it started.
+  test("claims the memory thread while its invoke holds it", async () => {
+    const contactInboxId = 8802;
+    await seedConv(909, null, new Date(), contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const claimedDuringInvoke: boolean[] = [];
+    class ObservingModel extends BaseChatModel {
+      constructor() {
+        super({});
+      }
+      _llmType() {
+        return "fake-observing";
+      }
+      async _generate(): Promise<ChatResult> {
+        claimedDuringInvoke.push(isTurnInFlight(graphThreadId));
+        return {
+          generations: [
+            { text: "Tudo certo?", message: new AIMessage("Tudo certo?") },
+          ],
+        };
+      }
+    }
+    const s = stub();
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:909`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new ObservingModel(),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("messaged");
+    expect(claimedDuringInvoke).toEqual([true]);
+    // Released on every exit, or compaction for this contact defers itself forever.
+    expect(isTurnInFlight(graphThreadId)).toBe(false);
   });
 
   test("invokes on the per-contact-inbox memory thread, not the per-conversation thread (unification)", async () => {

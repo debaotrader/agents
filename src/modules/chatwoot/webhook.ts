@@ -833,23 +833,31 @@ async function maybeConsumeCommandOrGate(params: {
     // their own threads), which matches where the operator typed /reset.
     if (ctx.conv.contactInboxId !== null) {
       const contactInboxId = ctx.conv.contactInboxId;
-      await step("deleteThread", "memória", async () => {
-        const cp = await getCheckpointer();
-        await cp.deleteThread(
-          contactInboxThreadId(tenantId, instanceId, contactInboxId),
-        );
-      });
-      // Both deletions under the lock a compaction takes to write its summary row, so a job already
-      // CLAIMED (past cancelPendingJob, provider call in flight) cannot slip its row in between the
-      // two: it either wrote before this ran — and this deletes it — or it finds the AgentThread row
-      // gone and drops the summary. Without the shared lock that is a race the reset loses, and the
-      // memory an operator explicitly cleared comes back on the next compaction.
-      await step("clear agent-thread marker", "memória", () =>
+      // ALL THREE deletions under the lock a compaction takes, and in one step, because a reset that
+      // clears them in separate critical sections loses to a job already CLAIMED (past
+      // cancelPendingJob, provider call in flight):
+      //
+      //   - the summary rows and the AgentThread marker, or the job slips its row in between the two
+      //     and the next compaction renders memory this reset cleared;
+      //   - the CHECKPOINT itself, or the job's rewrite recreates the thread — with the memory head
+      //     in it — right after this deleted it, and nothing deletes it again. That one is the worst
+      //     of the three, because the operator sees the reset confirmed and the agent keeps
+      //     answering from the memory they just cleared.
+      //
+      // Under the shared lock the job either finished before this ran (and this deletes everything it
+      // wrote) or it finds the AgentThread row gone and drops the summary. The checkpointer call is a
+      // separate connection, which is exactly why the advisory lock — and not the transaction — is
+      // what serializes here.
+      await step("clear agent memory", "memória", () =>
         runScopedOn(base, sysCtx(tenantId), (db) =>
           withEntityLock(
             db,
             `ingest:${contactInboxThreadId(tenantId, instanceId, contactInboxId)}`,
             async () => {
+              const cp = await getCheckpointer();
+              await cp.deleteThread(
+                contactInboxThreadId(tenantId, instanceId, contactInboxId),
+              );
               await db.attendanceSummary.deleteMany({
                 where: {
                   tenantId,

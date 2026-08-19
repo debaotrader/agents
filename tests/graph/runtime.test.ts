@@ -8,6 +8,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import { isTurnInFlight } from "@/graph/inflight";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -472,6 +473,66 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // The customer's own message is untouched by the marker.
     expect(String(messages[3]?.content)).not.toContain("nova conversa");
     expect(String(messages[3]?.content)).toBe(String(messages[0]?.content));
+  });
+
+  // The producer half of the memory-compaction guard. The consumer half (a compaction that finds the
+  // thread claimed stands down) is pinned in tests/modules/memory-compaction.test.ts; nothing there
+  // proves a turn ever CLAIMS it, and the two only meet if both name the same key — so this computes
+  // the key the same way compaction does, from contactInboxThreadId.
+  //
+  // Why it matters that the claim covers the invoke specifically: a LangGraph invoke saves the state
+  // it loaded when it started, so a compaction rewriting the channel in the middle of one is undone
+  // the moment the turn finishes, and the raw history it had replaced comes back.
+  test("a turn claims the memory thread for as long as its invoke holds it", async () => {
+    const contact = await suDb.contact.create({
+      data: { tenantId, chatwootContactId: 557, name: "Cliente" },
+      select: { id: true },
+    });
+    const contactInboxId = 7003;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 975,
+        contactInboxId,
+        status: "pending",
+        contactId: contact.id,
+        threadId: `${tenantId}:${instanceId}:975`,
+        lastEventAt: new Date(),
+      },
+    });
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const claimedDuringInvoke: boolean[] = [];
+    class ObservingModel {
+      async invoke(_messages: unknown[]) {
+        claimedDuringInvoke.push(isTurnInFlight(graphThreadId));
+        return new AIMessage(REPLY);
+      }
+      bindTools(_tools: unknown) {
+        return { invoke: (m: unknown[]) => this.invoke(m) };
+      }
+    }
+
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 975 }),
+      base: appDb,
+      deps: {
+        makeModel: () => new ObservingModel() as never,
+        makeClient: makeStubClient([]),
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(claimedDuringInvoke).toEqual([true]);
+    // And released on the way out, or compaction for this contact would defer itself forever.
+    expect(isTurnInFlight(graphThreadId)).toBe(false);
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {

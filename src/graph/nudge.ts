@@ -2,6 +2,7 @@ import { HumanMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
@@ -17,6 +18,7 @@ import {
 } from "@/modules/service-window/service";
 import { resolveGraphThreadId, threadBelongsToTenant } from "./checkpointer";
 import { lastAssistantText } from "./graph";
+import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -480,25 +482,43 @@ export async function runAgentNudge(
     callbacks,
   };
 
-  // A suspended interrupt (human-in-the-loop) must not be barged over — defer the nudge.
-  try {
-    const state = await graph.getState(invokeConfig);
-    const pendingInterrupt = (state?.tasks ?? []).some(
-      (t) => (t.interrupts?.length ?? 0) > 0,
-    );
-    if (pendingInterrupt) return "deferred";
-  } catch {
-    // No prior checkpoint / state unavailable → proceed.
-  }
-
-  // 4. Invoke with the normalized event as a HUMAN turn. It must NOT be a SystemMessage: the agent
-  // node already prepends the one-and-only system prompt, and a second system message in the thread
-  // makes strict providers (Google) reject the call ("System messages are only permitted as the
-  // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
-  const result = await graph.invoke(
-    { messages: [new HumanMessage(renderNudge(params.nudge, canMessagePre))] },
-    invokeConfig,
+  // Claim the graph thread against a memory-compaction rewrite for as long as this invoke is reading
+  // and writing the channel. Same reasoning as the reactive turn (see ./inflight): an invoke saves
+  // the state it loaded, so a rewrite that lands in the middle of one is undone when it finishes,
+  // and the raw history it replaced comes back. The mark is taken under the lock the rewrite holds,
+  // which is what makes the two exclusive rather than merely staggered, and released in the `finally`
+  // below — the window only has to cover the invoke, since nothing after it writes the thread.
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+      markTurnInFlight(graphThreadId);
+    }),
   );
+  let result: Awaited<ReturnType<typeof graph.invoke>>;
+  try {
+    // A suspended interrupt (human-in-the-loop) must not be barged over — defer the nudge.
+    try {
+      const state = await graph.getState(invokeConfig);
+      const pendingInterrupt = (state?.tasks ?? []).some(
+        (t) => (t.interrupts?.length ?? 0) > 0,
+      );
+      if (pendingInterrupt) return "deferred";
+    } catch {
+      // No prior checkpoint / state unavailable → proceed.
+    }
+
+    // 4. Invoke with the normalized event as a HUMAN turn. It must NOT be a SystemMessage: the agent
+    // node already prepends the one-and-only system prompt, and a second system message in the thread
+    // makes strict providers (Google) reject the call ("System messages are only permitted as the
+    // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
+    result = await graph.invoke(
+      {
+        messages: [new HumanMessage(renderNudge(params.nudge, canMessagePre))],
+      },
+      invokeConfig,
+    );
+  } finally {
+    clearTurnInFlight(graphThreadId);
+  }
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
   const replyRaw = lastAssistantText(result.messages);

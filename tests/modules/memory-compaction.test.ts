@@ -4,13 +4,21 @@ import {
   AIMessage,
   type BaseMessage,
   HumanMessage,
+  RemoveMessage,
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
-import { MemorySaver } from "@langchain/langgraph";
+import {
+  END,
+  MemorySaver,
+  MessagesAnnotation,
+  START,
+  StateGraph,
+} from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
 import { CONVERSATION_DIVIDER, MEMORY_HEAD_OPEN } from "@/graph/markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
@@ -403,6 +411,151 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     const after = await readThread(saver, threadId);
     expect(after).toContain("mensagem que chegou no meio da reescrita");
     expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
+  });
+
+  // The measured fact the in-flight guard is built on, pinned here so it stays checkable. A LangGraph
+  // invoke is a read-modify-write of the WHOLE message channel: it saves the state it loaded when it
+  // started, plus its own messages. A rewrite that lands in the middle of one is therefore not merged
+  // — it is UNDONE the moment the turn finishes, and the raw history it replaced comes back.
+  test("a rewrite that lands mid-invoke is undone when the turn finishes", async () => {
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, 5020);
+    const cfg = { configurable: { thread_id: threadId } };
+    let release = () => {};
+    const modelIsThinking = new Promise<void>((r) => {
+      release = r;
+    });
+    // Stands in for the agent graph: one node that takes as long as a generation does.
+    const turnGraph = new StateGraph(MessagesAnnotation)
+      .addNode("agent", async () => {
+        await modelIsThinking;
+        return {
+          messages: [new AIMessage({ id: "ai-1", content: "resposta" })],
+        };
+      })
+      .addEdge(START, "agent")
+      .addEdge("agent", END)
+      .compile({ checkpointer: saver });
+
+    await seedThread(saver, threadId, [
+      new HumanMessage({ id: "m1", content: `pedido antigo, ${SEEDED_TEXT}` }),
+      new AIMessage({ id: "m2", content: "combinado" }),
+      new HumanMessage({ id: "m3", content: CONVERSATION_DIVIDER }),
+    ]);
+
+    const turn = turnGraph.invoke(
+      { messages: [new HumanMessage({ id: "m4", content: "oi de novo" })] },
+      cfg,
+    );
+    // Let the invoke load the channel before the rewrite touches it.
+    await new Promise((r) => setTimeout(r, 30));
+
+    const plain = buildThreadStateGraph(saver);
+    await plain.updateState(
+      cfg,
+      {
+        messages: [
+          new HumanMessage({
+            id: "m1",
+            content: `${MEMORY_HEAD_OPEN}resumo</atendimentos-anteriores>`,
+          }),
+          new RemoveMessage({ id: "m2" }),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    expect((await readThread(saver, threadId))[0]).toStartWith(
+      MEMORY_HEAD_OPEN,
+    );
+
+    release();
+    await turn;
+
+    const after = await readThread(saver, threadId);
+    expect(after[0]).not.toStartWith(MEMORY_HEAD_OPEN);
+    // Not merely "the head is gone": the raw turns it had replaced are back, which is what would
+    // make the next cut summarize them a second time.
+    expect(after[0]).toContain(SEEDED_TEXT);
+    expect(after).toContain("combinado");
+  });
+
+  test("a turn already in flight defers the job instead of paying for it", async () => {
+    const contactInboxId = 5021;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const saver = new MemorySaver();
+    await seedThread(saver, threadId, twoAttendances());
+    const model = new SummarizerModel("resumo");
+
+    markTurnInFlight(threadId);
+    let result: Awaited<ReturnType<typeof runCompaction>>;
+    try {
+      result = await runCompaction(
+        tenantId,
+        payload(contactInboxId, 720, "new_attendance"),
+        appDb,
+        { checkpointer: saver, makeModel: () => model },
+      );
+    } finally {
+      // The registry is module-global: a leak here would silently disable compaction for every test
+      // that follows.
+      clearTurnInFlight(threadId);
+    }
+
+    expect(result.outcome).toBe("reschedule");
+    // Deferred BEFORE the generation, not after: the reply the model would have written is thrown
+    // away by the locked check anyway, and the tenant would have been billed for it.
+    expect(model.calls).toBe(0);
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(0);
+    expect(await readThread(saver, threadId)).toEqual(
+      twoAttendances().map((m) => String(m.content)),
+    );
+  });
+
+  test("a turn that starts while the summarizer runs is caught by the locked check", async () => {
+    const contactInboxId = 5022;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    // Fires on the job's FIRST checkpoint read, which is past the cheap pre-check and before the
+    // locked one — exactly the window a turn starting mid-summarization occupies. `armed` keeps the
+    // hook out of the seeding above it: seedThread reads the checkpoint too, and a mark set there
+    // would be caught by the pre-check and prove nothing about the locked one.
+    let armed = false;
+    const saver = new HookedSaver(1, async () => {
+      if (armed) markTurnInFlight(threadId);
+    });
+    await seedThread(saver, threadId, twoAttendances());
+    saver.calls = 0;
+    armed = true;
+    const model = new SummarizerModel("resumo do atendimento");
+
+    let result: Awaited<ReturnType<typeof runCompaction>>;
+    try {
+      result = await runCompaction(
+        tenantId,
+        payload(contactInboxId, 721, "new_attendance"),
+        appDb,
+        { checkpointer: saver, makeModel: () => model },
+      );
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+
+    expect(result.outcome).toBe("reschedule");
+    // The thread is left exactly as the turn found it. Rewriting here is what the turn would undo.
+    expect(await readThread(saver, threadId)).toEqual(
+      twoAttendances().map((m) => String(m.content)),
+    );
+    // The summary was already generated and committed before the rewrite could be attempted, and it
+    // stays: that is what makes the deferred attempt free instead of a second generation.
+    const rows = await suDb.attendanceSummary.findMany({
+      where: { tenantId, contactInboxId },
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.summary).toBe("resumo do atendimento");
+    expect(model.calls).toBe(1);
   });
 
   test("a resolve that was undone inside the grace window does not compact", async () => {

@@ -336,90 +336,6 @@ export async function runLoadedTurn(
     conversationId,
     loaded.contactInboxId,
   );
-  // ── Attendance boundary. A NEW conversation reusing this contact-inbox thread gets the
-  //    "fresh attendance" divider, and the attendance it replaced becomes compactable.
-  //
-  //    Claimed ATOMICALLY, and the divider written as its own message rather than smuggled into the
-  //    customer's turn text, because the three things have to be all-or-nothing:
-  //
-  //      - Two deliveries for the same new conversation can run at once (debounce off is the common
-  //        setup). Both would read the same marker and both would prepend a divider; compaction cuts
-  //        at the LAST one, so the first exchange of the OPEN attendance would be summarized away as
-  //        if it had ended. The lock — the same one ingestion takes on this thread — makes exactly
-  //        one turn the claimant.
-  //      - The marker must not advance without the divider landing. It used to advance here while
-  //        the divider only reached the checkpointer if the invoke ran, so an input guardrail that
-  //        answered before the model, or a throw, left a boundary nothing could ever find again.
-  //        Writing the divider inside the claim removes the dependency on the turn succeeding.
-  //      - And with the divider durable at claim time, compaction can be armed right here instead of
-  //        waiting for the invoke.
-  //
-  //    The divider being its own message (the ingestion mechanism, same graph) is also why the
-  //    guardrails now see the customer's raw words on BOTH directions: there is no longer a turn text
-  //    carrying a system marker the customer never wrote.
-  if (loaded.contactInboxId != null) {
-    const contactInboxId = loaded.contactInboxId;
-    const checkpointerForDivider =
-      params.deps?.checkpointer ?? (await getCheckpointer());
-    const dividerGraph = buildThreadStateGraph(checkpointerForDivider);
-    const closedConversationId = await runScopedOn(
-      base,
-      sysCtx(tenantId),
-      (db) =>
-        withEntityLock(db, `ingest:${graphThreadId}`, async () => {
-          // Per-THREAD marker (AgentThread keyed by contact-inbox): a different display_id ⇒ a new
-          // conversation reusing the thread. Per-thread and not per-contact, so a multi-channel
-          // contact never gets a spurious divider from activity on another channel.
-          const key = {
-            tenantId_chatwootInstanceId_contactInboxId: {
-              tenantId,
-              chatwootInstanceId: instanceId,
-              contactInboxId,
-            },
-          };
-          const existing = await db.agentThread.findUnique({
-            where: key,
-            select: { lastConversationId: true },
-          });
-          const prev = existing?.lastConversationId ?? null;
-          if (prev === conversationId) return null;
-          const boundary = prev !== null;
-          if (boundary) {
-            await dividerGraph.updateState(
-              { configurable: { thread_id: graphThreadId } },
-              { messages: [new HumanMessage(CONVERSATION_DIVIDER)] },
-              THREAD_STATE_NODE,
-            );
-          }
-          await db.agentThread.upsert({
-            where: key,
-            create: {
-              tenantId,
-              chatwootInstanceId: instanceId,
-              contactInboxId,
-              threadId: graphThreadId,
-              lastConversationId: conversationId,
-            },
-            update: { lastConversationId: conversationId },
-          });
-          return boundary ? (prev as number) : null;
-        }),
-    );
-    if (closedConversationId !== null) {
-      // Outside the lock: this opens its own transaction, and nesting one inside an advisory-lock
-      // transaction would hold that lock across a second connection's work.
-      await armCompaction({
-        tenantId,
-        instanceId,
-        contactInboxId,
-        conversationId: closedConversationId,
-        agentId: loaded.agentId,
-        reason: "new_attendance",
-        enabled: loaded.memoryCompaction,
-        base,
-      });
-    }
-  }
 
   // The live "agent is working" indicator on the per-tenant realtime channel:
   // `started` before the first token (instant feedback), `step` events from the
@@ -526,6 +442,97 @@ export async function runLoadedTurn(
   // Mark this conversation's turn as in-flight so a concurrently-fired follow-up backs off instead
   // of nudging mid-turn (cleared in the finally on every exit). See ./inflight.
   markTurnInFlight(threadId);
+  // ── Attendance boundary. A NEW conversation reusing this contact-inbox thread gets the
+  //    "fresh attendance" divider, and the attendance it replaced becomes compactable.
+  //
+  //    Claimed ATOMICALLY, and the divider written as its own message rather than smuggled into the
+  //    customer's turn text, because the three things have to be all-or-nothing:
+  //
+  //      - Two deliveries for the same new conversation can run at once (debounce off is the common
+  //        setup). Both would read the same marker and both would prepend a divider; compaction cuts
+  //        at the LAST one, so the first exchange of the OPEN attendance would be summarized away as
+  //        if it had ended. The lock — the same one ingestion takes on this thread — makes exactly
+  //        one turn the claimant.
+  //      - The marker must not advance without the divider landing. It used to advance here while
+  //        the divider only reached the checkpointer if the invoke ran, so an input guardrail that
+  //        answered before the model, or a throw, left a boundary nothing could ever find again.
+  //        Writing the divider inside the claim removes the dependency on the turn succeeding.
+  //      - And with the divider durable at claim time, compaction can be armed right here instead of
+  //        waiting for the invoke.
+  //
+  //    The divider being its own message (the ingestion mechanism, same graph) is also why the
+  //    guardrails now see the customer's raw words on BOTH directions: there is no longer a turn text
+  //    carrying a system marker the customer never wrote.
+  if (loaded.contactInboxId != null) {
+    const contactInboxId = loaded.contactInboxId;
+    const checkpointerForDivider =
+      params.deps?.checkpointer ?? (await getCheckpointer());
+    const dividerGraph = buildThreadStateGraph(checkpointerForDivider);
+    const closedConversationId = await runScopedOn(
+      base,
+      sysCtx(tenantId),
+      (db) =>
+        withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+          // Per-THREAD marker (AgentThread keyed by contact-inbox): a different display_id ⇒ a new
+          // conversation reusing the thread. Per-thread and not per-contact, so a multi-channel
+          // contact never gets a spurious divider from activity on another channel.
+          const key = {
+            tenantId_chatwootInstanceId_contactInboxId: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+            },
+          };
+          const existing = await db.agentThread.findUnique({
+            where: key,
+            select: { lastConversationId: true },
+          });
+          // Claim the thread against a memory-compaction rewrite, under the lock the rewrite also
+          // holds while it checks. That makes the two exclusive rather than merely staggered: the
+          // rewrite either completes before this claim — and the invoke below then loads the
+          // rewritten channel — or it finds the thread claimed and stands down. Claimed for EVERY
+          // turn, not only the ones that cross a boundary, because what has to be excluded is the
+          // invoke, and every turn has one. Released in the `finally` below, on every exit.
+          markTurnInFlight(graphThreadId);
+          const prev = existing?.lastConversationId ?? null;
+          if (prev === conversationId) return null;
+          const boundary = prev !== null;
+          if (boundary) {
+            await dividerGraph.updateState(
+              { configurable: { thread_id: graphThreadId } },
+              { messages: [new HumanMessage(CONVERSATION_DIVIDER)] },
+              THREAD_STATE_NODE,
+            );
+          }
+          await db.agentThread.upsert({
+            where: key,
+            create: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+              threadId: graphThreadId,
+              lastConversationId: conversationId,
+            },
+            update: { lastConversationId: conversationId },
+          });
+          return boundary ? (prev as number) : null;
+        }),
+    );
+    if (closedConversationId !== null) {
+      // Outside the lock: this opens its own transaction, and nesting one inside an advisory-lock
+      // transaction would hold that lock across a second connection's work.
+      await armCompaction({
+        tenantId,
+        instanceId,
+        contactInboxId,
+        conversationId: closedConversationId,
+        agentId: loaded.agentId,
+        reason: "new_attendance",
+        enabled: loaded.memoryCompaction,
+        base,
+      });
+    }
+  }
   try {
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. On a violation,
     // send the configured template / a guardrails-generated safe reply and skip the graph, or stay
@@ -754,6 +761,7 @@ export async function runLoadedTurn(
     return "posted";
   } finally {
     clearTurnInFlight(threadId);
+    clearTurnInFlight(graphThreadId);
     status.finished(deliveredBalloons);
   }
 }

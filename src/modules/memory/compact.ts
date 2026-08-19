@@ -7,6 +7,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
+import { isTurnInFlight } from "@/graph/inflight";
 import { createChatModel } from "@/graph/models";
 import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
@@ -32,6 +33,23 @@ import { summarizeAttendance } from "./summarize";
 // ever waits on the summarizer.
 
 const GRACE_ON_RESOLVE_MS = 15 * 60_000;
+
+// How long to wait out a turn that is reading the thread right now. Short, because the only thing
+// being waited on is one generation finishing, and the deferred attempt costs a handful of reads: the
+// summary row is already durable by then, so nothing is generated twice.
+const DEFER_ON_TURN_MS = 60_000;
+
+function deferForTurn(graphThreadId: string, where: string): JobResult {
+  logger.info(
+    "memory: a turn is in flight (thread=%s, %s), deferring compaction",
+    graphThreadId,
+    where,
+  );
+  return {
+    outcome: "reschedule",
+    runAt: new Date(Date.now() + DEFER_ON_TURN_MS),
+  };
+}
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -230,6 +248,13 @@ export async function runCompaction(
     loaded.lastConversationId === null ||
     loaded.lastConversationId === conversationId;
 
+  // A turn holding this thread will undo the rewrite below, so there is nothing to gain by reading
+  // its channel now. Checked here as well as under the lock because this side is what avoids PAYING
+  // for a summary that the locked check would then discard; the locked one is what makes it correct.
+  if (isTurnInFlight(graphThreadId)) {
+    return deferForTurn(graphThreadId, "before reading the thread");
+  }
+
   const checkpointer = deps.checkpointer ?? (await getCheckpointer());
   const graph = buildThreadStateGraph(checkpointer);
   const threadCfg = { configurable: { thread_id: graphThreadId } };
@@ -351,6 +376,17 @@ export async function runCompaction(
     // It is NOT the whole story: a graph TURN writes to this thread without taking any lock, which
     // is why the update below names the messages it removes instead of clearing the channel.
     withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+      // The check that actually makes this safe. A graph invoke is a read-modify-write of the WHOLE
+      // message channel — it saves the state it loaded at the start plus its own messages — so a
+      // rewrite that lands while one is running is silently undone the moment it finishes: the raw
+      // turns come back, the memory head disappears, and the next cut summarizes a segment that ends
+      // one message later, writing a SECOND row that says the same thing. Removing messages by id
+      // does not help, because the loser here is this whole checkpoint, not individual writes.
+      //
+      // Turns mark themselves under this same lock (src/graph/runtime.ts, src/graph/nudge.ts), so
+      // reading the registry from inside it is exclusive: either no turn has started reading, or
+      // this attempt stands down and comes back.
+      if (isTurnInFlight(graphThreadId)) return "busy" as const;
       const fresh = await graph.getState(threadCfg);
       const current = ((
         fresh.values as { messages?: BaseMessage[] } | undefined
@@ -408,6 +444,9 @@ export async function runCompaction(
       return "ok" as const;
     }),
   );
+  if (rewrite === "busy") {
+    return deferForTurn(graphThreadId, "at the rewrite");
+  }
   if (rewrite === "changed") {
     return { outcome: "fail", error: "thread changed during compaction" };
   }
