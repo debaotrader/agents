@@ -1,3 +1,4 @@
+import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import {
   type BaseMessage,
@@ -111,6 +112,10 @@ export function renderTranscript(messages: BaseMessage[]): string {
 export async function summarizeAttendance(
   model: BaseChatModel,
   messages: BaseMessage[],
+  // Usage + trace handlers. This is a BILLED generation like any other, and one that runs without a
+  // customer waiting on it, which is exactly how a model call ends up invisible in the cost report:
+  // nobody notices a missing row on a call nobody is watching.
+  callbacks?: BaseCallbackHandler[],
 ): Promise<AttendanceSummaryResult> {
   const transcript = renderTranscript(messages);
   // NOTE: An attendance whose messages carry no text at all (only tool traffic) has nothing to
@@ -129,7 +134,10 @@ export async function summarizeAttendance(
             `${TRANSCRIPT_TAG}\n${transcript}\n${TRANSCRIPT_CLOSE}`,
           ),
         ],
-        { signal: AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS) },
+        {
+          signal: AbortSignal.timeout(SUMMARIZE_TIMEOUT_MS),
+          ...(callbacks ? { callbacks } : {}),
+        },
       ),
     );
     const text = contentToText(res.content).trim();

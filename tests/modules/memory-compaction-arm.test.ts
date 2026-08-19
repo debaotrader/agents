@@ -237,12 +237,12 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     expect(jobs).toBe(1);
   });
 
-  // The OTHER arm: a new attendance opening on the thread. Its ordering is the whole finding — the
-  // job looks for the divider, and the divider only reaches the checkpointer when the turn's invoke
-  // writes it. Armed before that, a due-now job can be claimed first, find no boundary, and retire
-  // itself as a no-op; the input guardrail makes it deterministic rather than a race, because it can
-  // return before the graph is invoked at all.
-  test("the boundary arm happens only after the divider is persisted", async () => {
+  // The OTHER arm: a new attendance opening on the thread. What matters is not WHEN it is armed but
+  // that the boundary the job looks for is already durable when the job exists — otherwise the
+  // scheduler can claim a due-now job, find nothing, and retire it as a no-op, and that attendance
+  // is never compacted. The divider is written as its own message inside the claim, so the property
+  // holds from the moment the job is enqueued.
+  test("the boundary is already in the thread by the time the job exists", async () => {
     const contactInboxId = 62_500;
     const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
     const checkpointer = new MemorySaver();
@@ -256,25 +256,31 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
       getMessages: async () => [],
     } as unknown as ChatwootClient;
 
-    // Asserted from INSIDE the model call, which is the only place that can tell the two orderings
-    // apart: at this point the invoke has not returned, so an arm placed before it would already
-    // have left a row.
+    // Sampled from INSIDE the model call, which is the earliest point a job could be claimed by the
+    // scheduler running in this same process: whatever it finds there, the boundary must already be
+    // findable. `throwOnce` forces the exit where the turn never produces a reply at all.
     let jobsAtModelTime = -1;
+    let dividerAtModelTime = false;
+    let throwOnce = false;
+    const sample = async () => {
+      jobsAtModelTime = await suDb.schedulerJob.count({
+        where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
+      });
+      const cp = await checkpointer.get({
+        configurable: { thread_id: threadId },
+      });
+      const msgs = ((
+        cp?.channel_values as { messages?: { content: unknown }[] } | undefined
+      )?.messages ?? []) as { content: unknown }[];
+      dividerAtModelTime = msgs.some((m) =>
+        String(m.content).startsWith(CONVERSATION_DIVIDER),
+      );
+      if (throwOnce) throw new Error("provider exploded");
+      return new AIMessage("Claro!");
+    };
     const model = {
-      invoke: async () => {
-        jobsAtModelTime = await suDb.schedulerJob.count({
-          where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
-        });
-        return new AIMessage("Claro!");
-      },
-      bindTools: (_t: unknown) => ({
-        invoke: async () => {
-          jobsAtModelTime = await suDb.schedulerJob.count({
-            where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
-          });
-          return new AIMessage("Claro!");
-        },
-      }),
+      invoke: sample,
+      bindTools: (_t: unknown) => ({ invoke: sample }),
     };
 
     const turn = (convId: number, messageId: number) =>
@@ -327,9 +333,11 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
       }),
     ).toBe(0);
 
-    // Second attendance on the same thread: the divider rides in, and the job is armed after it.
+    // Second attendance on the same thread: the boundary is claimed, and by the time anything could
+    // observe the job, the divider it looks for is already in the thread.
     expect(await turn(502, 9002)).toBe("posted");
-    expect(jobsAtModelTime).toBe(0);
+    expect(jobsAtModelTime).toBe(1);
+    expect(dividerAtModelTime).toBe(true);
     const job = await suDb.schedulerJob.findFirst({
       where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
     });
@@ -338,7 +346,27 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     expect(boundaryPayload.reason).toBe("new_attendance");
     expect(boundaryPayload.conversationId).toBe(501);
 
-    // And by the time that job exists, the boundary it looks for is really in the thread.
+    // A third attendance whose turn never produces a reply: the boundary must survive anyway. It
+    // used to advance the marker and depend on the invoke to write the divider, so a guardrail that
+    // answered before the model — or a throw, as here — left an attendance nothing could ever find
+    // the boundary of again.
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 503,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:503`,
+        lastEventAt: new Date(),
+      },
+    });
+    await suDb.schedulerJob.deleteMany({
+      where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
+    });
+    throwOnce = true;
+    await expect(turn(503, 9003)).rejects.toThrow();
+
     const cp = await checkpointer.get({
       configurable: { thread_id: threadId },
     });
@@ -346,8 +374,96 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
       cp?.channel_values as { messages?: { content: unknown }[] } | undefined
     )?.messages ?? []) as { content: unknown }[];
     expect(
-      messages.some((m) => String(m.content).startsWith(CONVERSATION_DIVIDER)),
-    ).toBe(true);
+      messages.filter((m) => String(m.content).startsWith(CONVERSATION_DIVIDER))
+        .length,
+    ).toBe(2);
+    const afterThrow = await suDb.schedulerJob.findFirst({
+      where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
+    });
+    expect(afterThrow).not.toBeNull();
+    const afterThrowPayload = (afterThrow?.payload ?? {}) as Record<
+      string,
+      unknown
+    >;
+    expect(afterThrowPayload.conversationId).toBe(502);
+  });
+
+  // Two deliveries for the same new conversation can run at once — debounce off is the common setup,
+  // and a burst is what a customer on WhatsApp actually sends. Both transactions read the marker
+  // before either advances it, so without a lock both claim the boundary and both write a divider.
+  // Compaction cuts at the LAST one, which would summarize away the first exchange of the attendance
+  // that is still open: the agent forgets what the customer just said.
+  test("two turns racing on the same new conversation write ONE divider", async () => {
+    const contactInboxId = 63_500;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const checkpointer = new MemorySaver();
+    const client = {
+      sendMessage: async () => ({}),
+      toggleTyping: async () => ({}),
+      getMessages: async () => [],
+    } as unknown as ChatwootClient;
+    const model = {
+      invoke: async () => new AIMessage("Claro!"),
+      bindTools: (_t: unknown) => ({
+        invoke: async () => new AIMessage("Claro!"),
+      }),
+    };
+    const turn = (convId: number, messageId: number) =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: {
+          event: "message_created",
+          conversationId: convId,
+          inboxId: INBOX_ID,
+          status: "pending",
+          assigneeType: null,
+          assigneeId: null,
+          assigneeName: null,
+          contactInboxId,
+          message: {
+            id: messageId,
+            content: "oi",
+            messageType: "incoming",
+            private: false,
+          },
+        } as NormalizedChatwootEvent,
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer,
+        },
+      });
+
+    for (const convId of [601, 602]) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+    }
+    await turn(601, 9101);
+    // Two deliveries of the NEW conversation, in flight together.
+    await Promise.all([turn(602, 9102), turn(602, 9103)]);
+
+    const cp = await checkpointer.get({
+      configurable: { thread_id: threadId },
+    });
+    const messages = ((
+      cp?.channel_values as { messages?: { content: unknown }[] } | undefined
+    )?.messages ?? []) as { content: unknown }[];
+    expect(
+      messages.filter((m) => String(m.content).startsWith(CONVERSATION_DIVIDER))
+        .length,
+    ).toBe(1);
   });
 
   // The dedupeKey is the THREAD, so one row serves every attendance this contact will ever have.

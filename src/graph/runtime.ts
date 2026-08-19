@@ -4,6 +4,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -33,7 +34,11 @@ import { armCompaction } from "@/modules/memory/compact";
 import { deliverReply } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
-import { chatwootThreadId, resolveGraphThreadId } from "./checkpointer";
+import {
+  chatwootThreadId,
+  getCheckpointer,
+  resolveGraphThreadId,
+} from "./checkpointer";
 import { lastAssistantText } from "./graph";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { CONVERSATION_DIVIDER } from "./markers";
@@ -47,6 +52,7 @@ import {
   loadAgentConfig,
 } from "./prepare";
 import { AgentStatusReporter } from "./status";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { ToolFlowLogger } from "./tool-flowlog";
 import type { McpLoadDeps } from "./tools/mcp";
 import { buildNativeTools, type TurnState } from "./tools/native";
@@ -330,36 +336,61 @@ export async function runLoadedTurn(
     conversationId,
     loaded.contactInboxId,
   );
-  let turnText = text;
-  // The conversation that closed when a new one took over this thread, held until the divider that
-  // marks the boundary is actually persisted (see below).
-  let pendingCompaction: number | null = null;
+  // ── Attendance boundary. A NEW conversation reusing this contact-inbox thread gets the
+  //    "fresh attendance" divider, and the attendance it replaced becomes compactable.
+  //
+  //    Claimed ATOMICALLY, and the divider written as its own message rather than smuggled into the
+  //    customer's turn text, because the three things have to be all-or-nothing:
+  //
+  //      - Two deliveries for the same new conversation can run at once (debounce off is the common
+  //        setup). Both would read the same marker and both would prepend a divider; compaction cuts
+  //        at the LAST one, so the first exchange of the OPEN attendance would be summarized away as
+  //        if it had ended. The lock — the same one ingestion takes on this thread — makes exactly
+  //        one turn the claimant.
+  //      - The marker must not advance without the divider landing. It used to advance here while
+  //        the divider only reached the checkpointer if the invoke ran, so an input guardrail that
+  //        answered before the model, or a throw, left a boundary nothing could ever find again.
+  //        Writing the divider inside the claim removes the dependency on the turn succeeding.
+  //      - And with the divider durable at claim time, compaction can be armed right here instead of
+  //        waiting for the invoke.
+  //
+  //    The divider being its own message (the ingestion mechanism, same graph) is also why the
+  //    guardrails now see the customer's raw words on BOTH directions: there is no longer a turn text
+  //    carrying a system marker the customer never wrote.
   if (loaded.contactInboxId != null) {
     const contactInboxId = loaded.contactInboxId;
-    // The conversation that CLOSED when this new one took over the thread, or null when this turn
-    // is not crossing an attendance boundary. Its raw turns are what compaction folds away.
+    const checkpointerForDivider =
+      params.deps?.checkpointer ?? (await getCheckpointer());
+    const dividerGraph = buildThreadStateGraph(checkpointerForDivider);
     const closedConversationId = await runScopedOn(
       base,
       sysCtx(tenantId),
-      async (db) => {
-        // Per-THREAD divider marker (AgentThread keyed by contact-inbox): compare the last
-        // conversation that ran on THIS thread. A different display_id ⇒ a new conversation reusing
-        // the thread ⇒ inject the "fresh attendance" divider. Tracking it per-thread (not per-contact)
-        // means a multi-channel contact never gets a spurious divider from activity on another channel.
-        const key = {
-          tenantId_chatwootInstanceId_contactInboxId: {
-            tenantId,
-            chatwootInstanceId: instanceId,
-            contactInboxId,
-          },
-        };
-        const existing = await db.agentThread.findUnique({
-          where: key,
-          select: { lastConversationId: true },
-        });
-        const prev = existing?.lastConversationId ?? null;
-        // Advance the marker to the current conversation (idempotent within one conversation).
-        if (prev !== conversationId) {
+      (db) =>
+        withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+          // Per-THREAD marker (AgentThread keyed by contact-inbox): a different display_id ⇒ a new
+          // conversation reusing the thread. Per-thread and not per-contact, so a multi-channel
+          // contact never gets a spurious divider from activity on another channel.
+          const key = {
+            tenantId_chatwootInstanceId_contactInboxId: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+            },
+          };
+          const existing = await db.agentThread.findUnique({
+            where: key,
+            select: { lastConversationId: true },
+          });
+          const prev = existing?.lastConversationId ?? null;
+          if (prev === conversationId) return null;
+          const boundary = prev !== null;
+          if (boundary) {
+            await dividerGraph.updateState(
+              { configurable: { thread_id: graphThreadId } },
+              { messages: [new HumanMessage(CONVERSATION_DIVIDER)] },
+              THREAD_STATE_NODE,
+            );
+          }
           await db.agentThread.upsert({
             where: key,
             create: {
@@ -371,18 +402,22 @@ export async function runLoadedTurn(
             },
             update: { lastConversationId: conversationId },
           });
-        }
-        return prev != null && prev !== conversationId ? prev : null;
-      },
+          return boundary ? (prev as number) : null;
+        }),
     );
     if (closedConversationId !== null) {
-      turnText = `${CONVERSATION_DIVIDER}\n\n${text}`;
-      // NOTE: The compaction arm for this boundary happens AFTER the invoke, not here. The divider
-      // is what the compaction job looks for, and it only reaches the checkpointer when the invoke
-      // writes this turn — an arm placed here is due immediately, so the scheduler can claim it
-      // first, find no boundary and retire the job as a no-op. The input guardrail makes that
-      // deterministic rather than a race: it can return before the graph is ever invoked.
-      pendingCompaction = closedConversationId;
+      // Outside the lock: this opens its own transaction, and nesting one inside an advisory-lock
+      // transaction would hold that lock across a second connection's work.
+      await armCompaction({
+        tenantId,
+        instanceId,
+        contactInboxId,
+        conversationId: closedConversationId,
+        agentId: loaded.agentId,
+        reason: "new_attendance",
+        enabled: loaded.memoryCompaction,
+        base,
+      });
     }
   }
 
@@ -495,7 +530,7 @@ export async function runLoadedTurn(
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. On a violation,
     // send the configured template / a guardrails-generated safe reply and skip the graph, or stay
     // silent (send nothing). null ⇒ nothing tripped, proceed as normal.
-    const inGuard = await runGuardrail("input", turnText);
+    const inGuard = await runGuardrail("input", text);
     if (inGuard) {
       if (inGuard.reply !== null) {
         // NOTE: The guardrail reply is a post like any other, so it claims the trigger through the
@@ -525,30 +560,13 @@ export async function runLoadedTurn(
       },
       () =>
         graph.invoke(
-          { messages: [new HumanMessage(turnText)] },
+          { messages: [new HumanMessage(text)] },
           {
             configurable: { thread_id: graphThreadId },
             callbacks: [...callbacks, status, toolLogger],
           },
         ),
     );
-    // The divider is now in the thread (the invoke persisted this turn), so the boundary the
-    // compaction job looks for exists. A new attendance starting is proof the previous one ended,
-    // whether or not anyone ever resolved it in Chatwoot, which is why this arm exists next to the
-    // resolve one. It only enqueues; the summarizing runs on the scheduler, after the reply.
-    if (pendingCompaction !== null && loaded.contactInboxId !== null) {
-      await armCompaction({
-        tenantId,
-        instanceId,
-        contactInboxId: loaded.contactInboxId,
-        conversationId: pendingCompaction,
-        agentId: loaded.agentId,
-        reason: "new_attendance",
-        enabled: loaded.memoryCompaction,
-        base,
-      });
-    }
-
     let reply = lastAssistantText(result.messages).trim();
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during

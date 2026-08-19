@@ -8,7 +8,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
 import { createChatModel } from "@/graph/models";
-import { loadAgentConfig } from "@/graph/prepare";
+import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
@@ -192,7 +192,7 @@ export async function runCompaction(
           contactInboxId,
         },
       },
-      select: { lastConversationId: true },
+      select: { id: true, lastConversationId: true },
     });
     const cfg = await loadAgentConfig(db, {
       tenantId,
@@ -202,7 +202,11 @@ export async function runCompaction(
       threadId: graphThreadId,
     });
     if (!cfg) return null;
-    return { cfg, lastConversationId: thread?.lastConversationId ?? null };
+    return {
+      cfg,
+      lastConversationId: thread?.lastConversationId ?? null,
+      threadRowId: thread?.id ?? null,
+    };
   });
   if (loaded === "off" || loaded === "reopened" || loaded === null) {
     return { outcome: "done" };
@@ -258,9 +262,44 @@ export async function runCompaction(
     });
     // Outside every lock: this is a provider round-trip, and holding a Postgres advisory lock across
     // the wire would block ingestion on this thread for as long as the model takes.
-    const result = await summarizeAttendance(model, cut.closed);
+    // The same usage/trace handlers a turn's generation carries, with its own node label: this call
+    // is billed to the tenant, and with compaction on by default it happens once per attendance
+    // across every agent. Left off, the cost report would say the feature is free.
+    const result = await summarizeAttendance(
+      model,
+      cut.closed,
+      buildCallbacks(cfg, {
+        tenantId,
+        threadId: graphThreadId,
+        node: "memory_compact",
+        model: cfg.mc.model,
+        source: "inbox",
+        base,
+      }),
+    );
     if (result.error) return { outcome: "fail", error: result.error };
     summary = result.summary;
+  }
+
+  // The reset fence. `cancelPendingJob` only reaches a job still PENDING, so a compaction already
+  // CLAIMED — provider call in flight — outlives a /reset that ran a second ago. It would then write
+  // a row the reset had just deleted, and a later compaction would render that row back into the
+  // thread as memory the operator explicitly cleared.
+  //
+  // /reset deletes the AgentThread row, and the next message recreates it with a NEW id, so the id
+  // this job started with IS the generation token: it exists already, it costs one indexed read, and
+  // it cannot be forgotten in a place a new column would have to be threaded through.
+  if (loaded.threadRowId !== null) {
+    const stillThere = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.agentThread.count({ where: { id: loaded.threadRowId as bigint } }),
+    );
+    if (stillThere === 0) {
+      logger.info(
+        "memory: thread was reset while compacting (thread=%s), dropping the summary",
+        graphThreadId,
+      );
+      return { outcome: "done" };
+    }
   }
 
   // The row is committed BEFORE the thread is rewritten, on purpose. The two failure orders are not

@@ -15,6 +15,7 @@ import { CONVERSATION_DIVIDER, MEMORY_HEAD_OPEN } from "@/graph/markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { UsageReportingModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -567,6 +568,86 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect((await readThread(saverB, threadId))[0]).toContain(
       "resumo do atendimento",
     );
+  });
+
+  // A billed generation that nobody is waiting on is exactly how model spend goes missing from the
+  // cost report: no customer notices, no latency shows up, and with compaction on by default this
+  // runs once per closed attendance across every agent.
+  test("the summary generation is billed to the tenant like any other", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5013;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await seedThread(saver, threadId, twoAttendances());
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, 712, "new_attendance"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new UsageReportingModel(["resumo"]),
+      },
+    );
+
+    // UsageCapture persists fire-and-forget, like the flow lines.
+    let usage = null;
+    for (let i = 0; i < 40 && !usage; i++) {
+      usage = await suDb.llmUsage.findFirst({
+        where: { tenantId, threadId, node: "memory_compact" },
+      });
+      if (!usage) await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(usage).not.toBeNull();
+    expect(usage?.promptTokens).toBeGreaterThan(0);
+    expect(usage?.completionTokens).toBeGreaterThan(0);
+  });
+
+  // cancelPendingJob only reaches a job still PENDING, so a compaction already claimed — provider
+  // call in flight — outlives the /reset that ran a second ago. Writing its row anyway would restore
+  // memory the operator explicitly deleted, with nothing to say where it came from.
+  test("a reset that lands mid-compaction stops the summary from being written", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5014;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await seedThread(saver, threadId, twoAttendances());
+    await suDb.agentThread.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId,
+        lastConversationId: 713,
+      },
+    });
+
+    const before = await readThread(saver, threadId);
+    const res = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 713, "new_attendance"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () =>
+          // /reset deletes the AgentThread row; the id this job started with is the generation token.
+          new SummarizerModel("resumo", async () => {
+            await suDb.agentThread.deleteMany({
+              where: {
+                tenantId,
+                chatwootInstanceId: instanceId,
+                contactInboxId,
+              },
+            });
+          }),
+      },
+    );
+
+    expect(res).toEqual({ outcome: "done" });
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(0);
+    expect(await readThread(saver, threadId)).toEqual(before);
   });
 
   test("the switch is honored at execution, not only at arming time", async () => {

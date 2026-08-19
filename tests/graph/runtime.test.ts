@@ -453,8 +453,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(after.lastConversationId).toBe(921);
 
-    // Both turns share ONE per-contact-inbox thread (continuity); only conv 921's human turn carries
-    // the divider so the model treats it as a fresh attendance.
+    // Both turns share ONE per-contact-inbox thread (continuity), and the boundary between them is
+    // its OWN message rather than a prefix on the customer's words: the divider is written when the
+    // boundary is claimed, so it survives a turn that never reaches the model, and the customer's
+    // message reaches the guardrails as the customer actually wrote it.
     const cp = await saver.get({
       configurable: {
         thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
@@ -463,9 +465,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const messages = ((
       cp?.channel_values as { messages?: Array<{ content: unknown }> }
     )?.messages ?? []) as Array<{ content: unknown }>;
-    expect(messages.length).toBe(4); // HumanA, AIReplyA, HumanB(+divider), AIReplyB
+    // HumanA, AIReplyA, DIVIDER, HumanB, AIReplyB
+    expect(messages.length).toBe(5);
     expect(String(messages[0]?.content)).not.toContain("nova conversa");
     expect(String(messages[2]?.content)).toContain("nova conversa");
+    // The customer's own message is untouched by the marker.
+    expect(String(messages[3]?.content)).not.toContain("nova conversa");
+    expect(String(messages[3]?.content)).toBe(String(messages[0]?.content));
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {
