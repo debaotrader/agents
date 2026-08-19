@@ -257,8 +257,10 @@ describe.skipIf(!dbUp)(
           chatwootInstanceId: instanceId,
           contactInboxId: 301,
           conversationId: 999,
+          lastMessageId: "msg-abc",
           summary: "orçamento de R$ 250 aprovado",
           messageCount: 4,
+          attendanceAt: new Date(),
         },
       });
       // A compaction armed on a resolve waits out a grace window, so at any moment there can be one

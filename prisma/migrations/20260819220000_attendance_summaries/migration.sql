@@ -8,8 +8,10 @@ CREATE TABLE "attendance_summaries" (
     "chatwoot_instance_id" BIGINT NOT NULL,
     "contact_inbox_id" INTEGER NOT NULL,
     "conversation_id" INTEGER NOT NULL,
+    "last_message_id" TEXT NOT NULL,
     "summary" TEXT NOT NULL,
     "message_count" INTEGER NOT NULL,
+    "attendance_at" TIMESTAMP(3) NOT NULL,
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL,
 
@@ -20,7 +22,7 @@ CREATE TABLE "attendance_summaries" (
 CREATE INDEX "attendance_summaries_tenant_id_chatwoot_instance_id_contact_idx" ON "attendance_summaries"("tenant_id", "chatwoot_instance_id", "contact_inbox_id");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "attendance_summaries_tenant_id_chatwoot_instance_id_contact_key" ON "attendance_summaries"("tenant_id", "chatwoot_instance_id", "contact_inbox_id", "conversation_id");
+CREATE UNIQUE INDEX "attendance_summaries_tenant_id_chatwoot_instance_id_contact_key" ON "attendance_summaries"("tenant_id", "chatwoot_instance_id", "contact_inbox_id", "conversation_id", "last_message_id");
 
 -- AddForeignKey
 ALTER TABLE "attendance_summaries" ADD CONSTRAINT "attendance_summaries_tenant_id_fkey" FOREIGN KEY ("tenant_id") REFERENCES "tenants"("id") ON DELETE CASCADE ON UPDATE CASCADE;

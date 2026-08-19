@@ -556,16 +556,29 @@ model AttendanceSummary {
   // attendances waiting (compaction newly enabled, or a run that kept failing), one row covers the
   // whole backlog and carries the display_id of the most recent closed one.
   conversationId     Int      @map("conversation_id")
+  // The graph message id of the LAST turn this row summarized, and the reason a row is a SEGMENT of
+  // an attendance rather than the whole of it. A conversation can be resolved, compacted, reopened by
+  // the customer and resolved again: the second cut carries only the new turns, so keying on the
+  // conversation alone would either replace the first summary with a description of the tail or
+  // reuse the first for turns it never saw. Both lose half the attendance. Keyed on this, the second
+  // pass writes its own row and both segments survive; a RETRY of the same cut finds the same id and
+  // costs nothing.
+  lastMessageId      String   @map("last_message_id")
   summary            String
   // How many raw messages this row replaced, for the turn trail. Never any of their text.
   messageCount       Int      @map("message_count")
+  // When the attendance itself happened (the mirrored conversation's last event), NOT when the job
+  // ran. Compaction can run months after the fact — the boundary trigger fires only when the contact
+  // comes back — and dating the memory by the job would tell the model a returning customer's
+  // history happened today.
+  attendanceAt       DateTime @map("attendance_at")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
 
-  @@unique([tenantId, chatwootInstanceId, contactInboxId, conversationId])
+  @@unique([tenantId, chatwootInstanceId, contactInboxId, conversationId, lastMessageId])
   @@index([tenantId, chatwootInstanceId, contactInboxId])
   @@map("attendance_summaries")
 }

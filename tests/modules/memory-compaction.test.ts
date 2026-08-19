@@ -525,47 +525,56 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(after[2]).toBe("Oi! Como posso ajudar?");
   });
 
-  // The row is committed before the rewrite, so a job that dies after summarizing comes back with
-  // the summary already stored. Paying the provider again for the same attendance is what the unique
-  // key was supposed to prevent, and the key alone does not prevent it.
   test("a retry reuses the stored summary instead of generating a second one", async () => {
     const contactInboxId = 5012;
     const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
-    const model = new SummarizerModel("resumo do atendimento");
 
-    // First attempt: the rewrite is sabotaged (the thread is reset mid-summary), so it fails AFTER
-    // the row was written.
-    const saverA = new MemorySaver();
-    await seedThread(saverA, threadId, twoAttendances());
-    const sabotaged = new SummarizerModel("resumo do atendimento", async () => {
-      await saverA.deleteThread(threadId);
-    });
-    const first = await runCompaction(
-      tenantId,
-      payload(contactInboxId, 711, "new_attendance"),
-      appDb,
-      { checkpointer: saverA, makeModel: () => sabotaged },
-    );
-    expect(first.outcome).toBe("fail");
-    expect(sabotaged.calls).toBe(1);
+    // ONE thread across both attempts, which is what a retry actually is. The row is committed before
+    // the rewrite, so a checkpointer that fails right after it leaves exactly the state the scheduler
+    // comes back to — and the message ids the reuse is keyed on are the same ones.
+    let failNextWrite = false;
+    class FlakyWriteSaver extends MemorySaver {
+      // biome-ignore lint/suspicious/noExplicitAny: mirrors the saver's own loose typing
+      override async put(...args: any[]): Promise<any> {
+        if (failNextWrite) {
+          failNextWrite = false;
+          throw new Error("checkpointer write failed");
+        }
+        // biome-ignore lint/suspicious/noExplicitAny: forwarding the saver's own signature
+        return (super.put as any)(...args);
+      }
+    }
+    const saver = new FlakyWriteSaver();
+    await seedThread(saver, threadId, twoAttendances());
+
+    const first = new SummarizerModel("resumo do atendimento");
+    failNextWrite = true;
+    await expect(
+      runCompaction(
+        tenantId,
+        payload(contactInboxId, 711, "new_attendance"),
+        appDb,
+        { checkpointer: saver, makeModel: () => first },
+      ),
+    ).rejects.toThrow();
+    expect(first.calls).toBe(1);
     expect(
       await suDb.attendanceSummary.count({
         where: { tenantId, contactInboxId },
       }),
     ).toBe(1);
 
-    // The retry finds the same cut and the stored row, and must not call the model again.
-    const saverB = new MemorySaver();
-    await seedThread(saverB, threadId, twoAttendances());
-    const second = await runCompaction(
+    // The retry finds the same cut, the same last message id and the stored row: no second bill.
+    const second = new SummarizerModel("NUNCA CHAMADO");
+    const res = await runCompaction(
       tenantId,
       payload(contactInboxId, 711, "new_attendance"),
       appDb,
-      { checkpointer: saverB, makeModel: () => model },
+      { checkpointer: saver, makeModel: () => second },
     );
-    expect(second).toEqual({ outcome: "done" });
-    expect(model.calls).toBe(0);
-    expect((await readThread(saverB, threadId))[0]).toContain(
+    expect(res).toEqual({ outcome: "done" });
+    expect(second.calls).toBe(0);
+    expect((await readThread(saver, threadId))[0]).toContain(
       "resumo do atendimento",
     );
   });
@@ -648,6 +657,96 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       }),
     ).toBe(0);
     expect(await readThread(saver, threadId)).toEqual(before);
+  });
+
+  // A resolved conversation can be reopened by the customer and resolved again — ordinary Chatwoot,
+  // and with compaction on by default it happens after the first pass already compacted it. The
+  // second cut carries only the new turns, so a row keyed on the conversation alone would either
+  // replace the first summary with a description of the tail or reuse the first for turns it never
+  // saw. Both delete the new turns and lose half the attendance.
+  test("a reopened attendance keeps the memory of its first half", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5015;
+    const conversationId = 714;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    await seedThread(saver, threadId, [
+      new HumanMessage("quero marcar, quanto custa?"),
+      new AIMessage("R$ 250, terça 08:30."),
+    ]);
+    const args = (m: SummarizerModel) =>
+      [
+        tenantId,
+        payload(contactInboxId, conversationId, "resolved"),
+        appDb,
+        { checkpointer: saver, makeModel: () => m },
+      ] as const;
+
+    await runCompaction(...args(new SummarizerModel("Combinou R$ 250 terça.")));
+    expect((await readThread(saver, threadId)).length).toBe(1);
+
+    // Reopened: two more turns land on the SAME conversation, then it is resolved again.
+    await seedThread(saver, threadId, [
+      new HumanMessage("na verdade preciso mudar para quinta"),
+      new AIMessage("Remarquei para quinta 10:00."),
+    ]);
+    await runCompaction(...args(new SummarizerModel("Remarcou para quinta.")));
+
+    const rows = await suDb.attendanceSummary.findMany({
+      where: { tenantId, contactInboxId },
+      orderBy: { id: "asc" },
+    });
+    expect(rows.length).toBe(2);
+    const head = (await readThread(saver, threadId))[0] ?? "";
+    // Both halves are still in the memory the model will read.
+    expect(head).toContain("Combinou R$ 250 terça.");
+    expect(head).toContain("Remarcou para quinta.");
+  });
+
+  // The boundary trigger fires only when the contact comes back, which can be months later. Dating a
+  // memory by the job that wrote it tells the model a returning customer's whole history happened
+  // today, and a model that believes that will answer as if it did.
+  test("the memory is dated by the attendance, not by the job that summarized it", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5016;
+    const conversationId = 715;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const longAgo = new Date(Date.UTC(2026, 1, 3, 15, 0, 0));
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: longAgo,
+      },
+    });
+    await seedThread(saver, threadId, twoAttendances());
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "new_attendance"),
+      appDb,
+      { checkpointer: saver, makeModel: () => new SummarizerModel("resumo") },
+    );
+
+    const row = await suDb.attendanceSummary.findFirst({
+      where: { tenantId, contactInboxId },
+    });
+    expect(row?.attendanceAt.toISOString()).toBe(longAgo.toISOString());
+    expect((await readThread(saver, threadId))[0]).toContain(
+      '<atendimento data="2026-02-03">',
+    );
   });
 
   test("the switch is honored at execution, not only at arming time", async () => {

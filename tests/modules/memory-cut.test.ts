@@ -157,7 +157,7 @@ describe("renderMemoryHead", () => {
   const row = (n: number, summary: string) => ({
     conversationId: n,
     summary,
-    createdAt: new Date(Date.UTC(2026, 7, 10 + n)),
+    attendanceAt: new Date(Date.UTC(2026, 7, 10 + n)),
   });
 
   test("no rows means no head at all", () => {

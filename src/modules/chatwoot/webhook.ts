@@ -16,6 +16,7 @@ import {
 import { ingestMessageIntoThread } from "@/graph/ingest";
 import { runAgentTurn } from "@/graph/runtime";
 import { AppError, UnauthorizedError } from "@/lib/errors";
+import { withEntityLock } from "@/lib/locks";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { shouldRunReset } from "@/modules/agents/test-mode";
 import {
@@ -838,35 +839,47 @@ async function maybeConsumeCommandOrGate(params: {
           contactInboxThreadId(tenantId, instanceId, contactInboxId),
         );
       });
+      // Both deletions under the lock a compaction takes to write its summary row, so a job already
+      // CLAIMED (past cancelPendingJob, provider call in flight) cannot slip its row in between the
+      // two: it either wrote before this ran — and this deletes it — or it finds the AgentThread row
+      // gone and drops the summary. Without the shared lock that is a race the reset loses, and the
+      // memory an operator explicitly cleared comes back on the next compaction.
       await step("clear agent-thread marker", "memória", () =>
         runScopedOn(base, sysCtx(tenantId), (db) =>
-          db.agentThread.deleteMany({
-            where: { tenantId, chatwootInstanceId: instanceId, contactInboxId },
-          }),
+          withEntityLock(
+            db,
+            `ingest:${contactInboxThreadId(tenantId, instanceId, contactInboxId)}`,
+            async () => {
+              await db.attendanceSummary.deleteMany({
+                where: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  contactInboxId,
+                },
+              });
+              await db.agentThread.deleteMany({
+                where: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  contactInboxId,
+                },
+              });
+            },
+          ),
         ),
       );
       // The compacted memory of past attendances lives in its own table, not in the thread, so
       // deleting the thread alone would resurrect every one of them on the next compaction (the head
-      // is rendered from these rows). "Starts this channel's conversation over" has to include them.
-      //
-      // The pending job goes first, and that order is the point: a compaction armed on a resolve
-      // waits out a grace window, so at any moment there can be one sitting in the queue holding the
-      // conversation this reset is clearing. Left alone it would fire minutes later, summarize
-      // whatever the thread has by then and write a fresh row — memory the operator explicitly
-      // deleted, back again with no trace of where it came from.
+      // is rendered from these rows). "Starts this channel's conversation over" has to include them,
+      // and the PENDING job that would write more of them: a compaction armed on a resolve waits out
+      // a grace window, so at any moment one can be sitting in the queue holding the conversation
+      // this reset is clearing.
       await step("cancel pending compaction", "memória", () =>
         cancelPendingJob(
           tenantId,
           "MEMORY_COMPACT",
           contactInboxThreadId(tenantId, instanceId, contactInboxId),
           base,
-        ),
-      );
-      await step("clear attendance summaries", "memória", () =>
-        runScopedOn(base, sysCtx(tenantId), (db) =>
-          db.attendanceSummary.deleteMany({
-            where: { tenantId, chatwootInstanceId: instanceId, contactInboxId },
-          }),
         ),
       );
     }

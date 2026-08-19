@@ -92,7 +92,10 @@ const FENCE_TAG = /<\s*\/?\s*(atendimento|atendimentos-anteriores)[^>]*>/gi;
 export interface SummaryRow {
   conversationId: number;
   summary: string;
-  createdAt: Date;
+  // When the ATTENDANCE happened, not when its summary was written. Compaction can run months after
+  // the fact, and a memory dated by the job would tell the model a returning customer's history
+  // happened today.
+  attendanceAt: Date;
 }
 
 // Renders the compacted memory as the thread's first message. Ordered oldest-first, which is how the
@@ -103,7 +106,7 @@ export function renderMemoryHead(rows: SummaryRow[]): HumanMessage | null {
     .map((r) => {
       const text = r.summary.replace(FENCE_TAG, "").trim();
       if (!text) return null;
-      const date = r.createdAt.toISOString().slice(0, 10);
+      const date = r.attendanceAt.toISOString().slice(0, 10);
       return `<atendimento data="${date}">\n${text}\n</atendimento>`;
     })
     .filter((e): e is string => e !== null);

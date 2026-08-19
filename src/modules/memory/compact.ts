@@ -179,6 +179,16 @@ export async function runCompaction(
       });
       if (conv && conv.status !== "resolved") return "reopened" as const;
     }
+    const mirrored = await db.conversation.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: conversationId,
+        },
+      },
+      select: { lastEventAt: true },
+    });
     // Which conversation the thread is on RIGHT NOW. The resolve trigger waits out a grace window,
     // and a contact can open a new attendance inside it: the resolved conversation stays resolved,
     // so the status check above passes, and treating the whole thread as closed would summarize the
@@ -206,6 +216,10 @@ export async function runCompaction(
       cfg,
       lastConversationId: thread?.lastConversationId ?? null,
       threadRowId: thread?.id ?? null,
+      // When the attendance actually happened. The boundary trigger fires only when the contact
+      // comes back, which can be months later, so the job's own clock would date a returning
+      // customer's whole history to today.
+      attendanceAt: mirrored?.lastEventAt ?? null,
     };
   });
   if (loaded === "off" || loaded === "reopened" || loaded === null) {
@@ -226,32 +240,34 @@ export async function runCompaction(
   const cut = selectClosedPrefix(messages, {
     currentAttendanceClosed: reason === "resolved" && attendanceIsCurrent,
   });
-  // GUARANTEE 3 of 3 against compacting twice: this is not a flag anyone has to remember to check.
-  // After a compaction the thread holds the head plus the open attendance, so a second run finds an
-  // empty closed chunk and stops HERE, before spending a generation. Running the job twice costs a
-  // state read.
-  if (cut.closed.length === 0) return { outcome: "done" };
-
+  // What this row will be a summary OF: the last turn in the cut. It is the segment's identity, and
+  // the reason a reopened conversation does not lose half its memory — a second cut on the same
+  // conversation carries different turns, so it writes its OWN row instead of replacing or reusing
+  // the first. A RETRY of the same cut lands on the same id and costs nothing.
+  //
+  // Absent, it also carries GUARANTEE 3 of 3 against compacting twice, and not as a flag anyone has
+  // to remember to check: after a compaction the thread holds the head plus the open attendance, so
+  // a second run finds an empty closed chunk, has no last turn, and stops HERE — before the model,
+  // before the row, before the rewrite. Running the job twice costs one state read.
+  const lastMessageId = cut.closed.at(-1)?.id;
+  if (!lastMessageId) return { outcome: "done" };
   const summaryKey = {
-    tenantId_chatwootInstanceId_contactInboxId_conversationId: {
+    tenantId_chatwootInstanceId_contactInboxId_conversationId_lastMessageId: {
       tenantId,
       chatwootInstanceId: instanceId,
       contactInboxId,
       conversationId,
+      lastMessageId,
     },
   };
-  // A retry must not pay for a second generation. The row is committed before the rewrite, so a job
-  // that failed AFTER summarizing comes back with the summary already stored: reuse it. The count is
-  // the identity check — a reopened attendance that grew before closing again has a different cut,
-  // and reusing a summary written from fewer messages would delete the rest without describing it.
   const existing = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.attendanceSummary.findUnique({
       where: summaryKey,
-      select: { summary: true, messageCount: true },
+      select: { summary: true },
     }),
   );
   let summary: string;
-  if (existing && existing.messageCount === cut.closed.length) {
+  if (existing) {
     summary = existing.summary;
   } else {
     const makeModel = deps.makeModel ?? createChatModel;
@@ -281,48 +297,53 @@ export async function runCompaction(
     summary = result.summary;
   }
 
-  // The reset fence. `cancelPendingJob` only reaches a job still PENDING, so a compaction already
-  // CLAIMED — provider call in flight — outlives a /reset that ran a second ago. It would then write
-  // a row the reset had just deleted, and a later compaction would render that row back into the
-  // thread as memory the operator explicitly cleared.
+  // The row is committed BEFORE the thread is rewritten, on purpose. The two failure orders are not
+  // equally bad: a row written whose rewrite never lands means the same turns get summarized again
+  // later and the memory says something twice, while a rewrite that lands with no row means the
+  // attendance is simply gone. Duplicated memory is recoverable by reading it; lost memory is not.
   //
-  // /reset deletes the AgentThread row, and the next message recreates it with a NEW id, so the id
-  // this job started with IS the generation token: it exists already, it costs one indexed read, and
-  // it cannot be forgotten in a place a new column would have to be threaded through.
-  if (loaded.threadRowId !== null) {
-    const stillThere = await runScopedOn(base, sysCtx(tenantId), (db) =>
-      db.agentThread.count({ where: { id: loaded.threadRowId as bigint } }),
+  // The reset fence sits in the SAME transaction, under the SAME lock /reset takes. `cancelPendingJob`
+  // only reaches a job still PENDING, so a compaction already CLAIMED — provider call in flight —
+  // outlives a reset that ran a second ago, and a check that is not atomic with the write is a race
+  // the reset loses: it deletes, we recreate, and a later compaction renders memory the operator
+  // explicitly cleared back into the thread. /reset deletes the AgentThread row and the next message
+  // recreates it with a NEW id, so the id this job started with is the generation token — already in
+  // the schema, one indexed read, nothing new to thread through.
+  if (summary) {
+    const wrote = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+        if (loaded.threadRowId !== null) {
+          const stillThere = await db.agentThread.count({
+            where: { id: loaded.threadRowId as bigint },
+          });
+          if (stillThere === 0) return false;
+        }
+        // GUARANTEE 2 of 3: one row per attendance SEGMENT, forever. `upsert` rather than
+        // create+catch — a P2002 caught inside an aborted transaction cannot recover with an update.
+        await db.attendanceSummary.upsert({
+          where: summaryKey,
+          create: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            contactInboxId,
+            conversationId,
+            lastMessageId,
+            summary,
+            messageCount: cut.closed.length,
+            attendanceAt: loaded.attendanceAt ?? new Date(),
+          },
+          update: { summary, messageCount: cut.closed.length },
+        });
+        return true;
+      }),
     );
-    if (stillThere === 0) {
+    if (!wrote) {
       logger.info(
         "memory: thread was reset while compacting (thread=%s), dropping the summary",
         graphThreadId,
       );
       return { outcome: "done" };
     }
-  }
-
-  // The row is committed BEFORE the thread is rewritten, on purpose. The two failure orders are not
-  // equally bad: a row written whose rewrite never lands means the same turns get summarized again
-  // later and the memory says something twice, while a rewrite that lands with no row means the
-  // attendance is simply gone. Duplicated memory is recoverable by reading it; lost memory is not.
-  if (summary) {
-    await runScopedOn(base, sysCtx(tenantId), (db) =>
-      // GUARANTEE 2 of 3: one row per attendance, forever. `upsert` rather than create+catch —
-      // a P2002 caught inside an aborted transaction cannot recover with an update.
-      db.attendanceSummary.upsert({
-        where: summaryKey,
-        create: {
-          tenantId,
-          chatwootInstanceId: instanceId,
-          contactInboxId,
-          conversationId,
-          summary,
-          messageCount: cut.closed.length,
-        },
-        update: { summary, messageCount: cut.closed.length },
-      }),
-    );
   }
 
   const rewrite = await runScopedOn(base, sysCtx(tenantId), (db) =>
@@ -349,8 +370,8 @@ export async function runCompaction(
           chatwootInstanceId: instanceId,
           contactInboxId,
         },
-        orderBy: { createdAt: "asc" },
-        select: { conversationId: true, summary: true, createdAt: true },
+        orderBy: [{ attendanceAt: "asc" }, { id: "asc" }],
+        select: { conversationId: true, summary: true, attendanceAt: true },
       });
       const head = renderMemoryHead(rows);
       // The update REMOVES BY ID and never clears the channel. REMOVE_ALL_MESSAGES would have been
