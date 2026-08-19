@@ -331,6 +331,9 @@ export async function runLoadedTurn(
     loaded.contactInboxId,
   );
   let turnText = text;
+  // The conversation that closed when a new one took over this thread, held until the divider that
+  // marks the boundary is actually persisted (see below).
+  let pendingCompaction: number | null = null;
   if (loaded.contactInboxId != null) {
     const contactInboxId = loaded.contactInboxId;
     // The conversation that CLOSED when this new one took over the thread, or null when this turn
@@ -374,19 +377,12 @@ export async function runLoadedTurn(
     );
     if (closedConversationId !== null) {
       turnText = `${CONVERSATION_DIVIDER}\n\n${text}`;
-      // A new attendance starting is proof the previous one ended, whether or not anyone ever
-      // resolved it in Chatwoot — which is why this arm exists next to the resolve one. It only
-      // enqueues; the summarizing happens on the scheduler, long after this reply is posted.
-      await armCompaction({
-        tenantId,
-        instanceId,
-        contactInboxId,
-        conversationId: closedConversationId,
-        agentId: loaded.agentId,
-        reason: "new_attendance",
-        enabled: loaded.memoryCompaction,
-        base,
-      });
+      // NOTE: The compaction arm for this boundary happens AFTER the invoke, not here. The divider
+      // is what the compaction job looks for, and it only reaches the checkpointer when the invoke
+      // writes this turn — an arm placed here is due immediately, so the scheduler can claim it
+      // first, find no boundary and retire the job as a no-op. The input guardrail makes that
+      // deterministic rather than a race: it can return before the graph is ever invoked.
+      pendingCompaction = closedConversationId;
     }
   }
 
@@ -536,6 +532,23 @@ export async function runLoadedTurn(
           },
         ),
     );
+    // The divider is now in the thread (the invoke persisted this turn), so the boundary the
+    // compaction job looks for exists. A new attendance starting is proof the previous one ended,
+    // whether or not anyone ever resolved it in Chatwoot, which is why this arm exists next to the
+    // resolve one. It only enqueues; the summarizing runs on the scheduler, after the reply.
+    if (pendingCompaction !== null && loaded.contactInboxId !== null) {
+      await armCompaction({
+        tenantId,
+        instanceId,
+        contactInboxId: loaded.contactInboxId,
+        conversationId: pendingCompaction,
+        agentId: loaded.agentId,
+        reason: "new_attendance",
+        enabled: loaded.memoryCompaction,
+        base,
+      });
+    }
+
     let reply = lastAssistantText(result.messages).trim();
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during

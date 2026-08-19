@@ -64,6 +64,27 @@ class SummarizerModel extends BaseChatModel {
   }
 }
 
+// A saver that lets a test write to the thread at an exact point in the compaction's checkpoint
+// traffic. The window that matters is between the job's locked re-read and the update it derives
+// from it: the advisory lock keeps INGESTION out of it, but a graph turn writes to this same thread
+// holding no lock at all, so a customer message really can land there.
+class HookedSaver extends MemorySaver {
+  calls = 0;
+  constructor(
+    private readonly at: number,
+    private readonly hook: () => Promise<void>,
+  ) {
+    super();
+  }
+  // biome-ignore lint/suspicious/noExplicitAny: mirrors the saver's own loose tuple typing
+  override async getTuple(config: any): Promise<any> {
+    const tuple = await super.getTuple(config);
+    this.calls += 1;
+    if (this.calls === this.at) await this.hook();
+    return tuple;
+  }
+}
+
 let tenantId = 0n;
 let instanceId = 0n;
 let agentId = 0n;
@@ -348,6 +369,41 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     ]);
   });
 
+  // The narrow window, and the reason the update names the ids it removes instead of clearing the
+  // channel: REMOVE_ALL_MESSAGES replaces the whole list with what the update carries, so a message
+  // written here would be erased by a compaction that never read it.
+  test("a message written between the locked re-read and the update survives", async () => {
+    const contactInboxId = 5010;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    let saver: HookedSaver | undefined;
+    // The job's checkpoint traffic is: getState, then the locked re-read, then the update's own
+    // internal read. Firing on the second is what puts the write inside the gap.
+    saver = new HookedSaver(2, async () => {
+      if (!saver) return;
+      await seedThread(saver, threadId, [
+        new HumanMessage("mensagem que chegou no meio da reescrita"),
+      ]);
+    });
+    await seedThread(saver, threadId, twoAttendances());
+    const before = saver.calls;
+    saver.calls = 0;
+    expect(before).toBeGreaterThan(0);
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, 709, "new_attendance"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new SummarizerModel("resumo"),
+      },
+    );
+
+    const after = await readThread(saver, threadId);
+    expect(after).toContain("mensagem que chegou no meio da reescrita");
+    expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
+  });
+
   test("a resolve that was undone inside the grace window does not compact", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 5004;
@@ -418,6 +474,99 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(after.length).toBe(1);
     expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
     expect(after[0]).toContain("Agendado 18/08.");
+  });
+
+  // The grace window on a resolve is long enough for the contact to come back and open a NEW
+  // attendance. The resolved conversation stays resolved, so the status check still passes, and
+  // treating the whole thread as closed would summarize the conversation the agent is in the middle
+  // of — the memory would then describe a conversation that is still happening.
+  test("a resolve whose thread already moved on cuts at the divider instead", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5011;
+    const conversationId = 710;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await seedThread(saver, threadId, twoAttendances());
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    // The thread has already moved on to a newer conversation.
+    await suDb.agentThread.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId,
+        lastConversationId: conversationId + 1,
+      },
+    });
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "resolved"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new SummarizerModel("resumo"),
+      },
+    );
+
+    const after = await readThread(saver, threadId);
+    // The open attendance survived: head + its divider + its reply, not a lone head.
+    expect(after.length).toBe(3);
+    expect(after[1]).toStartWith(CONVERSATION_DIVIDER);
+    expect(after[2]).toBe("Oi! Como posso ajudar?");
+  });
+
+  // The row is committed before the rewrite, so a job that dies after summarizing comes back with
+  // the summary already stored. Paying the provider again for the same attendance is what the unique
+  // key was supposed to prevent, and the key alone does not prevent it.
+  test("a retry reuses the stored summary instead of generating a second one", async () => {
+    const contactInboxId = 5012;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const model = new SummarizerModel("resumo do atendimento");
+
+    // First attempt: the rewrite is sabotaged (the thread is reset mid-summary), so it fails AFTER
+    // the row was written.
+    const saverA = new MemorySaver();
+    await seedThread(saverA, threadId, twoAttendances());
+    const sabotaged = new SummarizerModel("resumo do atendimento", async () => {
+      await saverA.deleteThread(threadId);
+    });
+    const first = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 711, "new_attendance"),
+      appDb,
+      { checkpointer: saverA, makeModel: () => sabotaged },
+    );
+    expect(first.outcome).toBe("fail");
+    expect(sabotaged.calls).toBe(1);
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(1);
+
+    // The retry finds the same cut and the stored row, and must not call the model again.
+    const saverB = new MemorySaver();
+    await seedThread(saverB, threadId, twoAttendances());
+    const second = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 711, "new_attendance"),
+      appDb,
+      { checkpointer: saverB, makeModel: () => model },
+    );
+    expect(second).toEqual({ outcome: "done" });
+    expect(model.calls).toBe(0);
+    expect((await readThread(saverB, threadId))[0]).toContain(
+      "resumo do atendimento",
+    );
   });
 
   test("the switch is honored at execution, not only at arming time", async () => {

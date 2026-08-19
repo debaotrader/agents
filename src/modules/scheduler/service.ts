@@ -41,6 +41,12 @@ export interface EnqueueParams {
   dedupeKey: string;
   runAt: Date;
   payload?: Record<string, unknown>;
+  // Start this row's retry budget over. Off by default, because most kinds key their dedupeKey to
+  // one unit of work (a conversation's follow-up, a document's ingest) and a re-arm there is the
+  // SAME work being retried. A kind whose key is permanent — one row per contact thread, reused by
+  // every attendance forever — needs it: without it, four transient failures spread over months make
+  // the next attendance dead-letter on its first, and that thread never compacts again.
+  resetAttempts?: boolean;
   base?: PrismaClient;
 }
 
@@ -74,6 +80,7 @@ export async function enqueueJob(params: EnqueueParams): Promise<bigint> {
         ...(params.payload !== undefined
           ? { payload: params.payload as Prisma.InputJsonValue }
           : {}),
+        ...(params.resetAttempts ? { attempts: 0 } : {}),
       },
       select: { id: true },
     });

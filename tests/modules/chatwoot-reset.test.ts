@@ -10,6 +10,7 @@ import { createHmac } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { contactInboxThreadId } from "@/graph/checkpointer";
 import { CHATWOOT_AUTH_HEADER } from "@/modules/chatwoot/constants";
 import {
   processChatwootDelivery,
@@ -260,6 +261,20 @@ describe.skipIf(!dbUp)(
           messageCount: 4,
         },
       });
+      // A compaction armed on a resolve waits out a grace window, so at any moment there can be one
+      // sitting in the queue holding this very conversation. Left armed it fires minutes later and
+      // writes a fresh row: memory the operator explicitly deleted, back with no trace of where it
+      // came from.
+      await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "MEMORY_COMPACT",
+          dedupeKey: contactInboxThreadId(tenantId, instanceId, 301),
+          runAt: new Date(Date.now() + 600_000),
+          status: "PENDING",
+          payload: {},
+        },
+      });
       const cw = fakeChatwoot();
       globalThis.fetch = cw.impl;
       await sendReset();
@@ -269,6 +284,15 @@ describe.skipIf(!dbUp)(
           where: { tenantId, contactInboxId: 301 },
         }),
       ).toBe(0);
+      const job = await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "MEMORY_COMPACT",
+          dedupeKey: contactInboxThreadId(tenantId, instanceId, 301),
+        },
+      });
+      // cancelPendingJob retires a row as DONE (its vocabulary for "this will not run").
+      expect(job?.status).toBe("DONE");
     });
 
     test("a failed step does not skip the independent ones that follow it", async () => {

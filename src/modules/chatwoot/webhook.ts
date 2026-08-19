@@ -848,6 +848,20 @@ async function maybeConsumeCommandOrGate(params: {
       // The compacted memory of past attendances lives in its own table, not in the thread, so
       // deleting the thread alone would resurrect every one of them on the next compaction (the head
       // is rendered from these rows). "Starts this channel's conversation over" has to include them.
+      //
+      // The pending job goes first, and that order is the point: a compaction armed on a resolve
+      // waits out a grace window, so at any moment there can be one sitting in the queue holding the
+      // conversation this reset is clearing. Left alone it would fire minutes later, summarize
+      // whatever the thread has by then and write a fresh row — memory the operator explicitly
+      // deleted, back again with no trace of where it came from.
+      await step("cancel pending compaction", "memória", () =>
+        cancelPendingJob(
+          tenantId,
+          "MEMORY_COMPACT",
+          contactInboxThreadId(tenantId, instanceId, contactInboxId),
+          base,
+        ),
+      );
       await step("clear attendance summaries", "memória", () =>
         runScopedOn(base, sysCtx(tenantId), (db) =>
           db.attendanceSummary.deleteMany({
