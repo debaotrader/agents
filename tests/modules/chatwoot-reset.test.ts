@@ -246,6 +246,31 @@ describe.skipIf(!dbUp)(
       expect(attrs[0]?.body).toEqual({ custom_attributes: {} });
     });
 
+    // The compacted memory of past attendances lives in its own table, not in the graph thread, so
+    // deleting the thread alone would leave it behind — and the next compaction renders it back into
+    // the thread's first message. A /reset that says "memória" and resurrects it is a lie.
+    test("the compacted memory of past attendances is cleared too", async () => {
+      await suDb.attendanceSummary.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId: 301,
+          conversationId: 999,
+          summary: "orçamento de R$ 250 aprovado",
+          messageCount: 4,
+        },
+      });
+      const cw = fakeChatwoot();
+      globalThis.fetch = cw.impl;
+      await sendReset();
+
+      expect(
+        await suDb.attendanceSummary.count({
+          where: { tenantId, contactInboxId: 301 },
+        }),
+      ).toBe(0);
+    });
+
     test("a failed step does not skip the independent ones that follow it", async () => {
       const cw = fakeChatwoot(/\/custom_attributes$/);
       globalThis.fetch = cw.impl;

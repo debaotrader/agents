@@ -63,6 +63,7 @@ import {
   type SideEffectErrorReporter,
 } from "@/modules/integrations/toolpacks";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import {
   readServiceWindowConfig,
   type ServiceWindowConfig,
@@ -224,6 +225,10 @@ export interface AgentConfig {
   // Ceiling on the history tokens sent to the model (agent.settings.limits.maxHistoryTokens).
   // null = no ceiling, send the whole thread.
   maxHistoryTokens: number | null;
+  // Whether a closed attendance gets folded into the contact's memory instead of staying raw on
+  // the thread (agent.settings.memory.compaction). Read here so the turn that CROSSES an
+  // attendance boundary can arm the compaction job without a second query.
+  memoryCompaction: boolean;
   // Whether this agent's tool lines log the VALUES the model sent instead of their shape
   // (agent.settings.observability.logToolValues; off by default — see src/modules/flowlog/shape.ts).
   logToolValues: boolean;
@@ -611,6 +616,7 @@ export async function loadAgentConfig(
     timezone,
     maxToolCalls: limits.maxToolCalls,
     maxHistoryTokens: limits.maxHistoryTokens,
+    memoryCompaction: readMemoryConfig(effSettings).compaction.enabled,
     logToolValues: readObservabilityConfig(effSettings).logToolValues,
   };
 }

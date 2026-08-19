@@ -1,0 +1,114 @@
+import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
+import {
+  isConversationDivider,
+  isMemoryHead,
+  MEMORY_HEAD_CLOSE,
+  MEMORY_HEAD_OPEN,
+} from "@/graph/markers";
+import { contentToText } from "@/graph/message-text";
+
+// Where one attendance ends and the next begins, inside the contact's memory thread.
+//
+// The thread is keyed per contact-inbox, so it accumulates every conversation that contact ever had
+// on that channel. Compaction replaces the raw turns of the attendances that ALREADY ENDED with one
+// summary each, and this module answers the only question that decision needs: which messages belong
+// to attendances that are over.
+//
+// Pure on purpose: no model, no database, no clock. Same reason as src/graph/history-window.ts — the
+// rule is a decision, and a decision belongs in a table of cases rather than behind a job that also
+// talks to a provider.
+//
+// THE FOUR INVARIANTS:
+//
+//   1. The memory head is never part of the closed chunk. It is rendered from attendance_summaries
+//      on every compaction, so feeding it back to the summarizer would summarize a summary — the
+//      compounding loss this whole design exists to avoid. Each attendance is summarized ONCE, from
+//      its raw turns.
+//   2. Whole attendances only. The cut lands on a CONVERSATION_DIVIDER, which is the exact string
+//      both writers prepend to the first human turn of a new conversation. Cutting anywhere else
+//      would summarize half a conversation and leave the other half raw, describing the same events
+//      twice.
+//   3. Nothing is closed just because the thread is long. Without a later attendance, the only
+//      attendance present is the open one, and the answer is "nothing to compact" — the ceiling
+//      (src/graph/history-window.ts) is what bounds a single endless attendance, not this.
+//   4. Except when the caller knows the current attendance itself ended (the resolve trigger), in
+//      which case everything below the head is closed and the thread compacts down to the head
+//      alone. That is the case worth having: it makes the RESUMPTION turn cheap, which measurement
+//      showed is the turn that is billed fresh (cache rate ~0% past 24h).
+
+export interface AttendanceCut {
+  // The memory head already sitting at the front of the thread, if there is one. Returned so the
+  // caller can tell "no head yet" from "head rebuilt", never to be re-summarized (invariant 1).
+  head: BaseMessage | null;
+  // Messages of attendances that are over. Empty means there is nothing to compact.
+  closed: BaseMessage[];
+  // Messages of the attendance still in progress. They travel untouched.
+  open: BaseMessage[];
+}
+
+export function selectClosedPrefix(
+  messages: BaseMessage[],
+  opts: { currentAttendanceClosed: boolean },
+): AttendanceCut {
+  const first = messages[0];
+  const hasHead =
+    first !== undefined &&
+    first.getType() === "human" &&
+    isMemoryHead(contentToText(first.content));
+  const head = hasHead ? (first as BaseMessage) : null;
+  const body = hasHead ? messages.slice(1) : messages;
+
+  // NOTE: Invariant 4 — the caller vouches that the conversation this thread is on has ended, so
+  // there is no open attendance to protect.
+  if (opts.currentAttendanceClosed) return { head, closed: body, open: [] };
+
+  let start = -1;
+  for (let i = body.length - 1; i >= 0; i--) {
+    const m = body[i];
+    if (
+      m?.getType() === "human" &&
+      isConversationDivider(contentToText(m.content))
+    ) {
+      start = i;
+      break;
+    }
+  }
+  // NOTE: Invariant 3 — no divider (or one that opens the body) means everything present belongs to
+  // the attendance in progress.
+  if (start <= 0) return { head, closed: [], open: body };
+  return { head, closed: body.slice(0, start), open: body.slice(start) };
+}
+
+// How many attendances the head carries. The rows are all kept; this bounds what the MODEL reads, so
+// a contact with a long history does not spend its whole budget on memory. The oldest fall off the
+// front, which is the same order a person forgets in.
+export const MEMORY_HEAD_MAX_ATTENDANCES = 20;
+
+// Anything a summary could contain that reads as the fence's own tag, in every spelling it could
+// take. A summary is model output derived from customer text, so it is not trusted to stay inside
+// the block it was put in.
+const FENCE_TAG = /<\s*\/?\s*(atendimento|atendimentos-anteriores)[^>]*>/gi;
+
+export interface SummaryRow {
+  conversationId: number;
+  summary: string;
+  createdAt: Date;
+}
+
+// Renders the compacted memory as the thread's first message. Ordered oldest-first, which is how the
+// raw turns it replaces were ordered. Rides in a HumanMessage: see src/graph/markers.ts.
+export function renderMemoryHead(rows: SummaryRow[]): HumanMessage | null {
+  const kept = rows.slice(-MEMORY_HEAD_MAX_ATTENDANCES);
+  const entries = kept
+    .map((r) => {
+      const text = r.summary.replace(FENCE_TAG, "").trim();
+      if (!text) return null;
+      const date = r.createdAt.toISOString().slice(0, 10);
+      return `<atendimento data="${date}">\n${text}\n</atendimento>`;
+    })
+    .filter((e): e is string => e !== null);
+  if (entries.length === 0) return null;
+  return new HumanMessage(
+    `${MEMORY_HEAD_OPEN}\n(Contexto do sistema: resumos de atendimentos já encerrados com este mesmo contato, do mais antigo para o mais recente. É memória de conversas passadas, não o assunto atual.)\n${entries.join("\n")}\n${MEMORY_HEAD_CLOSE}`,
+  );
+}

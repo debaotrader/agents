@@ -1,16 +1,12 @@
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
-import {
-  END,
-  MessagesAnnotation,
-  START,
-  StateGraph,
-} from "@langchain/langgraph";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getCheckpointer } from "./checkpointer";
+import { CONVERSATION_DIVIDER } from "./markers";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
 // Continuous ingestion: fold a conversation message into the agent's graph memory thread WITHOUT
 // running a model, so the agent has full context even for messages no turn handled — a customer
@@ -25,26 +21,6 @@ import { getCheckpointer } from "./checkpointer";
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
-}
-
-// Folded into the first human turn of a NEW conversation when the contact-inbox thread already carries
-// memory from a prior one. The agent node strips SystemMessages from history (graph.ts), so a
-// system-role divider would be invisible — it rides inside the human turn instead. Shared by the
-// reactive turn (runtime.ts) and customer-message ingestion.
-export const CONVERSATION_DIVIDER =
-  "(Contexto do sistema: início de uma nova conversa com este mesmo contato. As mensagens anteriores são de atendimentos passados; não presuma que o assunto continua, trate isto como um novo atendimento.)";
-
-// A minimal graph whose ONLY purpose is graph.updateState — appending to a thread's MessagesAnnotation
-// channel without a model. The channel schema is identical to the real agent graph (both
-// MessagesAnnotation), so the same checkpointer thread interoperates: the appended message is visible
-// to the next real turn. asNode="noop" makes the update self-contained, so it does not depend on the
-// node that wrote the prior checkpoint (which belongs to the real graph's topology).
-function buildIngestGraph(checkpointer: BaseCheckpointSaver) {
-  return new StateGraph(MessagesAnnotation)
-    .addNode("noop", () => ({}))
-    .addEdge(START, "noop")
-    .addEdge("noop", END)
-    .compile({ checkpointer });
 }
 
 export type IngestRole = "customer" | "human_agent";
@@ -67,6 +43,11 @@ export interface IngestMessageParams {
   agentName?: string | null;
   base?: PrismaClient;
   checkpointer?: BaseCheckpointSaver;
+  // Fired when this message OPENED a new attendance on the thread, carrying the display_id of the
+  // one that just ended. A callback rather than a direct call because the work it triggers (arming
+  // memory compaction) opens its own transaction, and this one runs under an advisory lock — so it
+  // is invoked only after the lock is released.
+  onAttendanceClosed?: (previousConversationId: number) => Promise<void> | void;
 }
 
 // Strip quotes/newlines from a human agent's display name so it can't break the <atendente nome="…">
@@ -93,9 +74,9 @@ export async function ingestMessageIntoThread(
   } = params;
   if (!params.text.trim()) return "skipped";
   const checkpointer = params.checkpointer ?? (await getCheckpointer());
-  const graph = buildIngestGraph(checkpointer);
+  const graph = buildThreadStateGraph(checkpointer);
 
-  return runScopedOn(base, sysCtx(tenantId), (db) =>
+  const done = await runScopedOn(base, sysCtx(tenantId), (db) =>
     withEntityLock(db, `ingest:${graphThreadId}`, async () => {
       const key = {
         tenantId_chatwootInstanceId_contactInboxId: {
@@ -113,7 +94,7 @@ export async function ingestMessageIntoThread(
         row?.lastSyncedMessageId != null &&
         messageId <= row.lastSyncedMessageId
       ) {
-        return "skipped";
+        return { outcome: "skipped" as const, closedConversationId: null };
       }
 
       // A customer message that starts a NEW conversation on this thread gets the fresh-attendance
@@ -137,7 +118,7 @@ export async function ingestMessageIntoThread(
       await graph.updateState(
         { configurable: { thread_id: graphThreadId } },
         { messages: [msg] },
-        "noop",
+        THREAD_STATE_NODE,
       );
 
       // Advance the watermark; customer messages also advance the divider marker (turns do the same).
@@ -160,7 +141,15 @@ export async function ingestMessageIntoThread(
             : {}),
         },
       });
-      return "ingested";
+      return {
+        outcome: "ingested" as const,
+        closedConversationId: newConversation ? prevConv : null,
+      };
     }),
   );
+
+  if (done.closedConversationId !== null) {
+    await params.onAttendanceClosed?.(done.closedConversationId);
+  }
+  return done.outcome;
 }

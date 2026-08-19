@@ -29,13 +29,14 @@ import {
 } from "@/modules/flowlog/service";
 import { analyzeGuardrail } from "@/modules/guardrails/analyze";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
+import { armCompaction } from "@/modules/memory/compact";
 import { deliverReply } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import { chatwootThreadId, resolveGraphThreadId } from "./checkpointer";
 import { lastAssistantText } from "./graph";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
-import { CONVERSATION_DIVIDER } from "./ingest";
+import { CONVERSATION_DIVIDER } from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -332,7 +333,9 @@ export async function runLoadedTurn(
   let turnText = text;
   if (loaded.contactInboxId != null) {
     const contactInboxId = loaded.contactInboxId;
-    const isNewConversation = await runScopedOn(
+    // The conversation that CLOSED when this new one took over the thread, or null when this turn
+    // is not crossing an attendance boundary. Its raw turns are what compaction folds away.
+    const closedConversationId = await runScopedOn(
       base,
       sysCtx(tenantId),
       async (db) => {
@@ -366,10 +369,25 @@ export async function runLoadedTurn(
             update: { lastConversationId: conversationId },
           });
         }
-        return prev != null && prev !== conversationId;
+        return prev != null && prev !== conversationId ? prev : null;
       },
     );
-    if (isNewConversation) turnText = `${CONVERSATION_DIVIDER}\n\n${text}`;
+    if (closedConversationId !== null) {
+      turnText = `${CONVERSATION_DIVIDER}\n\n${text}`;
+      // A new attendance starting is proof the previous one ended, whether or not anyone ever
+      // resolved it in Chatwoot — which is why this arm exists next to the resolve one. It only
+      // enqueues; the summarizing happens on the scheduler, long after this reply is posted.
+      await armCompaction({
+        tenantId,
+        instanceId,
+        contactInboxId,
+        conversationId: closedConversationId,
+        agentId: loaded.agentId,
+        reason: "new_attendance",
+        enabled: loaded.memoryCompaction,
+        base,
+      });
+    }
   }
 
   // The live "agent is working" indicator on the per-tenant realtime channel:
