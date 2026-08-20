@@ -1,0 +1,380 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
+import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import { seedChatwootInstance } from "../utils/chatwoot";
+
+// Issue #153, wiring end. The availability gate silenced the agent and told only the OPERATOR, so the
+// customer's side of a closed schedule was indistinguishable from the business ignoring them. What the
+// decision table in availability-away.test.ts pins is the RULE (what text, and when it is withheld);
+// what these cover is that the text actually leaves the process as a CUSTOMER-facing message on the
+// conversation — the half a pure function cannot prove, because "the double received a public message
+// with the persona's token" is the whole point.
+//
+// The schedule is open 00:00–23:59 every day and an exception closes today and tomorrow, so every
+// assertion here is on the CLOSED direction and holds at any minute of the run (same construction as
+// the #129 suite).
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+const TZ = "America/Sao_Paulo";
+// TEST-NET-3 on a closed port: passes the SSRF check without a DNS lookup, and nothing can reach it
+// even if a call escaped the double.
+const BASE_URL = "https://203.0.113.22:9";
+const BOT_TOKEN = "AWAY-BOT-TOKEN";
+const INBOX_WITH_COPY = 881;
+const INBOX_SILENT = 882;
+const AWAY_COPY = "Estamos fechados. Voltamos {proximo_atendimento}.";
+
+let tenantId = 0n;
+let instanceId = 0n;
+let inboxWithCopyId = 0n;
+let inboxSilentId = 0n;
+
+function localDate(days: number): string {
+  const at = new Date(Date.now() + days * 86_400_000);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(at);
+}
+
+interface Posted {
+  conversationId: number;
+  content: string;
+  private: boolean;
+  token: string;
+}
+const posted: Posted[] = [];
+let realFetch: typeof globalThis.fetch;
+
+// The double AUTHENTICATES like Chatwoot: a client built without the persona's bot token gets the same
+// 401 the real server answers, so a message the gate "sent" without an identity cannot pass as sent.
+function installChatwootDouble(): void {
+  realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const token = String(
+      (init?.headers as Record<string, string> | undefined)?.[
+        "api-access-token"
+      ] ?? "",
+    );
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    if (token === "") return json({ error: "Invalid Access Token" }, 401);
+    const messages = url.match(/\/conversations\/(\d+)\/messages$/);
+    if (messages && (init?.method ?? "GET") === "GET")
+      return json({ payload: [] });
+    if (messages && init?.method === "POST") {
+      const body = JSON.parse(String(init.body ?? "{}"));
+      posted.push({
+        conversationId: Number(messages[1]),
+        content: String(body.content ?? ""),
+        private: body.private === true,
+        token,
+      });
+      return json({ id: 1 });
+    }
+    return json({}, 404);
+  }) as typeof globalThis.fetch;
+}
+
+async function seedConversation(
+  convId: number,
+  inbox: bigint,
+  noticeSentAt: Date | null = null,
+): Promise<bigint> {
+  const row = await suDb.conversation.create({
+    data: {
+      tenantId,
+      chatwootInstanceId: instanceId,
+      inboxId: inbox,
+      chatwootConversationId: convId,
+      status: "pending",
+      threadId: `${tenantId}:${instanceId}:${convId}`,
+      lastEventAt: new Date(Date.now() - 2 * 60_000),
+      lastInboundAt: new Date(Date.now() - 3 * 60_000),
+      outOfHoursNoticeSentAt: noticeSentAt,
+    },
+    select: { id: true },
+  });
+  return row.id;
+}
+
+async function deliverCustomerMessage(
+  convId: number,
+  chatwootInboxId: number,
+  seq: number,
+): Promise<void> {
+  const n = normalizeChatwootEvent({
+    event: "message_created",
+    id: 6000 + seq,
+    content: "olá, tem alguém aí?",
+    message_type: "incoming",
+    private: false,
+    conversation: {
+      id: convId,
+      inbox_id: chatwootInboxId,
+      status: "pending",
+      contact_inbox: { id: 88_000 + convId },
+      meta: {
+        assignee_type: null,
+        assignee: null,
+        sender: { id: 701, name: "Cliente", phone_number: "+5511988880000" },
+      },
+      channel: "Channel::WebWidget",
+      last_activity_at: Math.floor(Date.now() / 1000),
+    },
+  });
+  if (!n) throw new Error("unreachable: the fixture is a valid event");
+  const delivery = await suDb.chatwootWebhookDelivery.create({
+    data: {
+      tenantId,
+      chatwootInstanceId: instanceId,
+      deliveryId: `away-${process.pid}-${convId}-${seq}`,
+      event: "message_created",
+      status: "PENDING",
+    },
+    select: { id: true },
+  });
+  await processChatwootDelivery({
+    tenantId,
+    instanceId,
+    deliveryRowId: delivery.id,
+    agentBotId: 9,
+    normalized: n,
+    base: appDb,
+  });
+}
+
+const publicOn = (convId: number) =>
+  posted.filter((p) => p.conversationId === convId && !p.private);
+const notesOn = (convId: number) =>
+  posted.filter((p) => p.conversationId === convId && p.private);
+
+describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
+  beforeAll(async () => {
+    installChatwootDouble();
+    const t = await suDb.tenant.create({
+      data: { name: "AWAY", slug: `away-${process.pid}` },
+    });
+    tenantId = t.id;
+    const inst = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 12,
+      baseUrl: BASE_URL,
+      adminToken: encryptJson("ADMIN"),
+    });
+    instanceId = inst.id;
+    const hours = await suDb.businessHours.create({
+      data: {
+        tenantId,
+        name: "Atendimento",
+        timezone: TZ,
+        // Open every day, all day: a closed reading can only have come from the exception.
+        windows: [0, 1, 2, 3, 4, 5, 6].map((day) => ({
+          day,
+          start: "00:00",
+          end: "23:59",
+        })),
+        exceptions: [
+          {
+            date: localDate(0),
+            dateEnd: localDate(1),
+            label: "Recesso",
+            ranges: [],
+          },
+        ],
+      },
+      select: { id: true },
+    });
+    const llmKey = await suDb.vaultEntry.create({
+      data: { tenantId, name: "llm-key", secret: encryptJson("sk-test") },
+      select: { id: true },
+    });
+    const baseAgent = {
+      tenantId,
+      systemPrompt: "Você é prestativa.",
+      businessHoursId: hours.id,
+      modelConfig: {
+        provider: "openai",
+        model: "gpt-4o-mini",
+        credentialRef: `vault:${llmKey.id}`,
+      },
+    };
+    const withCopy = await suDb.agent.create({
+      data: {
+        ...baseAgent,
+        name: "Com recado",
+        settings: {
+          debounce: { enabled: false },
+          split: { enabled: false },
+          availability: { awayMessage: AWAY_COPY },
+        },
+      },
+      select: { id: true },
+    });
+    const silent = await suDb.agent.create({
+      data: {
+        ...baseAgent,
+        name: "Sem recado",
+        settings: { debounce: { enabled: false }, split: { enabled: false } },
+      },
+      select: { id: true },
+    });
+    // One bot per persona, which is what makes the persona token the sender identity.
+    for (const agentId of [withCopy.id, silent.id]) {
+      await suDb.chatwootAgentBot.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          agentId,
+          chatwootAgentBotId: agentId === withCopy.id ? 9 : 10,
+          accessToken: encryptJson(BOT_TOKEN),
+          webhookSecret: encryptJson("SECRET"),
+          webhookRouteTokenHash: `hash-${process.pid}-${agentId}`,
+          name: "bot",
+        },
+      });
+    }
+    const a = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: INBOX_WITH_COPY,
+        name: "Com recado",
+        agentId: withCopy.id,
+      },
+      select: { id: true },
+    });
+    inboxWithCopyId = a.id;
+    const b = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: INBOX_SILENT,
+        name: "Sem recado",
+        agentId: silent.id,
+      },
+      select: { id: true },
+    });
+    inboxSilentId = b.id;
+  });
+
+  afterAll(async () => {
+    globalThis.fetch = realFetch;
+    if (!dbUp || !tenantId) return;
+    for (const table of [
+      "scheduler_jobs",
+      "llm_usage",
+      "execution_logs",
+      "conversations",
+      "chatwoot_webhook_deliveries",
+      "inboxes",
+      "chatwoot_agent_bots",
+      "agents",
+      "business_hours",
+      "vault_entries",
+      "chatwoot_instances",
+    ]) {
+      await suDb
+        .$executeRawUnsafe(`DELETE FROM ${table} WHERE tenant_id = ${tenantId}`)
+        .catch(() => {});
+    }
+    await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${tenantId}`);
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("the customer receives the away message, as the persona, and the operator still gets the note", async () => {
+    const convId = 9101;
+    await seedConversation(convId, inboxWithCopyId);
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 1);
+
+    const reply = publicOn(convId);
+    expect(reply).toHaveLength(1);
+    expect(reply[0]?.token).toBe(BOT_TOKEN);
+    // The schedule reached the renderer: the placeholder is gone and what replaced it is not empty.
+    expect(reply[0]?.content).toStartWith("Estamos fechados. Voltamos ");
+    expect(reply[0]?.content).not.toContain("{proximo_atendimento}");
+    expect(reply[0]?.content.length).toBeGreaterThan(AWAY_COPY.length - 22);
+    // The operator note is unchanged — the customer message is additive, not a replacement.
+    expect(
+      notesOn(convId).some((p) => p.content.includes("fora do horário")),
+    ).toBe(true);
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { outOfHoursNoticeSentAt: true },
+    });
+    expect(conv.outOfHoursNoticeSentAt).not.toBeNull();
+  });
+
+  test("an agent with no away message keeps the pre-#153 silence", async () => {
+    const convId = 9102;
+    await seedConversation(convId, inboxSilentId);
+    await deliverCustomerMessage(convId, INBOX_SILENT, 2);
+    // Twice: the note stays one-shot for an agent that sends nothing to the customer, which is the
+    // watermark write that the away message must not have taken over.
+    await deliverCustomerMessage(convId, INBOX_SILENT, 6);
+
+    expect(publicOn(convId)).toEqual([]);
+    expect(notesOn(convId)).toHaveLength(1);
+    expect(notesOn(convId)[0]?.content).toContain("fora do horário");
+  });
+
+  test("a second message the same day repeats neither the away message nor the note", async () => {
+    const convId = 9103;
+    await seedConversation(convId, inboxWithCopyId);
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 3);
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 4);
+
+    expect(publicOn(convId)).toHaveLength(1);
+    expect(notesOn(convId)).toHaveLength(1);
+  });
+
+  // A WhatsApp conversation is never closed, so a watermark from a previous day is the ordinary case,
+  // not an edge one: the customer asking again tomorrow is asking again, and gets an answer.
+  test("a new day re-sends the away message without re-posting the note", async () => {
+    const convId = 9104;
+    await seedConversation(
+      convId,
+      inboxWithCopyId,
+      new Date(Date.now() - 2 * 86_400_000),
+    );
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 5);
+    // And the new day gets its own one-shot: without re-stamping on the away send, the watermark
+    // would stay stuck on the old day and every further message would repeat the message.
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 7);
+
+    expect(publicOn(convId)).toHaveLength(1);
+    expect(notesOn(convId)).toEqual([]);
+  });
+});

@@ -48,6 +48,7 @@ import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
+  TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
@@ -186,6 +187,8 @@ interface BehaviorTabProps {
   hours: Hours[];
   businessHoursId: string;
   setBusinessHoursId: (v: string) => void;
+  awayMessage: string;
+  setAwayMessage: (v: string) => void;
   followUpHoursId: string;
   setFollowUpHoursId: (v: string) => void;
   debounce: DebounceState;
@@ -756,6 +759,8 @@ export function BehaviorTab({
   hours,
   businessHoursId,
   setBusinessHoursId,
+  awayMessage,
+  setAwayMessage,
   followUpHoursId,
   setFollowUpHoursId,
   debounce,
@@ -929,7 +934,7 @@ export function BehaviorTab({
             title={t("editor.availability", "Availability")}
             description={t(
               "editor.availabilityHint",
-              "When the agent is active and answering. Outside these hours it stays silent and notifies the operator with a private note.",
+              "When the agent is active and answering. Outside these hours it stays silent, notifies the operator with a private note, and sends the customer the message below if you write one.",
             )}
           >
             <FormField
@@ -945,6 +950,24 @@ export function BehaviorTab({
                 onScheduleSaved={(savedId) => {
                   onScheduleSaved(savedId, setBusinessHoursId);
                 }}
+              />
+            </FormField>
+            <FormField
+              label={t("editor.awayMessage", "Out-of-hours message")}
+              description={t(
+                "editor.awayMessageHint",
+                "Sent to the customer while the agent is outside these hours, at most once a day per conversation. Leave it empty to stay silent. Write {proximo_atendimento} (or {next_open}) where the next opening should appear.",
+              )}
+            >
+              <Textarea
+                value={awayMessage}
+                onChange={(e) => setAwayMessage(e.target.value)}
+                rows={2}
+                maxLength={TEMPLATE_MESSAGE_MAX}
+                placeholder={t(
+                  "editor.awayMessagePlaceholder",
+                  "We are closed right now. We will be back {proximo_atendimento}.",
+                )}
               />
             </FormField>
           </Section>

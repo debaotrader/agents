@@ -50,43 +50,74 @@ describe("outOfHoursGate", () => {
   const MON_MIDDAY = new Date("2024-01-08T12:00:00Z"); // open
   const MON_NIGHT = new Date("2024-01-08T20:00:00Z"); // closed
   const SUNDAY = new Date("2024-01-07T12:00:00Z"); // closed (no Sunday window)
+  const OPEN = { silence: false, postNote: false, sendAway: false };
 
   test("no schedule / empty windows → always on (never silenced)", () => {
-    expect(outOfHoursGate(null, MON_NIGHT, false)).toEqual({
-      silence: false,
-      postNote: false,
-    });
+    expect(outOfHoursGate(null, MON_NIGHT, null)).toEqual(OPEN);
     expect(
       outOfHoursGate(
         { windows: [], exceptions: [], timezone: "UTC" },
         MON_NIGHT,
-        false,
+        null,
       ),
-    ).toEqual({ silence: false, postNote: false });
+    ).toEqual(OPEN);
   });
 
   test("inside the window → responds (no silence, no note)", () => {
-    expect(outOfHoursGate(HOURS, MON_MIDDAY, false)).toEqual({
-      silence: false,
-      postNote: false,
-    });
+    expect(outOfHoursGate(HOURS, MON_MIDDAY, null)).toEqual(OPEN);
   });
 
   test("outside the window, notice not yet sent → silence + post the one-shot note", () => {
-    expect(outOfHoursGate(HOURS, MON_NIGHT, false)).toEqual({
+    expect(outOfHoursGate(HOURS, MON_NIGHT, null)).toEqual({
       silence: true,
       postNote: true,
+      sendAway: true,
     });
-    expect(outOfHoursGate(HOURS, SUNDAY, false)).toEqual({
+    expect(outOfHoursGate(HOURS, SUNDAY, null)).toEqual({
       silence: true,
       postNote: true,
+      sendAway: true,
     });
   });
 
   test("outside the window, notice already sent → silence WITHOUT re-posting (anti-spam)", () => {
-    expect(outOfHoursGate(HOURS, MON_NIGHT, true)).toEqual({
+    expect(
+      outOfHoursGate(HOURS, MON_NIGHT, new Date("2024-01-08T19:00:00Z")),
+    ).toEqual({ silence: true, postNote: false, sendAway: false });
+  });
+
+  // The operator note and the customer message run on different clocks off the same watermark:
+  // the note answers a question that does not change, the away message answers one the customer
+  // asks again every day.
+  test("a new local day re-sends the away message but never re-posts the note", () => {
+    expect(
+      outOfHoursGate(HOURS, SUNDAY, new Date("2024-01-06T20:00:00Z")),
+    ).toEqual({ silence: true, postNote: false, sendAway: true });
+  });
+
+  test("same local day, later hour → neither is repeated", () => {
+    expect(
+      outOfHoursGate(HOURS, SUNDAY, new Date("2024-01-07T08:00:00Z")),
+    ).toEqual({ silence: true, postNote: false, sendAway: false });
+  });
+
+  // The day boundary is the SCHEDULE's, not UTC's: 21:00 in Sao Paulo is already the next UTC day,
+  // and comparing in UTC would hand the customer a second away message three hours early.
+  test("the local day boundary is the schedule timezone's, not UTC's", () => {
+    const SP = {
+      windows: [{ day: 1, start: "09:00", end: "17:00" }],
+      exceptions: [],
+      timezone: "America/Sao_Paulo",
+    };
+    // One local Sunday that straddles the UTC day boundary: 12:00 local is Jan 7 in UTC, 21:30 local
+    // is already Jan 8 there. Comparing in UTC would call these different days and hand the customer
+    // a second away message before their day ended.
+    const first = new Date("2024-01-07T15:00:00Z"); // Sun 12:00 local, Jan 7 UTC
+    const later = new Date("2024-01-08T00:30:00Z"); // Sun 21:30 local, Jan 8 UTC
+    expect(outOfHoursGate(SP, later, first)).toEqual({
       silence: true,
       postNote: false,
+      sendAway: false,
     });
   });
 });

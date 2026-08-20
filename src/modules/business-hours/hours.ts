@@ -212,6 +212,14 @@ function rangesForLocalDate(schedule: Schedule, date: LocalDate): TimeRange[] {
   return ordered(schedule.windows.filter((w) => w.day === date.weekday));
 }
 
+// The local calendar date of an instant ("YYYY-MM-DD") in a timezone. Exported for the surfaces that
+// need "is this the same day as that" without reimplementing the zone math — the away-message cadence
+// compares the last notice's local day against today's, and a UTC comparison would roll the day over
+// three hours early for America/Sao_Paulo.
+export function localDateKey(at: Date, timezone: string): string {
+  return ymdKey(zonedParts(at, timezone));
+}
+
 // The exception governing the local date of an instant, or null when the weekly grid decides. The
 // operator-facing surfaces need the entry itself (its label is what makes the closure explainable),
 // not just the ranges it resolves to.

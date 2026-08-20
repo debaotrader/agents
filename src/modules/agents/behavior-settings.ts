@@ -1,4 +1,5 @@
 import { readLimitsConfig } from "@/modules/agents/limits";
+import { readAvailabilityConfig } from "@/modules/availability/away";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readDebounceConfig } from "@/modules/debounce/settings";
@@ -45,6 +46,7 @@ export interface BehaviorSettings {
   handoff: ReturnType<typeof readHandoffConfig>;
   sendImage: ReturnType<typeof readSendImageConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
+  availability: ReturnType<typeof readAvailabilityConfig>;
   channelRedirect: ReturnType<typeof readChannelRedirectConfig>;
   guardrails: ReturnType<typeof readGuardrailsConfig>;
   // NOTE: Which Chatwoot custom attributes (per scope) are injected into the system prompt.
@@ -66,6 +68,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "handoff",
   "sendImage",
   "limits",
+  "availability",
   "channelRedirect",
   "guardrails",
   "attributeContext",
@@ -87,6 +90,7 @@ export function readBehaviorSettings(settings: unknown): BehaviorSettings {
     handoff: readHandoffConfig(settings),
     sendImage: readSendImageConfig(settings),
     limits: readLimitsConfig(settings),
+    availability: readAvailabilityConfig(settings),
     channelRedirect: readChannelRedirectConfig(settings),
     guardrails: readGuardrailsConfig(settings),
     attributeContext: readAttributeContextConfig(settings),
@@ -108,6 +112,7 @@ export interface BehaviorSettingsPatch {
   handoff?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
   limits?: Record<string, unknown>;
+  availability?: Record<string, unknown>;
   channelRedirect?: Record<string, unknown>;
   guardrails?: Record<string, unknown>;
   attributeContext?: Record<string, unknown>;
@@ -152,6 +157,7 @@ export function mergeBehaviorSettings(
   next.handoff = normalized.handoff;
   next.sendImage = normalized.sendImage;
   next.limits = normalized.limits;
+  next.availability = normalized.availability;
   next.channelRedirect = normalized.channelRedirect;
   next.guardrails = normalized.guardrails;
   next.attributeContext = normalized.attributeContext;

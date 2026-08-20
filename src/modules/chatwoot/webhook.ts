@@ -19,7 +19,13 @@ import { AppError, UnauthorizedError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { shouldRunReset } from "@/modules/agents/test-mode";
 import {
+  readAvailabilityConfig,
+  renderAwayMessage,
+} from "@/modules/availability/away";
+import {
   isOpenAt,
+  localDateKey,
+  NEXT_OPEN_SCAN_DAYS,
   parseSchedule,
   type Schedule,
 } from "@/modules/business-hours/hours";
@@ -558,20 +564,32 @@ async function ingestUnhandledMessage(args: {
 
 // Reactive availability decision: the agent's business hours (the "Disponibilidade" schedule) gate
 // replies to the customer. Outside the configured window the agent stays SILENT; the operator gets a
-// one-shot private note (postNote true only the first time, mirroring the test-mode notice). No
-// schedule / empty windows → always on (never silenced). Pure (now injected) so it is unit-testable.
+// one-shot private note (postNote true only the first time, mirroring the test-mode notice) and the
+// customer gets the agent's away message, when one is configured. No schedule / empty windows →
+// always on (never silenced). Pure (now injected) so it is unit-testable.
+//
+// The two notices deliberately run on different clocks off the SAME watermark. The note answers "why
+// is the bot quiet", which the operator needs once and which does not change. The away message answers
+// "is anyone there", which the customer asks again every time they write — and a WhatsApp conversation
+// is never closed, so once-per-conversation would mean once per customer per lifetime. Once per local
+// day is also what Chatwoot's own inbox out-of-office does (messages.today.template.empty?), so an
+// operator migrating off that stopgap gets the cadence they already know.
 export function outOfHoursGate(
   hours: Schedule | null,
   now: Date,
-  noticeAlreadySent: boolean,
-): { silence: boolean; postNote: boolean } {
-  if (!hours || hours.windows.length === 0) {
-    return { silence: false, postNote: false };
-  }
-  if (isOpenAt(hours, now)) {
-    return { silence: false, postNote: false };
-  }
-  return { silence: true, postNote: !noticeAlreadySent };
+  lastNoticeAt: Date | null,
+): { silence: boolean; postNote: boolean; sendAway: boolean } {
+  const open = { silence: false, postNote: false, sendAway: false };
+  if (!hours || hours.windows.length === 0) return open;
+  if (isOpenAt(hours, now)) return open;
+  return {
+    silence: true,
+    postNote: lastNoticeAt === null,
+    sendAway:
+      lastNoticeAt === null ||
+      localDateKey(lastNoticeAt, hours.timezone) !==
+        localDateKey(now, hours.timezone),
+  };
 }
 
 // Test-mode gate + the /teste and /reset commands (item 1 + 2). Runs at the TOP of the actionable
@@ -671,13 +689,13 @@ async function maybeConsumeCommandOrGate(params: {
     });
   };
 
-  const postAck = async (text: string): Promise<void> => {
+  const postPublicMessage = async (text: string): Promise<void> => {
     try {
       const client = await personaClient();
       await client.sendMessage(conversationId, text);
     } catch (err) {
       logger.warn(
-        "chatwoot: command ack failed (conv=%s): %s",
+        "chatwoot: public message send failed (conv=%s): %s",
         String(conversationId),
         errMsg(err),
       );
@@ -767,7 +785,7 @@ async function maybeConsumeCommandOrGate(params: {
         errMsg(err),
       );
     }
-    await postAck("🧪 Modo teste ativado para esta conversa.");
+    await postPublicMessage("🧪 Modo teste ativado para esta conversa.");
     logger.info("chatwoot: /teste activated (conv=%s)", String(conversationId));
     return true;
   }
@@ -893,7 +911,7 @@ async function maybeConsumeCommandOrGate(params: {
     // typed /reset to get a clean slate, and acting on a conversation that is not clean is worse than
     // knowing what survived.
     const distinctFailed = [...new Set(failed)];
-    await postAck(
+    await postPublicMessage(
       distinctFailed.length === 0
         ? "🔄 Memória, preferência de áudio e etiquetas/atributos desta conversa foram limpos."
         : `⚠️ Reset parcial: não consegui limpar ${distinctFailed.join(", ")}. O restante foi limpo.`,
@@ -970,30 +988,55 @@ async function maybeConsumeCommandOrGate(params: {
         clonedMessage: n.message?.content ?? null,
         now: new Date(),
         base,
-        send: postAck,
+        send: postPublicMessage,
       });
       if (outcome !== "misconfigured") return true;
     }
   }
 
   // ── Availability gate: the agent's business hours (the "Disponibilidade" schedule) gate REACTIVE
-  //    replies. Outside the configured window the agent stays silent and the operator gets a one-shot
-  //    private note (same anti-spam watermark as the test-mode notice). Empty/no schedule = always on. ──
+  //    replies. Outside the configured window the agent stays silent, the operator gets a one-shot
+  //    private note (same anti-spam watermark as the test-mode notice), and the CUSTOMER gets the
+  //    agent's away message when one is configured. Empty/no schedule = always on. ──
+  const now = new Date();
   const availability = outOfHoursGate(
     ctx.hours,
-    new Date(),
-    ctx.conv.outOfHoursNoticeSentAt !== null,
+    now,
+    ctx.conv.outOfHoursNoticeSentAt,
   );
   if (availability.silence) {
+    // The customer-facing half (#153). ctx.hours is non-null whenever the gate silences, so the
+    // schedule the message describes is the one that just silenced the agent.
+    const away =
+      availability.sendAway && ctx.hours
+        ? renderAwayMessage({
+            copy: readAvailabilityConfig(ctx.agentSettings).awayMessage,
+            schedule: ctx.hours,
+            now,
+          })
+        : ({ send: false, reason: "not_configured" } as const);
+    if (away.send) {
+      await postPublicMessage(away.text);
+    } else if (away.reason === "no_next_open") {
+      logger.warn(
+        "chatwoot: away message not sent (conv=%s) — it interpolates the next opening and the schedule never opens within %d days",
+        String(conversationId),
+        NEXT_OPEN_SCAN_DAYS,
+      );
+    }
     if (availability.postNote) {
       await postPrivateNote(
         "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
       );
+    }
+    // One watermark for both notices (see outOfHoursGate). Advancing it only when something was
+    // actually sent is what keeps an agent with no away message on exactly its pre-#153 behavior.
+    if (availability.postNote || away.send) {
       try {
         await runScopedOn(base, sysCtx(tenantId), (db) =>
           db.conversation.update({
             where: { id: ctx.conv.id },
-            data: { outOfHoursNoticeSentAt: new Date() },
+            data: { outOfHoursNoticeSentAt: now },
           }),
         );
       } catch (err) {
