@@ -240,8 +240,10 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       messageId: number,
       role: "customer" | "human_agent",
       text: string,
+      onAttendanceClosed?: (previousConversationId: number) => void,
     ) =>
       ingestMessageIntoThread({
+        ...(onAttendanceClosed ? { onAttendanceClosed } : {}),
         tenantId,
         instanceId,
         conversationId,
@@ -254,10 +256,23 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
         checkpointer: saver,
       });
 
+    const closed: number[] = [];
     await ingest(810, 1, "customer", "primeira conversa");
     // A NEW conversation, opened by the agent reaching out.
-    await ingest(811, 2, "human_agent", "oi, passando para lembrar da revisão");
+    await ingest(
+      811,
+      2,
+      "human_agent",
+      "oi, passando para lembrar da revisão",
+      (prev) => {
+        closed.push(prev);
+      },
+    );
     await ingest(811, 3, "customer", "ah sim, obrigado");
+    // The attendance that ENDED is reported to the caller, which is what arms its compaction. The
+    // marker advances on this message either way, so without the callback here the customer's reply
+    // no longer looks like a boundary and nothing ever arms it.
+    expect(closed).toEqual([810]);
 
     const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
     const messages = ((

@@ -497,6 +497,22 @@ async function ingestUnhandledMessage(args: {
     contactInboxId,
   );
 
+  // A new attendance can begin on a message the agent never answers (out of hours, a human on the
+  // conversation, or the agent reaching out first). Without this arm, that boundary would be invisible
+  // to compaction until the attendance AFTER it, which is exactly the deployment that never resolves
+  // conversations — the population the whole feature exists for.
+  const armOnBoundary = (previousConversationId: number): Promise<void> =>
+    armCompaction({
+      tenantId,
+      instanceId,
+      contactInboxId,
+      conversationId: previousConversationId,
+      agentId: args.agentId,
+      reason: "new_attendance",
+      enabled: args.compactionEnabled,
+      base,
+    }).then(() => undefined);
+
   // A human agent's outgoing reply (a colleague messaged the customer while the bot was silent).
   if (isHumanAgentMessage(n)) {
     const text = (n.message.content ?? "").trim();
@@ -513,6 +529,16 @@ async function ingestUnhandledMessage(args: {
         text,
         agentName: n.message.sender?.name ?? null,
         base,
+        // The agent reaching out is what OPENS the new conversation, so this path closes the previous
+        // attendance exactly like a customer message does. Left off, the boundary would be detected
+        // and the marker advanced with nothing armed, and the customer's reply would then see no
+        // boundary at all — the attendance before it staying raw until yet another one opened.
+        //
+        // NOTE: this branch is currently unreachable. `rt` above is resolved only for a new INCOMING
+        // message, so an outgoing human-agent message never gets here and is never ingested at all —
+        // which predates memory compaction and is tracked on its own. Wired anyway, because the day
+        // it does run the boundary must not be consumed silently.
+        onAttendanceClosed: armOnBoundary,
       });
     } catch (err) {
       logger.warn(
@@ -553,20 +579,7 @@ async function ingestUnhandledMessage(args: {
       role: "customer",
       text,
       base,
-      // A new attendance can begin on a message the agent never answers (out of hours, a human on
-      // the conversation). Without this arm, that boundary would be invisible to compaction until
-      // the attendance AFTER it, which is exactly the deployment that never resolves conversations.
-      onAttendanceClosed: (previousConversationId) =>
-        armCompaction({
-          tenantId,
-          instanceId,
-          contactInboxId,
-          conversationId: previousConversationId,
-          agentId: args.agentId,
-          reason: "new_attendance",
-          enabled: args.compactionEnabled,
-          base,
-        }).then(() => undefined),
+      onAttendanceClosed: armOnBoundary,
     });
   } catch (err) {
     logger.warn(

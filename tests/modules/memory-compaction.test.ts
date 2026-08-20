@@ -31,6 +31,7 @@ import {
   memoryHeadMessage,
 } from "@/graph/markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
+import { runScopedOn } from "@/lib/tenancy";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { UsageReportingModel } from "../utils/scripted-models";
@@ -246,7 +247,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
 
     const res = await runCompaction(
       tenantId,
-      payload(contactInboxId, 700, "new_attendance"),
+      payload(contactInboxId, 708, "new_attendance"),
       appDb,
       { checkpointer: saver, makeModel: () => model },
     );
@@ -269,7 +270,9 @@ describe.skipIf(!dbUp)("memory compaction", () => {
 
     const rows = await suDb.attendanceSummary.findMany({ where: { tenantId } });
     expect(rows.length).toBe(1);
-    expect(rows[0]?.conversationId).toBe(700);
+    // 708 is the conversation the closed turns are stamped with: the row is filed under the
+    // attendance it describes, not under whatever the job happened to be armed for.
+    expect(rows[0]?.conversationId).toBe(708);
     expect(rows[0]?.messageCount).toBe(3);
   });
 
@@ -888,6 +891,81 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(settled.some((c) => c.includes("oi, voltei"))).toBe(false);
   });
 
+  // Registration in TENANT_SCOPED_MODELS is what makes the tenancy extension inject the tenant on a
+  // scoped write and override a spoofed one. The production upsert happens to pass tenantId itself,
+  // so nothing about today's behavior would notice the model missing from that set — which is exactly
+  // how a table opts out of the repo's defense-in-depth without anyone seeing it.
+  test("a scoped write fills in the tenant even when the caller does not", async () => {
+    const contactInboxId = 5027;
+    await runScopedOn(
+      appDb,
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      (db) =>
+        (
+          db.attendanceSummary as unknown as {
+            create: (a: { data: Record<string, unknown> }) => Promise<unknown>;
+          }
+        ).create({
+          data: {
+            chatwootInstanceId: instanceId,
+            contactInboxId,
+            conversationId: 730,
+            lastMessageId: "scoped-1",
+            summary: "sem tenant no payload",
+            messageCount: 1,
+            attendanceAt: new Date(),
+          },
+        }),
+    );
+    const row = await suDb.attendanceSummary.findFirstOrThrow({
+      where: { contactInboxId, chatwootInstanceId: instanceId },
+    });
+    expect(row.tenantId).toBe(tenantId);
+  });
+
+  // loadAgentConfig resolves the agent's A/B variant, and resolving one WRITES an assignment keyed by
+  // the thread it is handed. Keyed by contact-inbox it would be an assignment no conversion can ever
+  // match, counted in the denominator of every result for that agent — rates drifting down by one row
+  // per contact, with nothing in the numbers to say why.
+  test("compacting does not invent an experiment assignment", async () => {
+    const contactInboxId = 5028;
+    const conversationId = 731;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const exp = await suDb.experiment.create({
+      data: {
+        tenantId,
+        agentId,
+        name: "tom",
+        enabled: true,
+        variants: [
+          { key: "a", systemPrompt: "A" },
+          { key: "b", systemPrompt: "B" },
+        ],
+      },
+      select: { id: true },
+    });
+    const saver = new MemorySaver();
+    await seedThread(saver, threadId, twoAttendances());
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "new_attendance"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new SummarizerModel("resumo"),
+      },
+    );
+
+    const assignments = await suDb.promptVariantAssignment.findMany({
+      where: { tenantId, experimentId: exp.id },
+      select: { threadId: true },
+    });
+    // Whatever it assigned, it is NOT keyed by the contact-inbox thread: that key belongs to no
+    // conversation, so no conversion could ever be matched to it.
+    expect(assignments.map((a) => a.threadId)).not.toContain(threadId);
+  });
+
   test("a resolved attendance compacts the whole thread down to its memory", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 5005;
@@ -1162,27 +1240,36 @@ describe.skipIf(!dbUp)("memory compaction", () => {
   // The boundary trigger fires only when the contact comes back, which can be months later. Dating a
   // memory by the job that wrote it tells the model a returning customer's whole history happened
   // today, and a model that believes that will answer as if it did.
+  // Dated by the attendance the SEGMENT is about, which is not always the one the job was armed for:
+  // a claimed job cannot be called back, so a new attendance can re-arm the row while the handler is
+  // still running and the cut it takes reaches past the payload's conversation. Dating from the
+  // payload would file a months-old conversation under the date of a different one.
   test("the memory is dated by the attendance, not by the job that summarized it", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 5016;
-    const conversationId = 715;
     const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
     const longAgo = new Date(Date.UTC(2026, 1, 3, 15, 0, 0));
-    await suDb.conversation.create({
-      data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        chatwootConversationId: conversationId,
-        status: "resolved",
-        threadId: `${tenantId}:${instanceId}:${conversationId}`,
-        lastEventAt: longAgo,
-      },
-    });
+    // 708 is the attendance the closed turns belong to; 715 is what this job was armed for.
+    for (const [chatwootConversationId, lastEventAt] of [
+      [708, longAgo],
+      [715, new Date()],
+    ] as const) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId,
+          status: "resolved",
+          threadId: `${tenantId}:${instanceId}:${chatwootConversationId}`,
+          lastEventAt,
+        },
+      });
+    }
     await seedThread(saver, threadId, twoAttendances());
 
     await runCompaction(
       tenantId,
-      payload(contactInboxId, conversationId, "new_attendance"),
+      payload(contactInboxId, 715, "new_attendance"),
       appDb,
       { checkpointer: saver, makeModel: () => new SummarizerModel("resumo") },
     );

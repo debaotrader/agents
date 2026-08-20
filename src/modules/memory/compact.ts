@@ -2,7 +2,11 @@ import { type BaseMessage, RemoveMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
-import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
+import {
+  chatwootThreadId,
+  contactInboxThreadId,
+  getCheckpointer,
+} from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
 import { memoryHeadMessage, stampedConversationId } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
@@ -198,16 +202,6 @@ export async function runCompaction(
       });
       if (conv && conv.status !== "resolved") reopened = true;
     }
-    const mirrored = await db.conversation.findUnique({
-      where: {
-        tenantId_chatwootInstanceId_chatwootConversationId: {
-          tenantId,
-          chatwootInstanceId: instanceId,
-          chatwootConversationId: conversationId,
-        },
-      },
-      select: { lastEventAt: true },
-    });
     // Which conversation the thread is on RIGHT NOW. The resolve trigger waits out a grace window,
     // and a contact can open a new attendance inside it: the resolved conversation stays resolved,
     // so the status check above passes, and treating the whole thread as closed would summarize the
@@ -228,7 +222,13 @@ export async function runCompaction(
       instanceId,
       conversationId,
       agentId,
-      threadId: graphThreadId,
+      // The per-CONVERSATION thread, not this thread's contact-inbox id, even though the compaction
+      // works on the latter. loadAgentConfig resolves the agent's A/B variant, and resolving one
+      // WRITES an assignment keyed by the thread it is given: keyed by contact-inbox it would be an
+      // assignment no conversion can ever match, counted in the denominator of every experiment
+      // result for that agent. Rates would drift down by one row per contact, and nothing in the
+      // numbers would say why. This id is the one the conversation's own turns already used.
+      threadId: chatwootThreadId(tenantId, instanceId, conversationId),
     });
     if (!cfg) return null;
     return {
@@ -236,10 +236,6 @@ export async function runCompaction(
       reopened,
       lastConversationId: thread?.lastConversationId ?? null,
       threadRowId: thread?.id ?? null,
-      // When the attendance actually happened. The boundary trigger fires only when the contact
-      // comes back, which can be months later, so the job's own clock would date a returning
-      // customer's whole history to today.
-      attendanceAt: mirrored?.lastEventAt ?? null,
     };
   });
   if (loaded === "off" || loaded === null) {
@@ -318,13 +314,32 @@ export async function runCompaction(
         open: messages.slice(owedIndex + 1),
       }
     : natural;
-  // Which attendance the segment being folded belongs to. On the owed path it is the row's OWN
-  // conversation, not the one this job was armed for: the two differ exactly when a later attendance
-  // re-armed the job, and keying the lookup on the payload instead would miss the row it is about to
-  // apply, pay for a second summary of the same turns, and file it under the wrong attendance.
+  // Which attendance the segment being folded belongs to, read off the segment itself rather than off
+  // the payload. The two come apart in two ways, and both leave the memory filed under a conversation
+  // it is not about:
+  //
+  //   - on the owed path the row describes an OLDER attendance than the job was armed for, and
+  //     keying the lookup on the payload would miss the row it is about to apply and pay for a
+  //     second summary of the same turns;
+  //   - a job already CLAIMED cannot be called back. A new attendance re-arms the scheduler row while
+  //     the handler is still running, so the cut it goes on to take can reach past the attendance the
+  //     payload names — and the re-armed job then finds nothing left to do.
+  //
+  // The last stamped message of the closed chunk is what the chunk ENDS in, which is the attendance
+  // it belongs to. Threads written before stamps existed have none, and fall back to the payload.
+  let closedStamp: number | null = null;
+  for (let i = cut.closed.length - 1; i >= 0; i--) {
+    const m = cut.closed[i];
+    if (m === undefined) continue;
+    const stamp = stampedConversationId(m);
+    if (stamp !== null) {
+      closedStamp = stamp;
+      break;
+    }
+  }
   const segmentConversationId = owedIsPending
     ? (owed?.conversationId ?? conversationId)
-    : conversationId;
+    : (closedStamp ?? conversationId);
   // What this row will be a summary OF: the last turn in the cut. It is the segment's identity, and
   // the reason a reopened conversation does not lose half its memory — a second cut on the same
   // conversation carries different turns, so it writes its OWN row instead of replacing or reusing
@@ -336,6 +351,24 @@ export async function runCompaction(
   // before the row, before the rewrite. Running the job twice costs one state read.
   const lastMessageId = cut.closed.at(-1)?.id;
   if (!lastMessageId) return { outcome: "done" };
+  // When the attendance actually happened, read for the conversation the SEGMENT belongs to. The
+  // boundary trigger fires only when the contact comes back, which can be months later, so the job's
+  // own clock would date a returning customer's whole history to today — and the payload's
+  // conversation would date it to a different attendance entirely.
+  const segmentAt = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.conversation
+      .findUnique({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: segmentConversationId,
+          },
+        },
+        select: { lastEventAt: true },
+      })
+      .then((c) => c?.lastEventAt ?? null),
+  );
   const summaryKey = {
     tenantId_chatwootInstanceId_contactInboxId_conversationId_lastMessageId: {
       tenantId,
@@ -415,7 +448,7 @@ export async function runCompaction(
             lastMessageId,
             summary,
             messageCount: cut.closed.length,
-            attendanceAt: loaded.attendanceAt ?? new Date(),
+            attendanceAt: segmentAt ?? new Date(),
           },
           update: { summary, messageCount: cut.closed.length },
         });
