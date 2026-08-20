@@ -19,7 +19,7 @@ import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 // words would be deleted without ever having been summarized. Metadata cannot be typed into a chat.
 
 const MARKER_KWARG = "fazerMarker";
-type SystemMarker = "divider" | "memory_head";
+type SystemMarker = "divider" | "memory_head" | "nudge";
 
 function hasMarker(message: BaseMessage, marker: SystemMarker): boolean {
   return message.additional_kwargs?.[MARKER_KWARG] === marker;
@@ -95,10 +95,26 @@ export function memoryHeadMessage(content: string, id?: string): HumanMessage {
   });
 }
 
+// A proactive nudge is injected into the thread as a HUMAN turn — a SystemMessage would make strict
+// providers reject the call (src/graph/graph.ts) — so from the channel's point of view the operator's
+// own guidance and the untrusted external event payload look exactly like something the customer
+// typed. Nothing downstream could tell them apart, and the summarizer wrote them into the permanent
+// memory as the contact's words. Marked at the source, like every other marker here.
+export function nudgeMessage(content: string): HumanMessage {
+  return new HumanMessage({
+    content,
+    additional_kwargs: { [MARKER_KWARG]: "nudge" satisfies SystemMarker },
+  });
+}
+
 export function isConversationDivider(message: BaseMessage): boolean {
   return hasMarker(message, "divider");
 }
 
 export function isMemoryHead(message: BaseMessage): boolean {
   return hasMarker(message, "memory_head");
+}
+
+export function isNudgeTurn(message: BaseMessage): boolean {
+  return hasMarker(message, "nudge");
 }

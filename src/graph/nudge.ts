@@ -1,4 +1,3 @@
-import { HumanMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
@@ -19,6 +18,7 @@ import {
 import { resolveGraphThreadId, threadBelongsToTenant } from "./checkpointer";
 import { lastAssistantText } from "./graph";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
+import { nudgeMessage } from "./markers";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -518,7 +518,7 @@ export async function runAgentNudge(
     // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
     result = await graph.invoke(
       {
-        messages: [new HumanMessage(renderNudge(params.nudge, canMessagePre))],
+        messages: [nudgeMessage(renderNudge(params.nudge, canMessagePre))],
       },
       invokeConfig,
     );

@@ -168,10 +168,16 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     });
   }
 
+  // The AgentThread row comes with the messages on purpose: in production every path that stamps a
+  // message upserts it, so a populated channel with no row is not a state the system can reach —
+  // except as the residue of a /reset, which is what the generation fence keys on. Seeding the
+  // channel alone would model an impossible thread and quietly exercise the fence's null branch.
+  // `withThreadRow: false` is for the one test that wants that residue on purpose.
   async function seedThread(
     saver: MemorySaver,
     threadId: string,
     messages: BaseMessage[],
+    opts: { withThreadRow?: boolean } = {},
   ) {
     const graph = buildThreadStateGraph(saver);
     for (const m of messages) {
@@ -181,6 +187,24 @@ describe.skipIf(!dbUp)("memory compaction", () => {
         THREAD_STATE_NODE,
       );
     }
+    if (opts.withThreadRow === false) return;
+    const contactInboxId = Number(threadId.split(":ci:")[1]);
+    await suDb.agentThread.upsert({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      create: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId,
+      },
+      update: {},
+    });
   }
 
   async function readThread(
@@ -771,12 +795,15 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       },
     });
     // The marker still names the PREVIOUS conversation: its boundary claim was skipped.
-    await suDb.agentThread.create({
+    await suDb.agentThread.update({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
       data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        contactInboxId,
-        threadId,
         lastConversationId: conversationId - 1,
       },
     });
@@ -1062,12 +1089,15 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       },
     });
     // The thread has already moved on to a newer conversation.
-    await suDb.agentThread.create({
+    await suDb.agentThread.update({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
       data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        contactInboxId,
-        threadId,
         lastConversationId: conversationId + 1,
       },
     });
@@ -1183,12 +1213,15 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     const contactInboxId = 5014;
     const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
     await seedThread(saver, threadId, twoAttendances());
-    await suDb.agentThread.create({
+    await suDb.agentThread.update({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
       data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        contactInboxId,
-        threadId,
         lastConversationId: 713,
       },
     });
@@ -1212,6 +1245,38 @@ describe.skipIf(!dbUp)("memory compaction", () => {
             });
           }),
       },
+    );
+
+    expect(res).toEqual({ outcome: "done" });
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(0);
+    expect(await readThread(saver, threadId)).toEqual(before);
+  });
+
+  // The same fence, on a thread that has no AgentThread row to use as its generation token. That
+  // state is reachable: /reset deletes the row and the checkpoint under the lock, but an invoke that
+  // started earlier saves the channel it had loaded AFTER the delete — restoring the stamped
+  // messages while the row stays gone — and a nudge can populate a checkpoint without ever creating
+  // a row. A fence that only runs when the row was present reads "no row" as "nothing was reset" and
+  // writes the summary anyway, rendering back the memory the operator cleared.
+  test("a thread with no AgentThread row is fenced too, not waved through", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5040;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    // No agentThread row on purpose: this is the residue a reset leaves behind.
+    await seedThread(saver, threadId, twoAttendances(), {
+      withThreadRow: false,
+    });
+
+    const before = await readThread(saver, threadId);
+    const res = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 709, "new_attendance"),
+      appDb,
+      { checkpointer: saver, makeModel: () => new SummarizerModel("resumo") },
     );
 
     expect(res).toEqual({ outcome: "done" });

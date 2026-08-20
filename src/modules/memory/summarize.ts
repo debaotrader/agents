@@ -10,9 +10,11 @@ import {
   CONVERSATION_DIVIDER,
   isConversationDivider,
   isMemoryHead,
+  isNudgeTurn,
 } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import { runModelCall } from "@/graph/model-limit";
+import { DATA_FENCE } from "@/graph/nudge";
 
 // Condenses the raw turns of a closed attendance into the memory the agent keeps of it.
 //
@@ -97,6 +99,18 @@ export function renderTranscript(messages: BaseMessage[]): string {
     // The head is rendered FROM the rows, so feeding it back would summarize a summary.
     if (isMemoryHead(m)) continue;
     let text = contentToText(m.content).trim();
+    // A proactive nudge rides as a HUMAN turn (src/graph/nudge.ts), so left in it is quoted to the
+    // summarizer as the CUSTOMER asking for whatever the operator's follow-up guidance says — and
+    // that lands in the permanent memory, which is what the agent believes from then on. The nudge's
+    // own directive is not part of the attendance; the agent's REPLY to it is, and stays.
+    //
+    // The marker covers every nudge written from here on. The DATA_FENCE fallback covers the ones
+    // already sitting in threads written before it: the fence is embedded by renderNudge in every
+    // nudge and stripped out of the external payload by sanitizeFreeText, so it cannot arrive from
+    // the event data. A customer CAN type it, and typing it costs them that one message in the
+    // summary — the trade runs the safe way, unlike leaving operator instructions in.
+    if (isNudgeTurn(m) || (type === "human" && text.includes(DATA_FENCE)))
+      continue;
     // System markers ride as HumanMessages (src/graph/markers.ts), and the ingestion path folds the
     // divider into the customer's own turn — so this strips the marker and keeps the words around it,
     // rather than dropping the message. Left in, the system's directive would be quoted back to the

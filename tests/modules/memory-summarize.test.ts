@@ -11,7 +11,9 @@ import {
   conversationDividerMessage,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
+  nudgeMessage,
 } from "@/graph/markers";
+import { DATA_FENCE, renderNudge } from "@/graph/nudge";
 import {
   ATTENDANCE_SUMMARY_MAX,
   renderTranscript,
@@ -52,6 +54,62 @@ describe("renderTranscript", () => {
     expect(t).toContain("Oi! Como posso ajudar?");
     // The customer's own words, which rode along with the marker, are still there.
     expect(t).toContain("oi, voltei");
+  });
+
+  // A proactive nudge is injected as a HUMAN turn (a SystemMessage would make strict providers reject
+  // the call — see src/graph/nudge.ts), so without filtering it the operator's own guidance and the
+  // untrusted external event payload are summarized as things the CUSTOMER said, and the agent
+  // believes that forever after. The agent's REPLY to the nudge is a real part of the attendance and
+  // stays.
+  test("a proactive nudge is not quoted as the customer", () => {
+    const t = renderTranscript([
+      nudgeMessage(
+        renderNudge(
+          {
+            source: "followup",
+            kind: "followup",
+            summary: "cliente não respondeu há 2 dias",
+            instructions: "Ofereça o pacote premium e insista no upgrade.",
+          },
+          true,
+        ),
+      ),
+      new AIMessage("Oi Renata! Passando para saber se ficou tudo certo."),
+    ]);
+    expect(t).not.toContain("Ofereça o pacote premium");
+    expect(t).not.toContain(DATA_FENCE);
+    expect(t).not.toContain("UNTRUSTED external event data");
+    expect(t).toContain("Passando para saber se ficou tudo certo");
+  });
+
+  // Threads already carry nudges written before the marker existed, and the first compaction after an
+  // upgrade is exactly when they would be summarized as the customer's words. The fence renderNudge
+  // embeds is what identifies those.
+  test("a nudge written before the marker existed is still not the customer", () => {
+    const t = renderTranscript([
+      new HumanMessage(
+        renderNudge(
+          { source: "followup", instructions: "Insista no upgrade." },
+          true,
+        ),
+      ),
+      new AIMessage("Oi! Tudo certo por aí?"),
+    ]);
+    expect(t).not.toContain("Insista no upgrade");
+    expect(t).toContain("Tudo certo por aí");
+  });
+
+  // The marker is what DECIDES, and it has to work on its own: the fence is a fallback for nudges
+  // already written into threads before the marker existed, and it lives in text the renderer happens
+  // to embed today. A nudge recognized only by its payload stops being recognized the day the payload
+  // is reworded.
+  test("a nudge is recognized by its marker, not by what it says", () => {
+    const t = renderTranscript([
+      nudgeMessage("lembre o cliente do orçamento em aberto"),
+      new AIMessage("Oi! Passando para lembrar do orçamento."),
+    ]);
+    expect(t).not.toContain("lembre o cliente");
+    expect(t).toContain("Passando para lembrar do orçamento");
   });
 
   // The bare divider is what a new attendance holds when an input guardrail answered before the model

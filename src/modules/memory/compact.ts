@@ -246,6 +246,20 @@ export async function runCompaction(
   }
   const cfg = loaded.cfg;
 
+  // GENERATION FENCE, first half. The AgentThread row id is the token that says which generation of
+  // this thread the job belongs to (see the second half, at the write below), so a job that starts
+  // without one has no token and every later check would wave it through.
+  //
+  // No row means the thread was wiped: /reset deletes the row, the summary rows and the checkpoint
+  // under this same lock. The channel can still come back populated afterwards — an invoke that
+  // started earlier saves the state it had loaded, stamps included, and a nudge can write a
+  // checkpoint without ever creating a row — and that residue is exactly what would be summarized
+  // here and rendered back into the memory the operator explicitly cleared. Every path that stamps a
+  // message upserts the row, so a thread with something to compact and no row is that residue and
+  // nothing else. Refused before the state read, so it costs neither a generation nor a query.
+  const threadRowId = loaded.threadRowId;
+  if (threadRowId === null) return { outcome: "done" };
+
   // A turn holding this thread will undo the rewrite below, so there is nothing to gain by reading
   // its channel now. Checked here as well as under the lock because this side is what avoids PAYING
   // for a summary that the locked check would then discard; the locked one is what makes it correct.
@@ -432,12 +446,12 @@ export async function runCompaction(
   if (summary) {
     const wrote = await runScopedOn(base, sysCtx(tenantId), (db) =>
       withEntityLock(db, `ingest:${graphThreadId}`, async () => {
-        if (loaded.threadRowId !== null) {
-          const stillThere = await db.agentThread.count({
-            where: { id: loaded.threadRowId as bigint },
-          });
-          if (stillThere === 0) return false;
-        }
+        // GENERATION FENCE, second half: the row this job started with is gone, so a /reset ran
+        // while the provider call was in flight. Non-null by the check right after the load.
+        const stillThere = await db.agentThread.count({
+          where: { id: threadRowId },
+        });
+        if (stillThere === 0) return false;
         // GUARANTEE 2 of 3: one row per attendance SEGMENT, forever. `upsert` rather than
         // create+catch — a P2002 caught inside an aborted transaction cannot recover with an update.
         await db.attendanceSummary.upsert({

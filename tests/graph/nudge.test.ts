@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
@@ -9,6 +9,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
+import { isNudgeTurn } from "@/graph/markers";
 import {
   FOLLOWUP_SKIP_SENTINEL,
   isNudgeSilent,
@@ -450,6 +451,46 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       configurable: { thread_id: `${tenantId}:${instanceId}:907` },
     });
     expect(perConv).toBeUndefined();
+  });
+
+  // The nudge's directive goes into the SAME channel a customer writes to, as a human turn, so
+  // nothing downstream could tell the operator's follow-up guidance from something the contact said.
+  // Compaction is where that bites: unmarked, the guidance is summarized as the customer's words and
+  // becomes what the agent believes from then on (src/modules/memory/summarize.ts).
+  test("the injected nudge turn is marked as a nudge, not left looking like the customer", async () => {
+    const contactInboxId = 8801;
+    await seedConv(908, null, new Date(), contactInboxId);
+    const saver = new MemorySaver();
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:908`,
+      nudge: {
+        source: "followup",
+        kind: "inactivity",
+        step: 1,
+        instructions: "Ofereça o pacote premium.",
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const cp = await saver.get({
+      configurable: {
+        thread_id: contactInboxThreadId(tenantId, instanceId, contactInboxId),
+      },
+    });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    const injected = messages.find((m) =>
+      String(m.content).includes("Ofereça o pacote premium"),
+    );
+    expect(injected).toBeDefined();
+    expect(isNudgeTurn(injected as BaseMessage)).toBe(true);
   });
 
   test("outside the 24h window (no template) → private note, not a free-form message", async () => {
