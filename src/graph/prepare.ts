@@ -288,7 +288,16 @@ function pickPromptVar(
 export async function loadAgentConfig(
   db: ScopedDb,
   args: LoadAgentArgs,
-  opts: { ignoreDisabled?: boolean; overrides?: AgentConfigOverrides } = {},
+  opts: {
+    ignoreDisabled?: boolean;
+    overrides?: AgentConfigOverrides;
+    // Skips the A/B variant resolution. Resolving one is not a read: it INSERTS the thread's
+    // assignment when there is none, and that row lands in the denominator of every result for the
+    // experiment. A caller that never runs the tested prompt — memory compaction summarizes with a
+    // fixed prompt of its own — would be inventing participants for an experiment it takes no part
+    // in, lowering its reported rates with nothing in the numbers to say why.
+    skipExperiment?: boolean;
+  } = {},
 ): Promise<AgentConfig | null> {
   const agent = await db.agent.findUnique({
     where: { id: args.agentId },
@@ -441,11 +450,13 @@ export async function loadAgentConfig(
   const langfuseCfg = await resolveLangfuseConfig(db, args.tenantId);
   const sel = await loadToolSelections(db, agent.id);
   // A/B: an active experiment for this agent may override the system prompt for this thread.
-  const promptOverride = await resolveVariantOverride(db, {
-    tenantId: args.tenantId,
-    agentId: agent.id,
-    threadId: args.threadId,
-  });
+  const promptOverride = opts.skipExperiment
+    ? null
+    : await resolveVariantOverride(db, {
+        tenantId: args.tenantId,
+        agentId: agent.id,
+        threadId: args.threadId,
+      });
   // Grounding is a runtime invariant: when the agent can search the KB, append the grounding
   // directive (don't fabricate / cite / "I don't know" → human) instead of trusting the tenant
   // prompt. The threshold lives in agent.settings (no column on the RAG selection row).

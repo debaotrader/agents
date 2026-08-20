@@ -145,6 +145,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
         "execution_logs",
         "agent_threads",
         "conversations",
+        "inboxes",
         "agents",
         "chatwoot_instances",
       ]) {
@@ -196,18 +197,18 @@ describe.skipIf(!dbUp)("memory compaction", () => {
   // Two attendances on one thread: the first one (raw) is what a boundary trigger compacts. The
   // customer turns carry the conversation they belong to, as production writes them; the assistant
   // replies do not, because the graph builds those.
-  function twoAttendances(): BaseMessage[] {
+  function twoAttendances(closedId = 708, openId = 709): BaseMessage[] {
     return [
       new HumanMessage({
         content: `quero marcar uma avaliação, ${SEEDED_TEXT}`,
-        additional_kwargs: conversationStamp(708),
+        additional_kwargs: conversationStamp(closedId),
       }),
       new AIMessage("Claro! Consegui terça 08h30, R$ 250."),
       new HumanMessage({
         content: "pode ser, obrigado",
-        additional_kwargs: conversationStamp(708),
+        additional_kwargs: conversationStamp(closedId),
       }),
-      conversationDividerMessage(709, "oi, voltei"),
+      conversationDividerMessage(openId, "oi, voltei"),
       new AIMessage("Oi! Como posso ajudar?"),
     ];
   }
@@ -966,6 +967,44 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(assignments.map((a) => a.threadId)).not.toContain(threadId);
   });
 
+  // Resolving a variant is not a read: it INSERTS the assignment when the thread has none. Keying it
+  // by the conversation only makes the row look real — an attendance a human handled, or one that
+  // predates the experiment, still gets a phantom participant that no conversion can match.
+  test("compacting an attendance with no assignment does not invent one", async () => {
+    const contactInboxId = 5029;
+    const conversationId = 732;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const exp = await suDb.experiment.create({
+      data: {
+        tenantId,
+        agentId,
+        name: "tom-2",
+        enabled: true,
+        variants: [
+          { key: "a", systemPrompt: "A" },
+          { key: "b", systemPrompt: "B" },
+        ],
+      },
+      select: { id: true },
+    });
+    const saver = new MemorySaver();
+    await seedThread(saver, threadId, twoAttendances());
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "new_attendance"),
+      appDb,
+      { checkpointer: saver, makeModel: () => new SummarizerModel("resumo") },
+    );
+
+    // Not "not keyed by the contact-inbox thread" — NONE. Compaction takes no part in the experiment.
+    expect(
+      await suDb.promptVariantAssignment.count({
+        where: { tenantId, experimentId: exp.id },
+      }),
+    ).toBe(0);
+  });
+
   test("a resolved attendance compacts the whole thread down to its memory", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 5005;
@@ -1312,11 +1351,34 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     const saver = new MemorySaver();
     const contactInboxId = 5007;
     const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
-    await seedThread(saver, threadId, twoAttendances());
+    // The mirrored conversation the closed turns belong to, on its inbox: together they are what the
+    // trail line points AT, and what the Logs page filters on.
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: 4242,
+        name: "Suporte",
+        agentId,
+      },
+      select: { id: true },
+    });
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 760,
+        inboxId: inbox.id,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:760`,
+        lastEventAt: new Date(),
+      },
+    });
+    await seedThread(saver, threadId, twoAttendances(760, 761));
 
     await runCompaction(
       tenantId,
-      payload(contactInboxId, 706, "new_attendance"),
+      payload(contactInboxId, 760, "new_attendance"),
       appDb,
       {
         checkpointer: saver,
@@ -1330,6 +1392,10 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     });
     expect(row).not.toBeNull();
     expect(row?.level).toBe("info");
+    // Findable from the conversation. The Logs page filters on the database ids, so a line without
+    // them exists and is invisible to the operator who opens the trail from the conversation.
+    expect(row?.conversationId).not.toBeNull();
+    expect(row?.inboxId).not.toBeNull();
     const detail = JSON.stringify(row?.detail ?? {});
     expect(detail).toContain('"messagesCompacted":3');
     expect(detail).not.toContain(SEEDED_TEXT);

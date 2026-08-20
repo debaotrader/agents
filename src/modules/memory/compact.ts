@@ -217,19 +217,22 @@ export async function runCompaction(
       },
       select: { id: true, lastConversationId: true },
     });
-    const cfg = await loadAgentConfig(db, {
-      tenantId,
-      instanceId,
-      conversationId,
-      agentId,
-      // The per-CONVERSATION thread, not this thread's contact-inbox id, even though the compaction
-      // works on the latter. loadAgentConfig resolves the agent's A/B variant, and resolving one
-      // WRITES an assignment keyed by the thread it is given: keyed by contact-inbox it would be an
-      // assignment no conversion can ever match, counted in the denominator of every experiment
-      // result for that agent. Rates would drift down by one row per contact, and nothing in the
-      // numbers would say why. This id is the one the conversation's own turns already used.
-      threadId: chatwootThreadId(tenantId, instanceId, conversationId),
-    });
+    const cfg = await loadAgentConfig(
+      db,
+      {
+        tenantId,
+        instanceId,
+        conversationId,
+        agentId,
+        threadId: chatwootThreadId(tenantId, instanceId, conversationId),
+      },
+      // Compaction summarizes with a fixed prompt of its own and never runs the tested variant, so it
+      // must not be counted as a participant. Resolving a variant INSERTS the assignment when the
+      // thread has none — an attendance a human handled, or one that predates the experiment — and
+      // that phantom row sits in the denominator of every result, quietly lowering the rates. Using
+      // the conversation's own thread id is not enough on its own: it only makes the row LOOK real.
+      { skipExperiment: true },
+    );
     if (!cfg) return null;
     return {
       cfg,
@@ -355,20 +358,19 @@ export async function runCompaction(
   // boundary trigger fires only when the contact comes back, which can be months later, so the job's
   // own clock would date a returning customer's whole history to today — and the payload's
   // conversation would date it to a different attendance entirely.
-  const segmentAt = await runScopedOn(base, sysCtx(tenantId), (db) =>
-    db.conversation
-      .findUnique({
-        where: {
-          tenantId_chatwootInstanceId_chatwootConversationId: {
-            tenantId,
-            chatwootInstanceId: instanceId,
-            chatwootConversationId: segmentConversationId,
-          },
+  const segment = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.conversation.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: segmentConversationId,
         },
-        select: { lastEventAt: true },
-      })
-      .then((c) => c?.lastEventAt ?? null),
+      },
+      select: { id: true, lastEventAt: true },
+    }),
   );
+  const segmentAt = segment?.lastEventAt ?? null;
   const summaryKey = {
     tenantId_chatwootInstanceId_contactInboxId_conversationId_lastMessageId: {
       tenantId,
@@ -551,6 +553,12 @@ export async function runCompaction(
       source: "inbox",
       agentId,
       threadId: graphThreadId,
+      // Without these the line exists but cannot be FOUND: the Logs page filters by conversation and
+      // inbox database ids, and the operator who opens the trail from a conversation would see every
+      // other stage and no compaction at all. It points at the attendance that was folded — the same
+      // one `attendanceConversationId` names — which on the owed path is not the one the job carried.
+      conversationId: segment?.id ?? cfg.conversationDbId,
+      inboxId: cfg.inboxDbId,
       base,
     },
     {
