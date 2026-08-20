@@ -100,10 +100,21 @@ export function memoryHeadMessage(content: string, id?: string): HumanMessage {
 // own guidance and the untrusted external event payload look exactly like something the customer
 // typed. Nothing downstream could tell them apart, and the summarizer wrote them into the permanent
 // memory as the contact's words. Marked at the source, like every other marker here.
-export function nudgeMessage(content: string): HumanMessage {
+// Stamped like every other message we write: a nudge can be the FIRST activity of a new attendance
+// (a redirect follow-up that lands before the customer says anything), and an unstamped one leaves
+// the cut reading the previous attendance as still current — so the nudge and the reply it produced
+// were summarized away as part of it. The conversation is required, not optional, so a future writer
+// cannot forget it the way this one did.
+export function nudgeMessage(
+  content: string,
+  conversationId: number,
+): HumanMessage {
   return new HumanMessage({
     content,
-    additional_kwargs: { [MARKER_KWARG]: "nudge" satisfies SystemMarker },
+    additional_kwargs: {
+      [MARKER_KWARG]: "nudge" satisfies SystemMarker,
+      ...conversationStamp(conversationId),
+    },
   });
 }
 

@@ -4,6 +4,10 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import {
+  claimAttendanceBoundary,
+  needsAttendanceStartProbe,
+} from "./attendance-boundary";
 import { getCheckpointer } from "./checkpointer";
 import { isTurnInFlight } from "./inflight";
 import {
@@ -91,49 +95,40 @@ export async function ingestMessageIntoThread(
         return { outcome: "skipped" as const, closedConversationId: null };
       }
 
-      // A message that starts a NEW conversation on this thread gets the fresh-attendance divider
-      // (same as the reactive turn). Human-agent messages count: an agent who opens the conversation
-      // sends the first message of it, and skipping them here left that message sitting inside the
-      // PREVIOUS attendance — summarized and removed with it when the customer finally replied.
+      // Which attendance this message belongs to, and what that costs the thread. One decision,
+      // shared with the reactive turn and the proactive nudge (./attendance-boundary.ts). Human-agent
+      // messages count as a start: an agent who opens the conversation sends its first message, and
+      // skipping them here left that message sitting inside the PREVIOUS attendance, summarized and
+      // removed with it when the customer finally replied.
       const prevConv = row?.lastConversationId ?? null;
-      const boundary = prevConv != null && prevConv !== conversationId;
-      // An invoke that started earlier on this thread is a read-modify-write of the WHOLE channel:
-      // it saves the state it loaded plus its own messages, erasing whatever landed meanwhile. So a
-      // boundary crossed while one is reading cannot be CONSUMED here — the divider would be erased
-      // and the marker below would advance for good, and the messages of the attendance that just
-      // ended would then carry no boundary the cut can find, leaving the due job a no-op that no
-      // later message re-arms. The marker stays put instead, and the next message on this thread
-      // writes the divider with no invoke in the way. Same reasoning as the reactive turn
-      // (src/graph/runtime.ts), and the same conclusion: only the PROMPT is at stake, since the cut
-      // reads the conversation stamped on each message, not the divider.
-      const anotherInvokeIsReading = boundary && isTurnInFlight(graphThreadId);
-      // ...and only while the attendance has not started yet. A boundary deferred above leaves the
-      // marker on the OLD conversation, so the next unhandled message of this same conversation
-      // arrives with `boundary` still true — and by then messages of this attendance are already in
-      // the thread. Appending the divider there would tell the model that part of the conversation
-      // it is in the middle of is a PAST attendance, which is worse than no hint at all. The cut does
-      // not need it either way: it reads the stamp. Same check the reactive turn makes before it
-      // writes one (src/graph/runtime.ts).
-      const alreadyStarted =
-        boundary &&
-        !anotherInvokeIsReading &&
-        (
-          (
+      const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
+      const alreadyStarted = needsAttendanceStartProbe(
+        prevConv,
+        conversationId,
+        anotherInvokeIsReading,
+      )
+        ? (
             (
-              await graph.getState({
-                configurable: { thread_id: graphThreadId },
-              })
-            ).values as { messages?: BaseMessage[] } | undefined
-          )?.messages ?? []
-        ).some((m) => stampedConversationId(m) === conversationId);
-      const newConversation =
-        boundary && !anotherInvokeIsReading && !alreadyStarted;
+              (
+                await graph.getState({
+                  configurable: { thread_id: graphThreadId },
+                })
+              ).values as { messages?: BaseMessage[] } | undefined
+            )?.messages ?? []
+          ).some((m) => stampedConversationId(m) === conversationId)
+        : false;
+      const claim = claimAttendanceBoundary({
+        previousConversationId: prevConv,
+        conversationId,
+        anotherInvokeIsReading,
+        attendanceAlreadyStarted: alreadyStarted,
+      });
 
       // Every message carries the conversation it belongs to, which is what the compaction cut reads.
       // The divider on top is prompt content, and goes through the factory because nothing else can
       // make a message COUNT as one — the text alone never does, or a customer could type it
       // (src/graph/markers.ts).
-      const msg = newConversation
+      const msg = claim.writeDivider
         ? conversationDividerMessage(conversationId, params.text)
         : new HumanMessage({
             content: params.text,
@@ -159,12 +154,10 @@ export async function ingestMessageIntoThread(
         },
         update: {
           lastSyncedMessageId: messageId,
-          // Held back when an invoke owns the thread: see anotherInvokeIsReading above. The synced
+          // Held back when the claim declined the boundary (./attendance-boundary.ts). The synced
           // watermark still advances — it guards at-most-once append, and rewinding it would trade a
           // lost divider for a duplicated message.
-          lastConversationId: anotherInvokeIsReading
-            ? prevConv
-            : conversationId,
+          lastConversationId: claim.advanceMarker ? conversationId : prevConv,
         },
       });
       return {
@@ -173,7 +166,7 @@ export async function ingestMessageIntoThread(
         // compactable right now — its boundary lives on the messages, not on the divider this call
         // declined to write — and withholding the arm would make it wait on a next message that may
         // never come.
-        closedConversationId: boundary ? prevConv : null,
+        closedConversationId: claim.closedConversationId,
       };
     }),
   );

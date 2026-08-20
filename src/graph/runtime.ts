@@ -35,6 +35,10 @@ import { deliverReply } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import {
+  claimAttendanceBoundary,
+  needsAttendanceStartProbe,
+} from "./attendance-boundary";
+import {
   chatwootThreadId,
   getCheckpointer,
   resolveGraphThreadId,
@@ -501,8 +505,8 @@ export async function runLoadedTurn(
               where: key,
               select: { lastConversationId: true },
             });
-            // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke is
-            // mid-flight on this thread. See the boundary deferral below.
+            // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke
+            // is mid-flight on this thread (./attendance-boundary.ts, case 1).
             const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
             // Claim the thread against a memory-compaction rewrite, under the lock the rewrite also
             // holds while it checks. That makes the two exclusive rather than merely staggered: the
@@ -513,56 +517,48 @@ export async function runLoadedTurn(
             markTurnInFlight(graphThreadId);
             claimedGraphThread = true;
             const prev = existing?.lastConversationId ?? null;
-            if (prev === conversationId) return null;
-            const boundary = prev !== null;
-            // The divider is a checkpoint write by something that is not an invoke, so an invoke
-            // that started earlier — a turn of the conversation that just ended, still generating —
-            // will save the channel it loaded and erase it, while the marker below is a DB row that
-            // would advance for good. Advancing the marker for a divider that got erased spends the
-            // one chance to write it.
-            //
-            // So this turn does not claim the boundary: the marker stays put and the next turn writes
-            // the divider with no invoke in the way. Only the PROMPT is at stake either way — the cut
-            // finds the boundary from the conversation stamped on each message, so a divider that
-            // never lands costs a hint in one prompt, not an attendance.
-            //
-            // Compaction is armed all the same. The attendance that just ended is compactable RIGHT
-            // NOW — its boundary is on the messages, not on the divider this turn declined to write —
-            // and withholding the arm would make it wait on a next turn that may never come.
-            if (boundary && anotherInvokeIsReading) return prev as number;
-            if (boundary) {
-              // Only when this attendance has not started yet. A claim skipped earlier (an
-              // overlapping invoke) leaves the turns that ran meanwhile in the thread, and the divider
-              // can only be APPENDED — landing after them, telling the model that part of the
-              // conversation it is in the middle of is a past attendance. A hint in the wrong place
-              // is worse than no hint, and the cut does not need it either way.
-              const already = await dividerGraph.getState({
-                configurable: { thread_id: graphThreadId },
-              });
-              const started = (
-                ((already.values as { messages?: BaseMessage[] } | undefined)
-                  ?.messages ?? []) as BaseMessage[]
-              ).some((m) => stampedConversationId(m) === conversationId);
-              if (!started) {
-                await dividerGraph.updateState(
-                  { configurable: { thread_id: graphThreadId } },
-                  { messages: [conversationDividerMessage(conversationId)] },
-                  THREAD_STATE_NODE,
-                );
-              }
-            }
-            await db.agentThread.upsert({
-              where: key,
-              create: {
-                tenantId,
-                chatwootInstanceId: instanceId,
-                contactInboxId,
-                threadId: graphThreadId,
-                lastConversationId: conversationId,
-              },
-              update: { lastConversationId: conversationId },
+            const alreadyStarted = needsAttendanceStartProbe(
+              prev,
+              conversationId,
+              anotherInvokeIsReading,
+            )
+              ? (
+                  (
+                    (
+                      await dividerGraph.getState({
+                        configurable: { thread_id: graphThreadId },
+                      })
+                    ).values as { messages?: BaseMessage[] } | undefined
+                  )?.messages ?? []
+                ).some((m) => stampedConversationId(m) === conversationId)
+              : false;
+            const claim = claimAttendanceBoundary({
+              previousConversationId: prev,
+              conversationId,
+              anotherInvokeIsReading,
+              attendanceAlreadyStarted: alreadyStarted,
             });
-            return boundary ? (prev as number) : null;
+            if (claim.writeDivider) {
+              await dividerGraph.updateState(
+                { configurable: { thread_id: graphThreadId } },
+                { messages: [conversationDividerMessage(conversationId)] },
+                THREAD_STATE_NODE,
+              );
+            }
+            if (claim.advanceMarker) {
+              await db.agentThread.upsert({
+                where: key,
+                create: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  contactInboxId,
+                  threadId: graphThreadId,
+                  lastConversationId: conversationId,
+                },
+                update: { lastConversationId: conversationId },
+              });
+            }
+            return claim.closedConversationId;
           }),
       );
       if (closedConversationId !== null) {

@@ -74,6 +74,7 @@ describe("renderTranscript", () => {
           },
           true,
         ),
+        91,
       ),
       new AIMessage("Oi Renata! Passando para saber se ficou tudo certo."),
     ]);
@@ -119,7 +120,7 @@ describe("renderTranscript", () => {
   // is reworded.
   test("a nudge is recognized by its marker, not by what it says", () => {
     const t = renderTranscript([
-      nudgeMessage("lembre o cliente do orçamento em aberto"),
+      nudgeMessage("lembre o cliente do orçamento em aberto", 91),
       new AIMessage("Oi! Passando para lembrar do orçamento."),
     ]);
     expect(t).not.toContain("lembre o cliente");

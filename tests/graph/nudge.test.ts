@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage, type BaseMessage } from "@langchain/core/messages";
+import {
+  AIMessage,
+  type BaseMessage,
+  HumanMessage,
+} from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
@@ -9,7 +13,12 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
-import { isNudgeTurn } from "@/graph/markers";
+import {
+  conversationStamp,
+  isConversationDivider,
+  isNudgeTurn,
+  stampedConversationId,
+} from "@/graph/markers";
 import {
   FOLLOWUP_SKIP_SENTINEL,
   isNudgeSilent,
@@ -18,7 +27,9 @@ import {
   renderNudge,
   runAgentNudge,
 } from "@/graph/nudge";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { EmptyThenReplyModel } from "../utils/scripted-models";
 
@@ -252,6 +263,8 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     if (tenantId) {
       for (const table of [
         "llm_usage",
+        "scheduler_jobs",
+        "agent_threads",
         "conversations",
         "inboxes",
         "agents",
@@ -491,6 +504,159 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     );
     expect(injected).toBeDefined();
     expect(isNudgeTurn(injected as BaseMessage)).toBe(true);
+  });
+
+  // Seeds a thread that already holds a finished attendance, and the sidecar row saying so.
+  async function seedPriorAttendance(
+    contactInboxId: number,
+    previousConversationId: number,
+    saver: MemorySaver,
+  ) {
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await suDb.agentThread.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId,
+        lastConversationId: previousConversationId,
+      },
+    });
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: threadId } },
+      {
+        messages: [
+          new HumanMessage({
+            content: "quanto custa a avaliação?",
+            additional_kwargs: conversationStamp(previousConversationId),
+          }),
+          new AIMessage("Custa R$ 250,00."),
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    return threadId;
+  }
+
+  // THE REGRESSION. A proactive nudge can be the first thing that happens on a NEW conversation — a
+  // redirect follow-up that lands before the customer says anything. Unstamped, the cut read the
+  // PREVIOUS attendance as still current, so the nudge and the reply it produced were summarized and
+  // deleted as part of it: the agent's own proactive message vanished from the memory of an
+  // attendance that had not even started.
+  test("a nudge that opens a new attendance is not swept into the previous one", async () => {
+    const contactInboxId = 8810;
+    const saver = new MemorySaver();
+    const threadId = await seedPriorAttendance(contactInboxId, 940, saver);
+    await seedConv(941, null, new Date(), contactInboxId);
+    const s = stub();
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:941`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+
+    const cp = await saver.get({ configurable: { thread_id: threadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    const nudge = messages.find((m) => isNudgeTurn(m));
+    expect(nudge).toBeDefined();
+    expect(stampedConversationId(nudge as BaseMessage)).toBe(941);
+
+    // The whole point of the stamp: the cut leaves the new attendance alone. Everything the nudge
+    // put in the thread — its own turn and the reply it produced — is OPEN, and only the previous
+    // attendance is closed.
+    const cut = selectClosedPrefix(messages, {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed.map((m) => String(m.content))).toEqual([
+      "quanto custa a avaliação?",
+      "Custa R$ 250,00.",
+    ]);
+    expect(cut.open.some((m) => isNudgeTurn(m))).toBe(true);
+    expect(cut.open.some((m) => String(m.content) === "Tudo certo?")).toBe(
+      true,
+    );
+
+    // The divider is prompt content, and it rides in the nudge's OWN invoke: written separately just
+    // before it, the invoke would save the channel it had already loaded and erase it.
+    expect(messages.some((m) => isConversationDivider(m))).toBe(true);
+  });
+
+  // The sidecar row is what resolve-time compaction reads to know which attendance the thread is on.
+  // A nudge that opened the conversation used to leave it absent, and the job then exited at its
+  // generation fence — the attendance was never summarized at all.
+  test("a nudge creates the sidecar row when it is the thread's first activity", async () => {
+    const contactInboxId = 8811;
+    await seedConv(942, null, new Date(), contactInboxId);
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:942`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(row?.lastConversationId).toBe(942);
+  });
+
+  // Crossing the boundary is also what makes the attendance that ENDED compactable. A nudge that
+  // consumed the boundary without arming would leave that attendance waiting on a next writer that
+  // may never come.
+  test("a nudge that crosses a boundary arms compaction and advances the marker", async () => {
+    const contactInboxId = 8812;
+    const saver = new MemorySaver();
+    const threadId = await seedPriorAttendance(contactInboxId, 943, saver);
+    await seedConv(944, null, new Date(), contactInboxId);
+    const s = stub();
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:944`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(row?.lastConversationId).toBe(944);
+    const job = await suDb.schedulerJob.findFirst({
+      where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
+    });
+    expect(job).not.toBeNull();
   });
 
   test("outside the 24h window (no template) → private note, not a free-form message", async () => {
