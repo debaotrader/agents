@@ -577,6 +577,92 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(isTurnInFlight(threadId)).toBe(false);
   });
 
+  // The divider is written by something that is NOT an invoke, so an invoke that started earlier —
+  // a turn of the conversation that just ended, still generating — saves the channel it loaded and
+  // erases it. The marker is a DB row and would survive, so the boundary would exist nowhere and no
+  // later turn would look for it again: two attendances summarized as one, permanently.
+  test("a boundary is not claimed while another invoke is reading the thread", async () => {
+    const contact = await suDb.contact.create({
+      data: { tenantId, chatwootContactId: 558, name: "Cliente" },
+      select: { id: true },
+    });
+    const contactInboxId = 7004;
+    for (const convId of [980, 981]) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          contactId: contact.id,
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+    }
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const saver = new MemorySaver();
+    const turn = (conversationId: number) =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: saver,
+        },
+      });
+
+    await turn(980);
+    // A turn of the OLD conversation, still invoking when the new one arrives.
+    markTurnInFlight(graphThreadId);
+    try {
+      await turn(981);
+    } finally {
+      clearTurnInFlight(graphThreadId);
+    }
+
+    // The marker stayed put, so the boundary is still there to be claimed.
+    const marker = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(marker.lastConversationId).toBe(980);
+
+    // And the NEXT turn, with nothing in flight, claims it: divider written, marker advanced.
+    await turn(981);
+    const after = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(after.lastConversationId).toBe(981);
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((
+      cp?.channel_values as { messages?: BaseMessage[] } | undefined
+    )?.messages ?? []) as BaseMessage[];
+    expect(
+      selectClosedPrefix(messages, { currentAttendanceClosed: false }).closed,
+    ).toHaveLength(4);
+  });
+
   test("inbox without an Agent → no-agent (silent)", async () => {
     const sent: Array<[number, string]> = [];
     const outcome = await runAgentTurn({

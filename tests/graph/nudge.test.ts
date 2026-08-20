@@ -340,6 +340,86 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(isTurnInFlight(graphThreadId)).toBe(false);
   });
 
+  // The claim is taken inside a transaction, and a transaction can reject AFTER its callback ran (a
+  // failed commit, a lost connection). A claim made on the way to a rejection that skips the release
+  // never comes back: every later compaction on this thread reads it as busy and reschedules until
+  // the process restarts.
+  test("a claim taken on a transaction that then rejects is still released", async () => {
+    const contactInboxId = 8803;
+    await seedConv(914, null, new Date(), contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    // Fails ONLY the transaction that takes the claim, and only on the way OUT — the callback, and
+    // the mark inside it, already ran. That transaction is the one that acquires the advisory lock,
+    // which is how it is told apart from the scoped reads the nudge makes before it; failing all of
+    // them would abort the nudge before it ever claimed, and the test would pass with the bug in.
+    // biome-ignore lint/suspicious/noExplicitAny: proxying Prisma's client surface
+    const failCommitOnLock = (client: any): any =>
+      new Proxy(client, {
+        get(target, prop, receiver) {
+          if (prop === "$extends") {
+            return (...args: unknown[]) =>
+              failCommitOnLock(target.$extends(...args));
+          }
+          if (prop === "$transaction") {
+            return async (fn: (tx: unknown) => Promise<unknown>) => {
+              let tookTheLock = false;
+              // biome-ignore lint/suspicious/noExplicitAny: proxying Prisma's client surface
+              const out = await target.$transaction((tx: any) =>
+                fn(
+                  new Proxy(tx, {
+                    // biome-ignore lint/suspicious/noExplicitAny: same
+                    get(t2: any, p2: string | symbol, r2: unknown) {
+                      if (p2 === "$executeRaw") {
+                        return (
+                          strings: TemplateStringsArray,
+                          ...v: unknown[]
+                        ) => {
+                          if (
+                            String(strings?.[0]).includes(
+                              "pg_advisory_xact_lock",
+                            )
+                          ) {
+                            tookTheLock = true;
+                          }
+                          return t2.$executeRaw(strings, ...v);
+                        };
+                      }
+                      return Reflect.get(t2, p2, r2);
+                    },
+                  }),
+                ),
+              );
+              if (tookTheLock) throw new Error("connection lost on commit");
+              return out;
+            };
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      });
+    const rejectingBase = failCommitOnLock(appDb) as typeof appDb;
+    const s2 = stub();
+
+    await expect(
+      runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:914`,
+        nudge: { source: "followup", kind: "inactivity", step: 1 },
+        base: rejectingBase,
+        deps: {
+          makeModel: () => new FakeListChatModel({ responses: ["Oi!"] }),
+          makeClient: s2.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      }),
+    ).rejects.toThrow();
+    expect(isTurnInFlight(graphThreadId)).toBe(false);
+  });
+
   test("invokes on the per-contact-inbox memory thread, not the per-conversation thread (unification)", async () => {
     const contactInboxId = 8800;
     await seedConv(907, null, new Date(), contactInboxId);

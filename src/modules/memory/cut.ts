@@ -6,6 +6,7 @@ import {
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
 } from "@/graph/markers";
+import { formatWithPattern } from "@/graph/time";
 
 // Where one attendance ends and the next begins, inside the contact's memory thread.
 //
@@ -94,13 +95,20 @@ export interface SummaryRow {
 
 // Renders the compacted memory as the thread's first message. Ordered oldest-first, which is how the
 // raw turns it replaces were ordered. Rides in a HumanMessage: see src/graph/markers.ts.
-export function renderMemoryHead(rows: SummaryRow[]): HumanMessage | null {
+// `timezone` is the agent's own (AgentConfig.timezone, from its BusinessHours). Dating in UTC instead
+// would put an attendance from 22:30 on the 19th in Sao Paulo on the 20th, and that wrong date then
+// rides in every future prompt as fact. It is also the timezone {{data_atual}} already renders in, so
+// the model would otherwise be reading two calendars at once.
+export function renderMemoryHead(
+  rows: SummaryRow[],
+  timezone: string,
+): HumanMessage | null {
   const kept = rows.slice(-MEMORY_HEAD_MAX_ATTENDANCES);
   const entries = kept
     .map((r) => {
       const text = r.summary.replace(FENCE_TAG, "").trim();
       if (!text) return null;
-      const date = r.attendanceAt.toISOString().slice(0, 10);
+      const date = formatWithPattern(r.attendanceAt, timezone, "YYYY-MM-DD");
       return `<atendimento data="${date}">\n${text}\n</atendimento>`;
     })
     .filter((e): e is string => e !== null);

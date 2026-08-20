@@ -40,7 +40,11 @@ import {
   resolveGraphThreadId,
 } from "./checkpointer";
 import { lastAssistantText } from "./graph";
-import { clearTurnInFlight, markTurnInFlight } from "./inflight";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "./inflight";
 import { conversationDividerMessage } from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
@@ -493,6 +497,9 @@ export async function runLoadedTurn(
               where: key,
               select: { lastConversationId: true },
             });
+            // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke is
+            // mid-flight on this thread. See the boundary deferral below.
+            const anotherInvokeIsReading = isTurnInFlight(graphThreadId);
             // Claim the thread against a memory-compaction rewrite, under the lock the rewrite also
             // holds while it checks. That makes the two exclusive rather than merely staggered: the
             // rewrite either completes before this claim — and the invoke below then loads the
@@ -504,6 +511,17 @@ export async function runLoadedTurn(
             const prev = existing?.lastConversationId ?? null;
             if (prev === conversationId) return null;
             const boundary = prev !== null;
+            // The divider is a checkpoint write by something that is not an invoke, so an invoke that
+            // started earlier — a turn of the conversation that just ended, still generating — will
+            // save the channel it loaded and erase it. The marker below, though, is a DB row: it
+            // would advance for good. The boundary would then exist nowhere, no later turn would look
+            // for it again (the marker already says we moved on), and the two attendances would be
+            // summarized as one.
+            //
+            // So this turn does not claim the boundary at all. The marker stays put, and the next
+            // turn on this conversation claims it with no invoke in the way. The cost is one turn
+            // whose prompt lacks the divider; the alternative is losing the boundary permanently.
+            if (boundary && anotherInvokeIsReading) return null;
             if (boundary) {
               await dividerGraph.updateState(
                 { configurable: { thread_id: graphThreadId } },

@@ -407,7 +407,7 @@ export async function runCompaction(
         orderBy: [{ attendanceAt: "asc" }, { id: "asc" }],
         select: { conversationId: true, summary: true, attendanceAt: true },
       });
-      const head = renderMemoryHead(rows);
+      const head = renderMemoryHead(rows, cfg.timezone);
       // The update REMOVES BY ID and never clears the channel. REMOVE_ALL_MESSAGES would have been
       // shorter, and wrong: it replaces the whole list with what this update carries, so a message
       // appended between the read above and this write would be erased. Ingestion is held off by the

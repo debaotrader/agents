@@ -488,13 +488,19 @@ export async function runAgentNudge(
   // and the raw history it replaced comes back. The mark is taken under the lock the rewrite holds,
   // which is what makes the two exclusive rather than merely staggered, and released in the `finally`
   // below — the window only has to cover the invoke, since nothing after it writes the thread.
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
-    withEntityLock(db, `ingest:${graphThreadId}`, async () => {
-      markTurnInFlight(graphThreadId);
-    }),
-  );
+  let claimedGraphThread = false;
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
+    // Taken INSIDE the try, and released only if it was actually taken: the transaction can reject
+    // after its callback ran (a failed commit, a lost connection), and a claim made on the way to a
+    // rejection that skips the `finally` never comes back — every later compaction on this thread
+    // would read it as busy and reschedule until the process restarts.
+    await runScopedOn(base, sysCtx(tenantId), (db) =>
+      withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+        markTurnInFlight(graphThreadId);
+        claimedGraphThread = true;
+      }),
+    );
     // A suspended interrupt (human-in-the-loop) must not be barged over — defer the nudge.
     try {
       const state = await graph.getState(invokeConfig);
@@ -517,7 +523,7 @@ export async function runAgentNudge(
       invokeConfig,
     );
   } finally {
-    clearTurnInFlight(graphThreadId);
+    if (claimedGraphThread) clearTurnInFlight(graphThreadId);
   }
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
