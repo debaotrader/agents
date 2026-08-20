@@ -51,12 +51,14 @@ const BASE_URL = "https://203.0.113.22:9";
 const BOT_TOKEN = "AWAY-BOT-TOKEN";
 const INBOX_WITH_COPY = 881;
 const INBOX_SILENT = 882;
+const INBOX_DISABLED = 883;
 const AWAY_COPY = "Estamos fechados. Voltamos {proximo_atendimento}.";
 
 let tenantId = 0n;
 let instanceId = 0n;
 let inboxWithCopyId = 0n;
 let inboxSilentId = 0n;
+let inboxDisabledId = 0n;
 
 function localDate(days: number): string {
   const at = new Date(Date.now() + days * 86_400_000);
@@ -262,14 +264,29 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
       },
       select: { id: true },
     });
+    // Same copy, switched OFF: the operator turned this agent's voice off, schedule or no schedule.
+    const disabled = await suDb.agent.create({
+      data: {
+        ...baseAgent,
+        name: "Desligado",
+        enabled: false,
+        settings: {
+          debounce: { enabled: false },
+          split: { enabled: false },
+          availability: { awayMessage: AWAY_COPY },
+        },
+      },
+      select: { id: true },
+    });
     // One bot per persona, which is what makes the persona token the sender identity.
-    for (const agentId of [withCopy.id, silent.id]) {
+    for (const agentId of [withCopy.id, silent.id, disabled.id]) {
       await suDb.chatwootAgentBot.create({
         data: {
           tenantId,
           chatwootInstanceId: instanceId,
           agentId,
-          chatwootAgentBotId: agentId === withCopy.id ? 9 : 10,
+          chatwootAgentBotId:
+            agentId === withCopy.id ? 9 : agentId === silent.id ? 10 : 11,
           accessToken: encryptJson(BOT_TOKEN),
           webhookSecret: encryptJson("SECRET"),
           webhookRouteTokenHash: `hash-${process.pid}-${agentId}`,
@@ -299,6 +316,17 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
       select: { id: true },
     });
     inboxSilentId = b.id;
+    const c = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: INBOX_DISABLED,
+        name: "Desligado",
+        agentId: disabled.id,
+      },
+      select: { id: true },
+    });
+    inboxDisabledId = c.id;
   });
 
   afterAll(async () => {
@@ -370,6 +398,19 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
 
     expect(publicOn(convId)).toHaveLength(1);
     expect(notesOn(convId)).toHaveLength(1);
+  });
+
+  // Disabling an agent switches off everything it says to the CUSTOMER. The operator note is the
+  // pre-existing behavior of this branch and stays.
+  test("a disabled agent tells the operator but never the customer", async () => {
+    const convId = 9107;
+    await seedConversation(convId, inboxDisabledId);
+    await deliverCustomerMessage(convId, INBOX_DISABLED, 10);
+
+    expect(publicOn(convId)).toEqual([]);
+    expect(
+      notesOn(convId).some((p) => p.content.includes("fora do horário")),
+    ).toBe(true);
   });
 
   // The dispatch is detached: two messages in a row can be processed by two invocations that both

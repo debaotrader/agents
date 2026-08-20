@@ -956,7 +956,7 @@ export function BehaviorTab({
               label={t("editor.awayMessage", "Out-of-hours message")}
               description={t(
                 "editor.awayMessageHint",
-                "Sent to the customer while the agent is outside these hours, at most once a day per conversation. Leave it empty to stay silent. Write {proximo_atendimento} (or {next_open}) where the next opening should appear.",
+                "Sent to the customer while the agent is outside these hours, at most once a day per conversation. Leave it empty to stay silent. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear.",
               )}
             >
               <Textarea
@@ -966,7 +966,7 @@ export function BehaviorTab({
                 maxLength={TEMPLATE_MESSAGE_MAX}
                 placeholder={t(
                   "editor.awayMessagePlaceholder",
-                  "We are closed right now. We will be back {proximo_atendimento}.",
+                  "We are closed right now. We will be back {next_open}.",
                 )}
               />
             </FormField>

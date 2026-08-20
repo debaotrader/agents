@@ -703,6 +703,7 @@ async function maybeConsumeCommandOrGate(params: {
     let inboxChatwootId: number | null = null;
     let agentSettings: unknown = null;
     let mode = "production";
+    let agentEnabled = true;
     let hours: Schedule | null = null;
     if (conv.inboxId !== null) {
       const inbox = await db.inbox.findUnique({
@@ -714,10 +715,16 @@ async function maybeConsumeCommandOrGate(params: {
         agentId = inbox.agentId;
         const agent = await db.agent.findUnique({
           where: { id: inbox.agentId },
-          select: { mode: true, businessHoursId: true, settings: true },
+          select: {
+            mode: true,
+            enabled: true,
+            businessHoursId: true,
+            settings: true,
+          },
         });
         if (agent) {
           mode = agent.mode;
+          agentEnabled = agent.enabled;
           agentSettings = agent.settings;
           // The agent's "Availability" schedule (businessHoursId) gates REACTIVE replies: outside it
           // the agent stays silent (a one-shot private note tells the operator). Empty = always on.
@@ -731,7 +738,15 @@ async function maybeConsumeCommandOrGate(params: {
         }
       }
     }
-    return { conv, agentId, mode, hours, inboxChatwootId, agentSettings };
+    return {
+      conv,
+      agentId,
+      mode,
+      agentEnabled,
+      hours,
+      inboxChatwootId,
+      agentSettings,
+    };
   });
   if (!ctx) return false;
 
@@ -1077,8 +1092,12 @@ async function maybeConsumeCommandOrGate(params: {
   if (availability.silence) {
     // The customer-facing half (#153). ctx.hours is non-null whenever the gate silences, so the
     // schedule the message describes is the one that just silenced the agent.
+    // A DISABLED agent still reaches this branch and still tells the operator why it is quiet, which
+    // is the pre-existing behavior of a note nobody but the operator sees. It must not acquire a voice
+    // toward the CUSTOMER here: an operator who switched the agent off switched off everything it says
+    // to the customer, and the runtime refuses to run it a few lines later for exactly that reason.
     const away =
-      availability.sendAway && ctx.hours
+      availability.sendAway && ctx.agentEnabled && ctx.hours
         ? renderAwayMessage({
             copy: readAvailabilityConfig(ctx.agentSettings).awayMessage,
             schedule: ctx.hours,
