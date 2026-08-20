@@ -22,16 +22,26 @@
 // lastFollowUpAt). At worst a restart mid-turn drops the guard for that one turn: the follow-up may
 // race one reply, and one compaction may be undone — recovered at the next attendance boundary,
 // where the summary row already exists and costs no second generation.
-const inFlight = new Set<string>();
+// COUNTED, not a set of present keys. Two turns really do overlap on one thread — two deliveries for
+// the same conversation race whenever debounce is off, and a follow-up nudge invokes on the same
+// memory thread as a reactive turn — and with plain membership the first one to finish releases a
+// claim the other is still holding. A compaction would then read the thread as idle, rewrite it, and
+// have the surviving invoke undo the rewrite: exactly the failure the claim exists to prevent, made
+// harder to see because it only happens under load.
+const inFlight = new Map<string, number>();
 
 export function markTurnInFlight(threadId: string): void {
-  inFlight.add(threadId);
+  inFlight.set(threadId, (inFlight.get(threadId) ?? 0) + 1);
 }
 
+// Releases ONE claim. Callers must release exactly what they took: an unbalanced release is not a
+// harmless no-op, it hands the thread to a compaction while another invoke is still reading it.
 export function clearTurnInFlight(threadId: string): void {
-  inFlight.delete(threadId);
+  const left = (inFlight.get(threadId) ?? 0) - 1;
+  if (left > 0) inFlight.set(threadId, left);
+  else inFlight.delete(threadId);
 }
 
 export function isTurnInFlight(threadId: string): boolean {
-  return inFlight.has(threadId);
+  return (inFlight.get(threadId) ?? 0) > 0;
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -8,11 +8,16 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
-import { isTurnInFlight } from "@/graph/inflight";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "@/graph/inflight";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
@@ -473,6 +478,14 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // The customer's own message is untouched by the marker.
     expect(String(messages[3]?.content)).not.toContain("nova conversa");
     expect(String(messages[3]?.content)).toBe(String(messages[0]?.content));
+    // And the boundary is one the CUT can find. Recognition is by metadata, not by the text above,
+    // so a divider written without it would read as an ordinary turn here and the first attendance
+    // would never be compactable — the producer and the consumer only meet if this passes.
+    const cut = selectClosedPrefix(messages as unknown as BaseMessage[], {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed).toHaveLength(2);
+    expect(cut.open).toHaveLength(3);
   });
 
   // The producer half of the memory-compaction guard. The consumer half (a compaction that finds the
@@ -533,6 +546,35 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(claimedDuringInvoke).toEqual([true]);
     // And released on the way out, or compaction for this contact would defer itself forever.
     expect(isTurnInFlight(graphThreadId)).toBe(false);
+  });
+
+  // Without a contact-inbox there is no per-contact memory thread, and resolveGraphThreadId falls
+  // back to the per-CONVERSATION id — the very key the follow-up guard uses. A turn that releases a
+  // claim it never took would then release a concurrent turn's, and a nudge would fire into the
+  // middle of that turn: the bug the follow-up guard exists to prevent, reintroduced from the side.
+  test("a turn without a contact-inbox releases nothing it did not claim", async () => {
+    await seedConversation(976, null);
+    const threadId = `${tenantId}:${instanceId}:976`;
+    // Stands in for a concurrent turn on the same conversation, still running.
+    markTurnInFlight(threadId);
+    try {
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 976 }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(isTurnInFlight(threadId)).toBe(true);
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+    expect(isTurnInFlight(threadId)).toBe(false);
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {

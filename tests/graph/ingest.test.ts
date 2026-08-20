@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { HumanMessage } from "@langchain/core/messages";
+import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -8,6 +8,7 @@ import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import { buildAgentGraph } from "@/graph/graph";
 import { ingestMessageIntoThread } from "@/graph/ingest";
+import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -200,5 +201,13 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     expect(String(messages[0]?.content)).toBe("primeira");
     expect(String(messages[1]?.content)).toContain("nova conversa");
     expect(String(messages[1]?.content)).toContain("segunda");
+    // And it is a boundary the CUT can find. This path folds the marker into the customer's own
+    // message, so the text alone cannot say whether the customer wrote it — recognition is by
+    // metadata, and a divider written without it leaves the first attendance uncompactable forever.
+    const cut = selectClosedPrefix(messages as unknown as BaseMessage[], {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed).toHaveLength(1);
+    expect(cut.open).toHaveLength(1);
   });
 });

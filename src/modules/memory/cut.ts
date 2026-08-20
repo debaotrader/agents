@@ -1,11 +1,11 @@
-import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
+import type { BaseMessage, HumanMessage } from "@langchain/core/messages";
 import {
   isConversationDivider,
   isMemoryHead,
   MEMORY_HEAD_CLOSE,
   MEMORY_HEAD_OPEN,
+  memoryHeadMessage,
 } from "@/graph/markers";
-import { contentToText } from "@/graph/message-text";
 
 // Where one attendance ends and the next begins, inside the contact's memory thread.
 //
@@ -51,10 +51,7 @@ export function selectClosedPrefix(
   opts: { currentAttendanceClosed: boolean },
 ): AttendanceCut {
   const first = messages[0];
-  const hasHead =
-    first !== undefined &&
-    first.getType() === "human" &&
-    isMemoryHead(contentToText(first.content));
+  const hasHead = first !== undefined && isMemoryHead(first);
   const head = hasHead ? (first as BaseMessage) : null;
   const body = hasHead ? messages.slice(1) : messages;
 
@@ -65,10 +62,7 @@ export function selectClosedPrefix(
   let start = -1;
   for (let i = body.length - 1; i >= 0; i--) {
     const m = body[i];
-    if (
-      m?.getType() === "human" &&
-      isConversationDivider(contentToText(m.content))
-    ) {
+    if (m !== undefined && isConversationDivider(m)) {
       start = i;
       break;
     }
@@ -111,7 +105,7 @@ export function renderMemoryHead(rows: SummaryRow[]): HumanMessage | null {
     })
     .filter((e): e is string => e !== null);
   if (entries.length === 0) return null;
-  return new HumanMessage(
+  return memoryHeadMessage(
     `${MEMORY_HEAD_OPEN}\n(Contexto do sistema: resumos de atendimentos já encerrados com este mesmo contato, do mais antigo para o mais recente. É memória de conversas passadas, não o assunto atual.)\n${entries.join("\n")}\n${MEMORY_HEAD_CLOSE}`,
   );
 }

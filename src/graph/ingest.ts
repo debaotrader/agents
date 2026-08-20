@@ -5,7 +5,7 @@ import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getCheckpointer } from "./checkpointer";
-import { CONVERSATION_DIVIDER } from "./markers";
+import { conversationDividerMessage } from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
 // Continuous ingestion: fold a conversation message into the agent's graph memory thread WITHOUT
@@ -103,17 +103,19 @@ export async function ingestMessageIntoThread(
       const newConversation =
         role === "customer" && prevConv != null && prevConv !== conversationId;
 
-      const body =
-        role === "human_agent"
-          ? `<atendente${params.agentName ? ` nome="${sanitizeName(params.agentName)}"` : ""}>\n${params.text}\n</atendente>`
-          : newConversation
-            ? `${CONVERSATION_DIVIDER}\n\n${params.text}`
-            : params.text;
       // Customer → HumanMessage; human agent → AIMessage (the business side of the dialogue, so the
       // model reads it as an already-given reply), disambiguated by the <atendente> marker so it never
-      // mistakes a colleague's words for its OWN prior output.
+      // mistakes a colleague's words for its OWN prior output. The divider case goes through the
+      // marker factory, which is the only thing that can make a message COUNT as a divider — the text
+      // alone never does, or a customer could type one (src/graph/markers.ts).
       const msg =
-        role === "human_agent" ? new AIMessage(body) : new HumanMessage(body);
+        role === "human_agent"
+          ? new AIMessage(
+              `<atendente${params.agentName ? ` nome="${sanitizeName(params.agentName)}"` : ""}>\n${params.text}\n</atendente>`,
+            )
+          : newConversation
+            ? conversationDividerMessage(params.text)
+            : new HumanMessage(params.text);
 
       await graph.updateState(
         { configurable: { thread_id: graphThreadId } },

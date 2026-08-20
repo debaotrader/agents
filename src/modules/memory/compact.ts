@@ -1,13 +1,11 @@
-import {
-  type BaseMessage,
-  HumanMessage,
-  RemoveMessage,
-} from "@langchain/core/messages";
+import { type BaseMessage, RemoveMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
+import { memoryHeadMessage } from "@/graph/markers";
+import { contentToText } from "@/graph/message-text";
 import { createChatModel } from "@/graph/models";
 import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
@@ -427,7 +425,7 @@ export async function runCompaction(
         {
           messages: [
             ...(head && survivorId
-              ? [new HumanMessage({ id: survivorId, content: head.content })]
+              ? [memoryHeadMessage(contentToText(head.content), survivorId)]
               : []),
             ...dropped.map((m) => new RemoveMessage({ id: m.id as string })),
             // NOTE: With no head to keep (every summary came back empty), the survivor has nothing

@@ -18,8 +18,17 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
-import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
-import { CONVERSATION_DIVIDER, MEMORY_HEAD_OPEN } from "@/graph/markers";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "@/graph/inflight";
+import {
+  CONVERSATION_DIVIDER,
+  conversationDividerMessage,
+  MEMORY_HEAD_OPEN,
+  memoryHeadMessage,
+} from "@/graph/markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
 import { seedChatwootInstance } from "../utils/chatwoot";
@@ -188,7 +197,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       new HumanMessage(`quero marcar uma avaliação, ${SEEDED_TEXT}`),
       new AIMessage("Claro! Consegui terça 08h30, R$ 250."),
       new HumanMessage("pode ser, obrigado"),
-      new HumanMessage(`${CONVERSATION_DIVIDER}\n\noi, voltei`),
+      conversationDividerMessage("oi, voltei"),
       new AIMessage("Oi! Como posso ajudar?"),
     ];
   }
@@ -440,7 +449,7 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     await seedThread(saver, threadId, [
       new HumanMessage({ id: "m1", content: `pedido antigo, ${SEEDED_TEXT}` }),
       new AIMessage({ id: "m2", content: "combinado" }),
-      new HumanMessage({ id: "m3", content: CONVERSATION_DIVIDER }),
+      new HumanMessage({ id: "m3", content: "assunto novo" }),
     ]);
 
     const turn = turnGraph.invoke(
@@ -455,10 +464,10 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       cfg,
       {
         messages: [
-          new HumanMessage({
-            id: "m1",
-            content: `${MEMORY_HEAD_OPEN}resumo</atendimentos-anteriores>`,
-          }),
+          memoryHeadMessage(
+            `${MEMORY_HEAD_OPEN}resumo</atendimentos-anteriores>`,
+            "m1",
+          ),
           new RemoveMessage({ id: "m2" }),
         ],
       },
@@ -513,6 +522,42 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(await readThread(saver, threadId)).toEqual(
       twoAttendances().map((m) => String(m.content)),
     );
+  });
+
+  // Overlapping turns are ordinary here: two deliveries for one conversation race whenever debounce
+  // is off, and a follow-up nudge invokes on this same thread. With presence instead of a count, the
+  // FIRST turn to finish would release a claim the other still holds, and the rewrite would land in
+  // the middle of the surviving invoke — the exact undo the claim exists to prevent, visible only
+  // under load.
+  test("one turn finishing does not release a claim another turn still holds", async () => {
+    const contactInboxId = 5023;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const saver = new MemorySaver();
+    await seedThread(saver, threadId, twoAttendances());
+    const model = new SummarizerModel("resumo");
+
+    markTurnInFlight(threadId); // turn A
+    markTurnInFlight(threadId); // turn B, overlapping
+    clearTurnInFlight(threadId); // A finishes; B is still invoking
+    let result: Awaited<ReturnType<typeof runCompaction>>;
+    try {
+      result = await runCompaction(
+        tenantId,
+        payload(contactInboxId, 722, "new_attendance"),
+        appDb,
+        { checkpointer: saver, makeModel: () => model },
+      );
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+
+    expect(result.outcome).toBe("reschedule");
+    expect(model.calls).toBe(0);
+    expect(await readThread(saver, threadId)).toEqual(
+      twoAttendances().map((m) => String(m.content)),
+    );
+    // Balanced: once B releases too, the thread is free again.
+    expect(isTurnInFlight(threadId)).toBe(false);
   });
 
   test("a turn that starts while the summarizer runs is caught by the locked check", async () => {
