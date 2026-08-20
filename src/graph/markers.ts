@@ -54,6 +54,23 @@ export function stampedConversationId(message: BaseMessage): number | null {
   return typeof raw === "number" ? raw : null;
 }
 
+// WHICH ATTENDANCE THE THREAD IS ON, which is the last stamped message's — not "any message stamped
+// with X exists somewhere". A conversation can be REOPENED after another has already run on this
+// thread (an operator picking an old one back up, a human agent replying in it), so a stamp appearing
+// earlier says nothing about where the thread is now. Asking "does X appear anywhere" answered yes
+// for an attendance that ended long ago, and every reader of that answer got it wrong in its own way.
+export function lastStampedConversationId(
+  messages: BaseMessage[],
+): number | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined) continue;
+    const stamp = stampedConversationId(m);
+    if (stamp !== null) return stamp;
+  }
+  return null;
+}
+
 // Folded into the first human turn of a NEW conversation when the contact-inbox thread already
 // carries memory from a prior one. Written by both the reactive turn (src/graph/runtime.ts) and the
 // silent-message ingestion (src/graph/ingest.ts) — the first as its own message, the second prepended

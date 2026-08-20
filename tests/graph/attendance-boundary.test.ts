@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import {
+  attendanceHasStarted,
   claimAttendanceBoundary,
   crossesAttendanceBoundary,
   needsAttendanceStartProbe,
 } from "@/graph/attendance-boundary";
+import { conversationStamp } from "@/graph/markers";
 
 // Decision table for the boundary claim shared by the three writers of a contact's memory thread
 // (runtime, ingest, nudge). Every row is a state one of them can actually be in; the columns are the
@@ -129,5 +132,45 @@ describe("needsAttendanceStartProbe", () => {
     expect(needsAttendanceStartProbe(6, 7, true)).toBe(false);
     expect(needsAttendanceStartProbe(7, 7, false)).toBe(false);
     expect(needsAttendanceStartProbe(null, 7, false)).toBe(false);
+  });
+});
+
+describe("attendanceHasStarted", () => {
+  const stamped = (conversation: number) =>
+    new HumanMessage({
+      content: "x",
+      additional_kwargs: conversationStamp(conversation),
+    });
+
+  test("an empty thread has started nothing", () => {
+    expect(attendanceHasStarted([], 7)).toBe(false);
+  });
+
+  test("the attendance the last stamped message belongs to has started", () => {
+    expect(attendanceHasStarted([stamped(7)], 7)).toBe(true);
+  });
+
+  // Assistant replies carry no stamp and sit after the human turn of their own attendance, so the
+  // scan has to walk past them rather than stop at the end of the array.
+  test("unstamped replies at the end do not hide the answer", () => {
+    expect(attendanceHasStarted([stamped(7), new AIMessage("oi")], 7)).toBe(
+      true,
+    );
+  });
+
+  // THE REOPENED CASE. Asking "does 1 appear anywhere" answered yes for an attendance that ended
+  // before 2 ran, so the writer skipped the divider for a conversation that had genuinely just
+  // resumed — and the first turn of it reached the model as a continuation of 2. The stamp is inert
+  // to the model; the divider is the only part it reads.
+  test("a conversation that ran EARLIER has not started the current attendance", () => {
+    const thread = [stamped(1), new AIMessage("resposta"), stamped(2)];
+    expect(attendanceHasStarted(thread, 1)).toBe(false);
+    expect(attendanceHasStarted(thread, 2)).toBe(true);
+  });
+
+  test("a conversation reopened at the end HAS started", () => {
+    const thread = [stamped(1), stamped(2), stamped(1)];
+    expect(attendanceHasStarted(thread, 1)).toBe(true);
+    expect(attendanceHasStarted(thread, 2)).toBe(false);
   });
 });

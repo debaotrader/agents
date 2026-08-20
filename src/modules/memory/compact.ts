@@ -426,6 +426,11 @@ export async function runCompaction(
         tenantId,
         threadId: graphThreadId,
         node: "memory_compact",
+        // The SEGMENT's conversation, not the payload's. Several boundaries can pass before a claimed
+        // job reads the thread, and the row and the flow event already say which segment this is; a
+        // usage row and a trace that said something else would put this spend on an attendance that
+        // was never summarized here.
+        conversationId: segment?.id ?? null,
         model: cfg.mc.model,
         source: "inbox",
         base,

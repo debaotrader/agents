@@ -1,6 +1,7 @@
 import type { BaseMessage, HumanMessage } from "@langchain/core/messages";
 import {
   isMemoryHead,
+  lastStampedConversationId,
   MEMORY_HEAD_CLOSE,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
@@ -74,18 +75,19 @@ export function selectClosedPrefix(
   // prompt from then on — silently, and permanently, since no later boundary changes the answer.
   // Threads carrying several raw attendances at once are exactly where this shows up: compaction
   // newly enabled, or a run that kept failing.
-  let current: number | null = null;
+  const current = lastStampedConversationId(body);
   let start = -1;
-  for (let i = body.length - 1; i >= 0; i--) {
-    const m = body[i];
-    if (m === undefined) continue;
-    const stamp = stampedConversationId(m);
-    if (stamp === null) continue;
-    if (current === null) current = stamp;
-    // A different conversation ends the run: everything at or below it belongs to an attendance
-    // that is over.
-    if (stamp !== current) break;
-    start = i;
+  if (current !== null) {
+    for (let i = body.length - 1; i >= 0; i--) {
+      const m = body[i];
+      if (m === undefined) continue;
+      const stamp = stampedConversationId(m);
+      if (stamp === null) continue;
+      // A different conversation ends the run: everything at or below it belongs to an attendance
+      // that is over.
+      if (stamp !== current) break;
+      start = i;
+    }
   }
   // NOTE: Invariant 3 — one attendance (or a thread written before stamps existed) means everything
   // present belongs to the attendance in progress. A thread that predates stamps compacts on its next

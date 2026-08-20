@@ -35,6 +35,7 @@ import { deliverReply } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import {
+  attendanceHasStarted,
   claimAttendanceBoundary,
   needsAttendanceStartProbe,
 } from "./attendance-boundary";
@@ -49,11 +50,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
-import {
-  conversationDividerMessage,
-  conversationStamp,
-  stampedConversationId,
-} from "./markers";
+import { conversationDividerMessage, conversationStamp } from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -522,15 +519,16 @@ export async function runLoadedTurn(
               conversationId,
               anotherInvokeIsReading,
             )
-              ? (
+              ? attendanceHasStarted(
                   (
                     (
                       await dividerGraph.getState({
                         configurable: { thread_id: graphThreadId },
                       })
                     ).values as { messages?: BaseMessage[] } | undefined
-                  )?.messages ?? []
-                ).some((m) => stampedConversationId(m) === conversationId)
+                  )?.messages ?? [],
+                  conversationId,
+                )
               : false;
             const claim = claimAttendanceBoundary({
               previousConversationId: prev,

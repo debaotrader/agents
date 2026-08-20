@@ -5,16 +5,13 @@ import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
+  attendanceHasStarted,
   claimAttendanceBoundary,
   needsAttendanceStartProbe,
 } from "./attendance-boundary";
 import { getCheckpointer } from "./checkpointer";
 import { isTurnInFlight } from "./inflight";
-import {
-  conversationDividerMessage,
-  conversationStamp,
-  stampedConversationId,
-} from "./markers";
+import { conversationDividerMessage, conversationStamp } from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
 // Continuous ingestion: fold a customer message into the agent's graph memory thread WITHOUT running
@@ -107,15 +104,16 @@ export async function ingestMessageIntoThread(
         conversationId,
         anotherInvokeIsReading,
       )
-        ? (
+        ? attendanceHasStarted(
             (
               (
                 await graph.getState({
                   configurable: { thread_id: graphThreadId },
                 })
               ).values as { messages?: BaseMessage[] } | undefined
-            )?.messages ?? []
-          ).some((m) => stampedConversationId(m) === conversationId)
+            )?.messages ?? [],
+            conversationId,
+          )
         : false;
       const claim = claimAttendanceBoundary({
         previousConversationId: prevConv,

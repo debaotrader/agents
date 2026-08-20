@@ -74,6 +74,49 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     await appDb.$disconnect();
   });
 
+  // A conversation can be REOPENED after another has already run on this thread — an operator picking
+  // an old one back up, a human agent replying in it. The probe that decides whether to write the
+  // divider used to ask "does this conversation appear ANYWHERE in the thread", and the earlier run
+  // answered yes: no divider, so the first turn of the resumed attendance reached the model as a
+  // continuation of the conversation that ran in between. The stamp is inert to the model; the
+  // divider is the only part of this it reads.
+  test("a conversation reopened after another one still opens a new attendance", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 12377;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const ingest = (conversationId: number, messageId: number, text: string) =>
+      ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId,
+        contactInboxId,
+        graphThreadId,
+        base: appDb,
+        checkpointer: saver,
+        messageId,
+        text,
+      });
+
+    // Conversation 880, then 881 — an ordinary boundary — then 880 again.
+    expect(await ingest(880, 1, "primeira dúvida")).toBe("ingested");
+    expect(await ingest(881, 2, "outro assunto")).toBe("ingested");
+    expect(await ingest(880, 3, "voltei naquele assunto")).toBe("ingested");
+
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    const dividers = messages.filter((m) => isConversationDivider(m));
+    // One for 881, one for the reopened 880 — the second is the one that used to be missing.
+    expect(dividers.length).toBe(2);
+    expect(String(dividers.at(-1)?.content)).toContain(
+      "voltei naquele assunto",
+    );
+  });
+
   test("appends to the same thread a real turn uses; the next turn sees the ingested messages", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12345;

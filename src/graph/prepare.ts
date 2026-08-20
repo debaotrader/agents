@@ -1040,6 +1040,11 @@ export interface CallbacksArgs {
   // turn itself; a secondary call on a separately-configured model (the speech normalizer) must pass
   // the model it actually billed, or the row attributes that spend to the wrong model.
   model?: string;
+  // The conversation to ATTRIBUTE the usage row and the trace to. Defaults to the one the config was
+  // loaded for, which is right for a turn; memory compaction is the exception, because a claimed job
+  // can find the thread already past the conversation its payload named, and the summary it bills is
+  // of the segment it actually cut.
+  conversationId?: bigint | null;
   // Passed through to the Langfuse handler: false for a secondary call sharing the turn's trace.
   // See TraceContext.updateRoot.
   updateRoot?: boolean;
@@ -1059,7 +1064,7 @@ export function buildCallbacks(
   const usage = new UsageCapture({
     tenantId: args.tenantId,
     agentId: cfg.agentId,
-    conversationId: cfg.conversationDbId,
+    conversationId: args.conversationId ?? cfg.conversationDbId,
     inboxId: cfg.inboxDbId,
     threadId: args.threadId,
     model: args.model ?? cfg.mc.model,
@@ -1072,7 +1077,7 @@ export function buildCallbacks(
   const langfuse = buildLangfuseHandler(cfg.langfuseCfg, {
     tenantId: args.tenantId,
     threadId: args.threadId,
-    conversationId: cfg.conversationDbId,
+    conversationId: args.conversationId ?? cfg.conversationDbId,
     agentId: cfg.agentId,
     userId: cfg.langfuseCfg?.tenantSlug,
     turnId: args.turnId,

@@ -18,6 +18,7 @@ import {
   proactiveSendMode,
 } from "@/modules/service-window/service";
 import {
+  attendanceHasStarted,
   claimAttendanceBoundary,
   needsAttendanceStartProbe,
 } from "./attendance-boundary";
@@ -32,11 +33,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
-import {
-  conversationDividerMessage,
-  nudgeMessage,
-  stampedConversationId,
-} from "./markers";
+import { conversationDividerMessage, nudgeMessage } from "./markers";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -570,13 +567,14 @@ export async function runAgentNudge(
           conversationId,
           anotherInvokeIsReading,
         )
-          ? (
+          ? attendanceHasStarted(
               (
                 (await graph.getState(invokeConfig)).values as
                   | { messages?: BaseMessage[] }
                   | undefined
-              )?.messages ?? []
-            ).some((m) => stampedConversationId(m) === conversationId)
+              )?.messages ?? [],
+              conversationId,
+            )
           : false;
         const decided = claimAttendanceBoundary({
           previousConversationId: previous,

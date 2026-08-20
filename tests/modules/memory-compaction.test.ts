@@ -1206,6 +1206,72 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(usage?.completionTokens).toBeGreaterThan(0);
   });
 
+  // The job is armed for the attendance that closed, but a claimed job can find the thread already
+  // past it: more boundaries pass while it waits, and the cut it makes covers them too. The row and
+  // the flow line already say which SEGMENT this summary is of; the usage row and the trace said the
+  // conversation the payload happened to name, putting this spend on an attendance nothing here
+  // summarized.
+  test("the summary is billed to the segment it actually cut", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 5019;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    // Armed for 730; by the time it runs the thread also closed 731 and opened 732.
+    const armedFor = 730;
+    const segmentIs = 731;
+    const openNow = 732;
+    const segmentRow = await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: segmentIs,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${segmentIs}`,
+        lastEventAt: new Date("2026-03-04T10:00:00Z"),
+      },
+      select: { id: true },
+    });
+    await seedThread(saver, threadId, [
+      new HumanMessage({
+        content: `quanto custa? ${SEEDED_TEXT}`,
+        additional_kwargs: conversationStamp(armedFor),
+      }),
+      new AIMessage("R$ 250."),
+      new HumanMessage({
+        content: "e o horário de sábado?",
+        additional_kwargs: conversationStamp(segmentIs),
+      }),
+      new AIMessage("Temos 09h."),
+      conversationDividerMessage(openNow, "oi, voltei"),
+      new AIMessage("Oi! Como posso ajudar?"),
+    ]);
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, armedFor, "new_attendance"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new UsageReportingModel(["resumo"]),
+      },
+    );
+
+    let usage = null;
+    for (let i = 0; i < 40 && !usage; i++) {
+      usage = await suDb.llmUsage.findFirst({
+        where: { tenantId, threadId, node: "memory_compact" },
+      });
+      if (!usage) await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(usage).not.toBeNull();
+    expect(usage?.conversationId).toBe(segmentRow.id);
+    // And the summary row it was billed for is the same segment.
+    const row = await suDb.attendanceSummary.findFirst({
+      where: { tenantId, contactInboxId },
+      select: { conversationId: true },
+    });
+    expect(row?.conversationId).toBe(segmentIs);
+  });
+
   // cancelPendingJob only reaches a job still PENDING, so a compaction already claimed — provider
   // call in flight — outlives the /reset that ran a second ago. Writing its row anyway would restore
   // memory the operator explicitly deleted, with nothing to say where it came from.

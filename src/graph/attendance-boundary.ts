@@ -1,3 +1,6 @@
+import type { BaseMessage } from "@langchain/core/messages";
+import { lastStampedConversationId } from "./markers";
+
 // WHO CONSUMES AN ATTENDANCE BOUNDARY, decided once for every writer of a contact's memory thread.
 //
 // Three places write that thread: the reactive turn (./runtime.ts), the ingestion of a message the
@@ -55,6 +58,19 @@ export interface AttendanceBoundaryClaim {
   advanceMarker: boolean;
   // The attendance that just ended, to arm compaction for. Null when none did.
   closedConversationId: number | null;
+}
+
+// Whether the attendance is already under way ON THE THREAD, which is what decides case 2 above.
+// Asked of the LAST stamped run and not of the whole history: a reopened conversation appears earlier
+// too, and reading that as "already started" made every writer skip the divider for an attendance
+// that had genuinely just begun — presenting its first turn to the model as a continuation of the
+// conversation that ran in between. The stamp itself is inert to the model; the divider is the only
+// part it reads.
+export function attendanceHasStarted(
+  messages: BaseMessage[],
+  conversationId: number,
+): boolean {
+  return lastStampedConversationId(messages) === conversationId;
 }
 
 export function crossesAttendanceBoundary(
