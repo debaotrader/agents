@@ -739,6 +739,125 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     expect(after).toEqual([after[0] as string, "voltei, quero marcar"]);
   });
 
+  // The thread marker is advanced by whoever claims a boundary, and a claim can be SKIPPED when an
+  // invoke from the previous conversation is still reading the thread. The turns of the new
+  // conversation are in the thread anyway, so the marker names a conversation the thread has already
+  // left. Asked of the marker, "is this attendance the current one" answers no, and a resolve on the
+  // conversation that is plainly the current one compacts nothing.
+  test("a stale thread marker does not stop a resolved attendance from compacting", async () => {
+    const contactInboxId = 5025;
+    const conversationId = 724;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const saver = new MemorySaver();
+    await seedThread(saver, threadId, [
+      new HumanMessage({
+        content: "queria trocar o horário de quinta",
+        additional_kwargs: conversationStamp(conversationId),
+      }),
+      new AIMessage("Movi para sexta às 10h."),
+    ]);
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    // The marker still names the PREVIOUS conversation: its boundary claim was skipped.
+    await suDb.agentThread.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId,
+        lastConversationId: conversationId - 1,
+      },
+    });
+
+    const result = await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "resolved"),
+      appDb,
+      {
+        checkpointer: saver,
+        makeModel: () => new SummarizerModel("Horário movido para sexta 10h."),
+      },
+    );
+
+    expect(result.outcome).toBe("done");
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(1);
+    const after = await readThread(saver, threadId);
+    expect(after).toHaveLength(1);
+    expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
+  });
+
+  // The job's dedupe key is the THREAD, so a later attendance re-arms the same row: a retry can
+  // arrive with a wider prefix than the attempt that already committed a summary for part of it.
+  // Summarizing the wider prefix pays the model to describe those turns a second time and renders
+  // both rows, overlapping, into the head.
+  test("a wider retry applies the summary already owed instead of writing a second one", async () => {
+    const contactInboxId = 5026;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    let armed = false;
+    const saver = new HookedSaver(1, async () => {
+      if (armed) markTurnInFlight(threadId);
+    });
+    await seedThread(saver, threadId, twoAttendances());
+    saver.calls = 0;
+    armed = true;
+    const model = new SummarizerModel("Avaliação marcada, R$ 250.");
+
+    // First attempt: row committed, rewrite deferred by a turn.
+    try {
+      const first = await runCompaction(
+        tenantId,
+        payload(contactInboxId, 708, "new_attendance"),
+        appDb,
+        { checkpointer: saver, makeModel: () => model },
+      );
+      expect(first.outcome).toBe("reschedule");
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+    armed = false;
+    const owed = await suDb.attendanceSummary.findMany({
+      where: { tenantId, contactInboxId },
+    });
+    expect(owed).toHaveLength(1);
+
+    // A THIRD attendance opens before the retry runs, so the re-armed job carries a wider prefix.
+    await seedThread(saver, threadId, [
+      conversationDividerMessage(710, "oi, de novo"),
+    ]);
+    const retry = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 709, "new_attendance"),
+      appDb,
+      { checkpointer: saver, makeModel: () => model },
+    );
+
+    expect(retry.outcome).toBe("done");
+    // No second generation, no second row: the owed prefix is what got folded.
+    expect(model.calls).toBe(1);
+    const rows = await suDb.attendanceSummary.findMany({
+      where: { tenantId, contactInboxId },
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.lastMessageId).toBe(owed[0]?.lastMessageId as string);
+    const after = await readThread(saver, threadId);
+    expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
+    // Everything the owed row did NOT cover is still raw, waiting for the next pass.
+    expect(after.some((c) => c.includes("oi, voltei"))).toBe(true);
+    expect(after.some((c) => c.includes("oi, de novo"))).toBe(true);
+  });
+
   test("a resolved attendance compacts the whole thread down to its memory", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 5005;

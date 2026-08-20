@@ -8,6 +8,11 @@ import {
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 import {
+  conversationDividerMessage,
+  MEMORY_HEAD_OPEN,
+  memoryHeadMessage,
+} from "@/graph/markers";
+import {
   ATTENDANCE_SUMMARY_MAX,
   renderTranscript,
   summarizeAttendance,
@@ -35,6 +40,37 @@ class ScriptedModel extends BaseChatModel {
 }
 
 describe("renderTranscript", () => {
+  // System markers ride as HumanMessages, so without filtering them the divider's own directive is
+  // quoted to the summarizer as something the CUSTOMER said — and the memory can end up recording the
+  // system's words as the contact's.
+  test("system markers are not quoted as the customer", () => {
+    const t = renderTranscript([
+      conversationDividerMessage(42, "oi, voltei"),
+      new AIMessage("Oi! Como posso ajudar?"),
+    ]);
+    expect(t).not.toContain("Contexto do sistema");
+    expect(t).toContain("Oi! Como posso ajudar?");
+    // The customer's own words, which rode along with the marker, are still there.
+    expect(t).toContain("oi, voltei");
+  });
+
+  // The bare divider is what a new attendance holds when an input guardrail answered before the model
+  // ran. Rendering it would bill a generation to summarize the system's own directive as history.
+  test("an attendance holding only the bare divider renders nothing", () => {
+    expect(renderTranscript([conversationDividerMessage(42)])).toBe("");
+  });
+
+  test("the memory head is never fed back to the summarizer", () => {
+    const t = renderTranscript([
+      memoryHeadMessage(
+        `${MEMORY_HEAD_OPEN}resumo antigo</atendimentos-anteriores>`,
+      ),
+      new HumanMessage("quanto custa?"),
+    ]);
+    expect(t).not.toContain("resumo antigo");
+    expect(t).toContain("quanto custa?");
+  });
+
   test("customer and assistant turns are labeled and kept in order", () => {
     const t = renderTranscript([
       new HumanMessage("quero remarcar"),

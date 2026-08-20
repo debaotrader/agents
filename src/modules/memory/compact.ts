@@ -4,7 +4,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
 import { isTurnInFlight } from "@/graph/inflight";
-import { memoryHeadMessage } from "@/graph/markers";
+import { memoryHeadMessage, stampedConversationId } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import { createChatModel } from "@/graph/models";
 import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
@@ -246,9 +246,6 @@ export async function runCompaction(
     return { outcome: "done" };
   }
   const cfg = loaded.cfg;
-  const attendanceIsCurrent =
-    loaded.lastConversationId === null ||
-    loaded.lastConversationId === conversationId;
 
   // A turn holding this thread will undo the rewrite below, so there is nothing to gain by reading
   // its channel now. Checked here as well as under the lock because this side is what avoids PAYING
@@ -264,38 +261,70 @@ export async function runCompaction(
   const messages = ((state.values as { messages?: BaseMessage[] } | undefined)
     ?.messages ?? []) as BaseMessage[];
 
-  // A conversation reopened inside the grace window is not a closed attendance — but a PREVIOUS
-  // attempt may already have summarized part of it and been deferred before it could rewrite (the row
-  // is committed first, on purpose). That row is owed a rewrite: dropping it here strands it, and the
-  // next resolve writes a SECOND row over turns the first one already covered, so the memory head
-  // says the same thing twice. Applying it is not "compacting a live conversation" either — it folds
-  // exactly the turns that were already summarized, and the ones since stay raw.
-  const owed = loaded.reopened
-    ? await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.attendanceSummary.findFirst({
-          where: { tenantId, chatwootInstanceId: instanceId, contactInboxId },
-          orderBy: { id: "desc" },
-          select: { lastMessageId: true },
-        }),
-      )
-    : null;
-  const owedIndex = owed
-    ? messages.findIndex((m) => m.id === owed.lastMessageId)
-    : -1;
-  if (loaded.reopened && owedIndex < 0) return { outcome: "done" };
+  // Whether the thread is still ON this conversation, asked of the MESSAGES rather than of
+  // AgentThread.lastConversationId. The marker is advanced by whoever claims a boundary, and a claim
+  // can be skipped (an overlapping invoke) while the turns of the new conversation are already in the
+  // thread — so the marker can name a conversation the thread has left. The last stamp cannot. Older
+  // threads carry no stamps at all, and those still answer from the marker.
+  let lastStamp: number | null = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m === undefined) continue;
+    const stamp = stampedConversationId(m);
+    if (stamp !== null) {
+      lastStamp = stamp;
+      break;
+    }
+  }
+  const attendanceIsCurrent =
+    lastStamp !== null
+      ? lastStamp === conversationId
+      : loaded.lastConversationId === null ||
+        loaded.lastConversationId === conversationId;
 
   const natural = selectClosedPrefix(messages, {
     currentAttendanceClosed:
       !loaded.reopened && reason === "resolved" && attendanceIsCurrent,
   });
-  const cut =
-    owedIndex >= 0
-      ? {
-          head: natural.head,
-          closed: messages.slice(natural.head ? 1 : 0, owedIndex + 1),
-          open: messages.slice(owedIndex + 1),
-        }
-      : natural;
+
+  // A summary row whose turns are STILL in the thread is owed its rewrite. The row is committed
+  // before the rewrite on purpose, so any deferral between the two leaves one behind, and this job's
+  // dedupe key is the THREAD: a later attendance re-arms the same row and the retry arrives with a
+  // wider prefix to summarize. Left alone, the wider cut gets its own key, the model is paid to
+  // describe those turns a second time, and the head renders both rows over the same conversation.
+  //
+  // So the owed prefix is applied FIRST, and only up to where it ends: the summary for it already
+  // exists, so the run costs no generation, and the rest compacts on the next pass.
+  const owed = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.attendanceSummary.findFirst({
+      where: { tenantId, chatwootInstanceId: instanceId, contactInboxId },
+      orderBy: { id: "desc" },
+      select: { lastMessageId: true, conversationId: true },
+    }),
+  );
+  const owedIndex = owed
+    ? messages.findIndex((m) => m.id === owed.lastMessageId)
+    : -1;
+  const headOffset = natural.head ? 1 : 0;
+  const owedIsPending =
+    owedIndex >= 0 &&
+    owedIndex >= headOffset &&
+    (loaded.reopened || owedIndex < headOffset + natural.closed.length);
+  if (loaded.reopened && !owedIsPending) return { outcome: "done" };
+  const cut = owedIsPending
+    ? {
+        head: natural.head,
+        closed: messages.slice(headOffset, owedIndex + 1),
+        open: messages.slice(owedIndex + 1),
+      }
+    : natural;
+  // Which attendance the segment being folded belongs to. On the owed path it is the row's OWN
+  // conversation, not the one this job was armed for: the two differ exactly when a later attendance
+  // re-armed the job, and keying the lookup on the payload instead would miss the row it is about to
+  // apply, pay for a second summary of the same turns, and file it under the wrong attendance.
+  const segmentConversationId = owedIsPending
+    ? (owed?.conversationId ?? conversationId)
+    : conversationId;
   // What this row will be a summary OF: the last turn in the cut. It is the segment's identity, and
   // the reason a reopened conversation does not lose half its memory — a second cut on the same
   // conversation carries different turns, so it writes its OWN row instead of replacing or reusing
@@ -312,7 +341,7 @@ export async function runCompaction(
       tenantId,
       chatwootInstanceId: instanceId,
       contactInboxId,
-      conversationId,
+      conversationId: segmentConversationId,
       lastMessageId,
     },
   };
@@ -382,7 +411,7 @@ export async function runCompaction(
             tenantId,
             chatwootInstanceId: instanceId,
             contactInboxId,
-            conversationId,
+            conversationId: segmentConversationId,
             lastMessageId,
             summary,
             messageCount: cut.closed.length,

@@ -631,6 +631,19 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       clearTurnInFlight(graphThreadId);
     }
 
+    // Compaction is armed regardless: the attendance that ended is compactable now, and making it
+    // wait for a next turn that may never come is how a boundary quietly goes uncompacted.
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "MEMORY_COMPACT",
+          dedupeKey: graphThreadId,
+          status: "PENDING",
+        },
+      }),
+    ).toBe(1);
+
     // The marker stayed put, so the boundary is still there to be claimed.
     const marker = await suDb.agentThread.findUniqueOrThrow({
       where: {

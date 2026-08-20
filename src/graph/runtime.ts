@@ -521,7 +521,11 @@ export async function runLoadedTurn(
             // the divider with no invoke in the way. Only the PROMPT is at stake either way — the cut
             // finds the boundary from the conversation stamped on each message, so a divider that
             // never lands costs a hint in one prompt, not an attendance.
-            if (boundary && anotherInvokeIsReading) return null;
+            //
+            // Compaction is armed all the same. The attendance that just ended is compactable RIGHT
+            // NOW — its boundary is on the messages, not on the divider this turn declined to write —
+            // and withholding the arm would make it wait on a next turn that may never come.
+            if (boundary && anotherInvokeIsReading) return prev as number;
             if (boundary) {
               await dividerGraph.updateState(
                 { configurable: { thread_id: graphThreadId } },

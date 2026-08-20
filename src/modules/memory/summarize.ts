@@ -6,6 +6,11 @@ import {
   SystemMessage,
 } from "@langchain/core/messages";
 import logger from "@/api/lib/logger";
+import {
+  CONVERSATION_DIVIDER,
+  isConversationDivider,
+  isMemoryHead,
+} from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import { runModelCall } from "@/graph/model-limit";
 
@@ -89,7 +94,19 @@ export function renderTranscript(messages: BaseMessage[]): string {
   for (const m of messages) {
     const type = m.getType();
     if (type === "tool") continue;
-    const text = contentToText(m.content).trim();
+    // The head is rendered FROM the rows, so feeding it back would summarize a summary.
+    if (isMemoryHead(m)) continue;
+    let text = contentToText(m.content).trim();
+    // System markers ride as HumanMessages (src/graph/markers.ts), and the ingestion path folds the
+    // divider into the customer's own turn — so this strips the marker and keeps the words around it,
+    // rather than dropping the message. Left in, the system's directive would be quoted back to the
+    // summarizer as something the CUSTOMER said; dropped whole, a real customer message would go
+    // missing from the memory of that attendance. An attendance whose only stored message IS the bare
+    // divider (an input guardrail answered the first turn before the model ran) renders nothing at
+    // all, and costs no generation.
+    if (isConversationDivider(m)) {
+      text = text.slice(CONVERSATION_DIVIDER.length).trim();
+    }
     if (type === "human") {
       if (text) lines.push(`cliente: ${text}`);
       continue;
