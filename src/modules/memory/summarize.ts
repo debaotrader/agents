@@ -5,6 +5,7 @@ import {
   HumanMessage,
   SystemMessage,
 } from "@langchain/core/messages";
+import { estimateTokenCount } from "tokenx";
 import logger from "@/api/lib/logger";
 import {
   CONVERSATION_DIVIDER,
@@ -36,7 +37,38 @@ export const ATTENDANCE_SUMMARY_MAX = 1200;
 // (compaction newly enabled, or a run that kept failing) can be larger than the model's own window,
 // and a call that fails on size would never recover on retry. Clipped from the FRONT, keeping the
 // most recent turns, because that is the half a later attendance is most likely to refer back to.
+//
+// The char cap is the floor, and it is deliberately not derived from the model: this repo has no
+// table of context windows and would not keep one honest. What the operator DID declare is
+// `agent.settings.limits.maxHistoryTokens`, and when it is set it applies here too — the same
+// budget, on the same model, measured by the same estimator the ceiling uses. Conservative in the
+// right direction: this call carries no tool definitions, so the overhead the ceiling sits under
+// (15.8k tokens on the install that motivated it) is absent here.
 const TRANSCRIPT_MAX_CHARS = 60_000;
+
+// The estimator runs low (see src/graph/token-count.ts), so convergence is by measurement rather
+// than arithmetic: shrink by the measured overshoot and re-measure. Bounded, because a text whose
+// estimate does not fall is a bug, not a reason to loop.
+const CLIP_PASSES = 6;
+
+function clipTranscript(
+  joined: string,
+  maxHistoryTokens: number | null,
+): string {
+  let text =
+    joined.length > TRANSCRIPT_MAX_CHARS
+      ? joined.slice(joined.length - TRANSCRIPT_MAX_CHARS)
+      : joined;
+  if (!maxHistoryTokens || maxHistoryTokens <= 0) return text;
+  for (let pass = 0; pass < CLIP_PASSES; pass++) {
+    const estimate = estimateTokenCount(text);
+    if (estimate <= maxHistoryTokens) break;
+    const keep = Math.floor((text.length * maxHistoryTokens) / estimate);
+    if (keep <= 0) return "";
+    text = text.slice(text.length - keep);
+  }
+  return text;
+}
 
 export const TRANSCRIPT_TAG = "<transcricao>";
 const TRANSCRIPT_CLOSE = "</transcricao>";
@@ -106,7 +138,10 @@ export interface AttendanceSummaryResult {
 // summarizable, and whatever the agent actually did with a result it said out loud in the reply that
 // follows. Sending them would spend the summarizer's window on ids and ISO timestamps, and would
 // hand a second model call customer data that never reached the customer.
-export function renderTranscript(messages: BaseMessage[]): string {
+export function renderTranscript(
+  messages: BaseMessage[],
+  maxHistoryTokens: number | null = null,
+): string {
   const lines: string[] = [];
   for (const m of messages) {
     const type = m.getType();
@@ -163,9 +198,7 @@ export function renderTranscript(messages: BaseMessage[]): string {
     }
   }
   const joined = lines.join("\n").replace(FENCE_TAG, "");
-  return joined.length > TRANSCRIPT_MAX_CHARS
-    ? joined.slice(joined.length - TRANSCRIPT_MAX_CHARS)
-    : joined;
+  return clipTranscript(joined, maxHistoryTokens);
 }
 
 export async function summarizeAttendance(
@@ -175,8 +208,10 @@ export async function summarizeAttendance(
   // customer waiting on it, which is exactly how a model call ends up invisible in the cost report:
   // nobody notices a missing row on a call nobody is watching.
   callbacks?: BaseCallbackHandler[],
+  // The agent's declared history ceiling (null = none). See TRANSCRIPT_MAX_CHARS.
+  maxHistoryTokens: number | null = null,
 ): Promise<AttendanceSummaryResult> {
-  const transcript = renderTranscript(messages);
+  const transcript = renderTranscript(messages, maxHistoryTokens);
   // NOTE: An attendance whose messages carry no text at all (only tool traffic) has nothing to
   // remember. That is a legitimate empty summary, not a failure, so it must not carry `error`.
   if (!transcript.trim()) return { summary: "" };

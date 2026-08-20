@@ -18,7 +18,11 @@ import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import { enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
-import { renderMemoryHead, selectClosedPrefix } from "./cut";
+import {
+  MEMORY_HEAD_MAX_ATTENDANCES,
+  renderMemoryHead,
+  selectClosedPrefix,
+} from "./cut";
 import { readMemoryConfig } from "./settings";
 import { summarizeAttendance } from "./summarize";
 
@@ -426,6 +430,7 @@ export async function runCompaction(
         source: "inbox",
         base,
       }),
+      cfg.maxHistoryTokens,
     );
     if (result.error) return { outcome: "fail", error: result.error };
     summary = result.summary;
@@ -509,15 +514,22 @@ export async function runCompaction(
       for (let i = 0; i < consumed.length; i++) {
         if (current[i]?.id !== consumed[i]?.id) return "changed" as const;
       }
-      const rows = await db.attendanceSummary.findMany({
-        where: {
-          tenantId,
-          chatwootInstanceId: instanceId,
-          contactInboxId,
-        },
-        orderBy: [{ attendanceAt: "asc" }, { id: "asc" }],
-        select: { conversationId: true, summary: true, attendanceAt: true },
-      });
+      // Only what the head can render. The rows are kept forever by design (the head bounds what the
+      // MODEL reads, not what the table stores), so a contact with years of history would otherwise
+      // have every one of them loaded and sorted on every compaction to keep the newest twenty.
+      // Newest-first with a limit, then back to chronological order, which is how the head reads.
+      const rows = (
+        await db.attendanceSummary.findMany({
+          where: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            contactInboxId,
+          },
+          orderBy: [{ attendanceAt: "desc" }, { id: "desc" }],
+          take: MEMORY_HEAD_MAX_ATTENDANCES,
+          select: { conversationId: true, summary: true, attendanceAt: true },
+        })
+      ).reverse();
       const head = renderMemoryHead(rows, cfg.timezone);
       // The update REMOVES BY ID and never clears the channel. REMOVE_ALL_MESSAGES would have been
       // shorter, and wrong: it replaces the whole list with what this update carries, so a message

@@ -33,6 +33,7 @@ import {
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { runScopedOn } from "@/lib/tenancy";
 import { type CompactPayload, runCompaction } from "@/modules/memory/compact";
+import { MEMORY_HEAD_MAX_ATTENDANCES } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { UsageReportingModel } from "../utils/scripted-models";
 
@@ -1339,6 +1340,65 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     // Both halves are still in the memory the model will read.
     expect(head).toContain("Combinou R$ 250 terça.");
     expect(head).toContain("Remarcou para quinta.");
+  });
+
+  // The head renders the newest MEMORY_HEAD_MAX_ATTENDANCES rows, so the query asks for exactly
+  // those. It used to load every row this contact ever had and sort them all, on every compaction,
+  // to keep the last twenty — and the rows are kept forever by design. What this pins is the part a
+  // limit can silently get wrong: WHICH twenty, and in which order.
+  test("the head carries the newest attendances, oldest-first", async () => {
+    const contactInboxId = 7180;
+    const conversationId = 7181;
+    const saver = new MemorySaver();
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    // Two more than the head can hold, each an hour apart so the ordering is unambiguous.
+    const total = MEMORY_HEAD_MAX_ATTENDANCES + 2;
+    const base = Date.parse("2026-01-01T12:00:00Z");
+    for (let i = 0; i < total; i++) {
+      await suDb.attendanceSummary.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+          conversationId: 6000 + i,
+          lastMessageId: `seed-${i}`,
+          summary: `atendimento numero ${i}`,
+          messageCount: 2,
+          attendanceAt: new Date(base + i * 3_600_000),
+        },
+      });
+    }
+    await seedThread(saver, threadId, [
+      new HumanMessage("voltei"),
+      new AIMessage("Oi! Como posso ajudar?"),
+    ]);
+
+    await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "resolved"),
+      appDb,
+      { checkpointer: saver, makeModel: () => new SummarizerModel("Voltou.") },
+    );
+
+    const head = (await readThread(saver, threadId))[0] ?? "";
+    // The two oldest fell off the front, which is the same order a person forgets in.
+    expect(head).not.toContain("atendimento numero 0\n");
+    expect(head).not.toContain("atendimento numero 1\n");
+    expect(head).toContain(`atendimento numero ${total - 1}`);
+    // Oldest-first among the ones kept: the head reads as a history, not a stack.
+    expect(head.indexOf("atendimento numero 2")).toBeLessThan(
+      head.indexOf(`atendimento numero ${total - 1}`),
+    );
   });
 
   // The boundary trigger fires only when the contact comes back, which can be months later. Dating a

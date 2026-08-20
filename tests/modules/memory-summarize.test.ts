@@ -7,6 +7,7 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
+import { estimateTokenCount } from "tokenx";
 import {
   CONVERSATION_DIVIDER,
   conversationDividerMessage,
@@ -243,5 +244,42 @@ describe("summarizeAttendance", () => {
     );
     expect(res.summary).toBe("");
     expect(res.error).toContain("429");
+  });
+});
+
+// The clip used to be a fixed 60k characters, which ignores what the operator declared about this
+// agent's model. An install on a small-context model sets `maxHistoryTokens` for its ordinary turns
+// to work at all; honouring it here is the difference between a compaction that succeeds and one
+// that fails on size and dead-letters after burning its retries, leaving the thread raw forever.
+describe("renderTranscript: the declared history ceiling", () => {
+  const long = Array.from(
+    { length: 400 },
+    (_, i) =>
+      new HumanMessage(`mensagem número ${i} com bastante texto de conversa`),
+  );
+
+  test("without a ceiling the transcript is not token-clipped", () => {
+    const t = renderTranscript(long);
+    expect(estimateTokenCount(t)).toBeGreaterThan(200);
+  });
+
+  test("with a ceiling the transcript fits inside it", () => {
+    const t = renderTranscript(long, 200);
+    expect(estimateTokenCount(t)).toBeLessThanOrEqual(200);
+    expect(t.length).toBeGreaterThan(0);
+  });
+
+  // Clipped from the FRONT: a later attendance refers back to how this one ENDED.
+  test("the clip keeps the most recent turns", () => {
+    const t = renderTranscript(long, 200);
+    expect(t).toContain("mensagem número 399");
+    expect(t).not.toContain("mensagem número 0 ");
+  });
+
+  // A transcript already inside the budget must come through untouched, or every short attendance
+  // would pay a clip it does not need.
+  test("a transcript already within the ceiling is untouched", () => {
+    const short = [new HumanMessage("oi, tudo bem?")];
+    expect(renderTranscript(short, 10_000)).toBe(renderTranscript(short));
   });
 });
