@@ -73,12 +73,43 @@ describe("createChatModel temperature on reasoning models", () => {
 
   test("non-OpenAI providers are untouched", () => {
     const m = createChatModel({
-      provider: "anthropic",
-      model: "claude-sonnet-4-5",
+      provider: "google",
+      model: "gemini-3.5-flash",
       apiKey: "test",
       temperature: 0.3,
-    }) as ChatAnthropic;
+    }) as unknown as { temperature?: number };
     expect(m.temperature).toBe(0.3);
+  });
+});
+
+// Anthropic's current generation answers 400 to any non-default `temperature`, and their own
+// migration guide says to remove the parameter. The drop is by PROVIDER, not by model pattern:
+// claude-haiku-4-5 still accepts it, claude-opus-4-5 accepts it while advertising the same `effort`
+// capability as the models that refuse it, and /v1/models never mentions the parameter — so there is
+// nothing to match on that will still be true next release. The asymmetry decides it: the guardrail
+// pass pins a temperature and is fail-open, so a missed id is not a visible error, it is a
+// moderation control that approves everything.
+describe("createChatModel temperature on anthropic", () => {
+  const anthropic = (model: string, temperature?: number) =>
+    createChatModel({
+      provider: "anthropic",
+      model,
+      apiKey: "test",
+      temperature,
+    }) as ChatAnthropic;
+
+  test("dropped for every model, including the ones that still accept it", () => {
+    expect(anthropic("claude-sonnet-5", 0).temperature).toBeUndefined();
+    expect(anthropic("claude-opus-5", 0.7).temperature).toBeUndefined();
+    expect(anthropic("claude-fable-5", 0.3).temperature).toBeUndefined();
+    expect(anthropic("claude-haiku-4-5", 0.3).temperature).toBeUndefined();
+  });
+
+  // The two calls the operator cannot reach: both pin 0, and both would fail on every request.
+  // The guardrail one is the reason this is a defect rather than an error message.
+  test("the pinned internal calls survive the provider", () => {
+    expect(anthropic("claude-sonnet-5", 0).temperature).toBeUndefined();
+    expect(anthropic("claude-sonnet-5", undefined).temperature).toBeUndefined();
   });
 });
 

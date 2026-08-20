@@ -54,32 +54,3 @@ export const CONVERSATION_NATIVE_TOOL_NAMES = NATIVE_TOOL_NAMES.filter(
 
 export const RAG_TOOL_NAMES = ["search_knowledge", "suggest_kb_entry"] as const;
 export type RagToolName = (typeof RAG_TOOL_NAMES)[number];
-
-export type RiskTier = "low" | "medium" | "high";
-
-// Declared risk of each built-in tool (surfaced in the tool-selection UI as a badge). Native tools
-// are conversation-scoped and low/medium; RAG reads/proposes (proposals need human approval), so
-// low. Toolpack tool risk is declared per-pack (Toolpack.toolRisk); custom HTTP tools carry their
-// own ToolDefinition.riskTier.
-export const NATIVE_TOOL_RISK: Record<NativeToolName, RiskTier> = {
-  handoff_to_human: "low",
-  private_note: "low",
-  set_custom_attribute: "low",
-  assign_label: "low",
-  resolve_conversation: "medium",
-  kanban_move_card: "medium",
-  update_kanban_task: "medium",
-  set_voice_preference: "low",
-  react_to_message: "low",
-  // NOTE: The only native tool that reaches OUTSIDE, on a URL the model chose, and delivers the
-  // result to the customer. The operator's host allowlist is what bounds it.
-  send_image: "medium",
-  skip_reply: "low",
-  calculator: "low",
-  get_current_time: "low",
-};
-
-export const RAG_TOOL_RISK: Record<RagToolName, RiskTier> = {
-  search_knowledge: "low",
-  suggest_kb_entry: "low",
-};

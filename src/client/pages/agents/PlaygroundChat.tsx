@@ -324,7 +324,7 @@ export function PlaygroundChat({
 // t('playground.toolsim.cat.integration','Integration')
 // t('playground.toolsim.cat.external','External')
 
-// One tool row: its name + category/risk badges + (for conversation natives) the auto-simulated
+// One tool row: its name + category badge + (for conversation natives) the auto-simulated
 // marker, and a textarea to force a canned return. A blank textarea means "no mock" (the tool runs
 // for real, or is auto-simulated); typing a value overrides its result.
 type ToolInfo = Chat["tools"][number];

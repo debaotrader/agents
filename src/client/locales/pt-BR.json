@@ -367,8 +367,10 @@
       "badgeN": "Follow-up {{step}}/{{total}}",
       "cadenceFirst": "após {{delay}} de silêncio",
       "cadenceNext": "{{delay}} após a anterior",
+      "closedToday": "Fechado hoje ({{label}})",
       "deferredHint": "O intervalo da etapa caiu fora do horário de envio, então foi adiado para o próximo horário disponível.",
       "done": "Sequência de follow-up concluída",
+      "exceptionToday": "Só hoje: {{hours}} ({{label}})",
       "imminent": "a qualquer momento",
       "imminentHint": "O horário estimado já passou; o envio roda em segundo plano, então o follow-up será enviado a qualquer momento.",
       "pausedAppointment": "Follow-up pausado · compromisso agendado",
@@ -681,6 +683,8 @@
       "ttsNormalize": "A reescrita para fala está ligada mas a configuração de modelo dela não pode rodar, então o áudio sai sem ela. Confira provedor, modelo, chave e endpoint.",
       "vision": "A leitura de imagens/documentos está ligada, mas sem chave de API definida."
     },
+    "configIssueGuardrailsFailing": "Os guardrails estão ligados, mas {{failures}} das verificações não conseguiram rodar nas últimas {{hours}} horas (a mais recente {{when}}). A análise é fail-open, então verificação que não rodou não pegou nada e não segurou nada. Confira o modelo, o endpoint e a chave.",
+    "configIssueGuardrailsFailingCause": "Os guardrails estão ligados, mas {{failures}} das verificações não conseguiram rodar nas últimas {{hours}} horas (a mais recente {{when}}). A análise é fail-open, então verificação que não rodou não pegou nada e não segurou nada. A última respondeu: {{error}}",
     "configIssueKnowledge": "A base de conhecimento \"{{name}}\" tem documentos que precisam ser indexados.",
     "configIssuePending": {
       "embedding": "Uma base de conhecimento precisa ser indexada, mas a credencial de embedding ainda não foi preenchida.",
@@ -1071,6 +1075,8 @@
   },
   "hours": {
     "add": "Novo horário",
+    "addException": "Adicionar data",
+    "addExceptionRange": "Adicionar horário",
     "addTitle": "Novo horário",
     "addWindow": "Adicionar janela",
     "alwaysOpen": "Sem janelas = sempre aberto.",
@@ -1084,12 +1090,23 @@
     "emptyDesc": "Defina quando seus agentes estão disponíveis para responder.",
     "emptyTitle": "Nenhum horário ainda",
     "end": "Fim",
+    "exceptionClosed": "Fechado o dia todo",
+    "exceptionDate": "Data",
+    "exceptionDateEnd": "Última data",
+    "exceptionLabel": "Nome",
+    "exceptionRecurring": "Todo ano",
+    "exceptions": "Feriados e fechamentos",
+    "exceptionsHint": "Uma data listada aqui substitui as janelas semanais acima. Sem horário, fica fechado o dia todo.",
+    "exceptionUntil": "até",
+    "invalidException": "Confira a data e se todo fim é depois do seu início.",
+    "invalidExceptionsSave": "Ajuste as exceções destacadas antes de salvar.",
     "invalidWindow": "O fim deve ser depois do início.",
     "invalidWindowsSave": "Ajuste as janelas destacadas antes de salvar.",
     "mirror": "Espelhado",
     "name": "Nome",
     "noTimezoneResults": "Nenhum fuso horário corresponde à busca.",
     "noWindows": "Sem janelas",
+    "removeException": "Remover data",
     "removeWindow": "Remover janela",
     "saved": "Horário de atendimento salvo.",
     "saveError": "Não foi possível salvar (verifique o fuso horário).",
@@ -1753,6 +1770,9 @@
     "tenantAdmin": "Admin do tenant"
   },
   "schedule": {
+    "exceptionCount_one": "{{count}} exceção",
+    "exceptionCount_many": "{{count}} exceções",
+    "exceptionCount_other": "{{count}} exceções",
     "noWindows": "Sem janelas"
   },
   "schedulePicker": {

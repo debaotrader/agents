@@ -623,6 +623,9 @@ model BusinessHours {
   name      String
   timezone  String   @default("America/Sao_Paulo")
   windows   Json     @default("[]")
+  // Date exceptions that REPLACE the weekly grid on the dates they match (holidays, shutdowns,
+  // half-days). Empty array = the weekly grid alone, i.e. exactly the pre-#129 behavior.
+  exceptions Json    @default("[]")
   source    String   @default("LOCAL") // LOCAL|CHATWOOT_MIRROR
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
@@ -824,8 +827,11 @@ model ToolDefinition {
   body          Json     @default("{}")
   credentialRef String?  @map("credential_ref")
   enabled       Boolean  @default(true)
-  // NOTE: low|medium|high. Surfaced in the tool-selection UI so granting a write/financial tool
-  // is a deliberate, visible act; default medium for a custom HTTP tool of unknown impact.
+  // NOTE: RETIRED and unread. Nothing selects, writes or projects this any more (issue #137); the
+  // column survives one release on purpose, because an operator who rolls the image back would
+  // otherwise land a build that still selects it and gets `undefined_column` on every tool screen,
+  // with no way back except rolling forward. The default keeps inserts working for the code that no
+  // longer sets it. Dropped by migration in the release after this one; see issue #149.
   riskTier      String   @default("medium") @map("risk_tier")
   // HTTP statuses this tool declares as RESULTS rather than integration failures. Empty (the
   // default) keeps issue #40's behavior, where every non-2xx is logged warn and reaches the alert
