@@ -66,7 +66,6 @@ import {
   firstAudioAttachment,
   firstLocationAttachment,
   firstVisualAttachment,
-  isHumanAgentMessage,
   isIncomingMessage,
   isNewIncomingMessage,
   normalizeChatwootEvent,
@@ -513,43 +512,6 @@ async function ingestUnhandledMessage(args: {
       base,
     }).then(() => undefined);
 
-  // A human agent's outgoing reply (a colleague messaged the customer while the bot was silent).
-  if (isHumanAgentMessage(n)) {
-    const text = (n.message.content ?? "").trim();
-    if (!text) return;
-    try {
-      await ingestMessageIntoThread({
-        tenantId,
-        instanceId,
-        conversationId,
-        contactInboxId,
-        graphThreadId,
-        messageId,
-        role: "human_agent",
-        text,
-        agentName: n.message.sender?.name ?? null,
-        base,
-        // The agent reaching out is what OPENS the new conversation, so this path closes the previous
-        // attendance exactly like a customer message does. Left off, the boundary would be detected
-        // and the marker advanced with nothing armed, and the customer's reply would then see no
-        // boundary at all — the attendance before it staying raw until yet another one opened.
-        //
-        // NOTE: this branch is currently unreachable. `rt` above is resolved only for a new INCOMING
-        // message, so an outgoing human-agent message never gets here and is never ingested at all —
-        // which predates memory compaction and is tracked on its own. Wired anyway, because the day
-        // it does run the boundary must not be consumed silently.
-        onAttendanceClosed: armOnBoundary,
-      });
-    } catch (err) {
-      logger.warn(
-        "ingest (human agent) failed (conv=%s): %s",
-        String(conversationId),
-        errMsg(err),
-      );
-    }
-    return;
-  }
-
   // A customer incoming message the bot will NOT answer: silenced out of hours (act && consumed) or
   // not bot-handled (!act — a human owns it, or it is not pending). An answered/debounced message is
   // covered by its turn and is NOT re-ingested here.
@@ -576,7 +538,6 @@ async function ingestUnhandledMessage(args: {
       contactInboxId,
       graphThreadId,
       messageId,
-      role: "customer",
       text,
       base,
       onAttendanceClosed: armOnBoundary,

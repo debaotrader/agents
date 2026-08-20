@@ -84,9 +84,7 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     );
     const ingest = (over: {
       messageId: number;
-      role: "customer" | "human_agent";
       text: string;
-      agentName?: string;
       conversationId?: number;
     }) =>
       ingestMessageIntoThread({
@@ -115,26 +113,12 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       { configurable: { thread_id: graphThreadId } },
     );
 
-    // 2. While the bot is silent, ingest a human agent's reply then a customer message.
-    expect(
-      await ingest({
-        messageId: 10,
-        role: "human_agent",
-        text: "Aqui é o João, vou te ajudar.",
-        agentName: "João",
-      }),
-    ).toBe("ingested");
-    expect(
-      await ingest({ messageId: 11, role: "customer", text: "obrigado!" }),
-    ).toBe("ingested");
+    // 2. While the bot is silent, ingest a customer message.
+    expect(await ingest({ messageId: 11, text: "obrigado!" })).toBe("ingested");
 
     // 3. Idempotency: the same id (re-delivery) and an older id are both skipped by the watermark.
-    expect(await ingest({ messageId: 11, role: "customer", text: "DUP" })).toBe(
-      "skipped",
-    );
-    expect(await ingest({ messageId: 5, role: "customer", text: "OLD" })).toBe(
-      "skipped",
-    );
+    expect(await ingest({ messageId: 11, text: "DUP" })).toBe("skipped");
+    expect(await ingest({ messageId: 5, text: "OLD" })).toBe("skipped");
 
     // 4. The next real turn loads the thread (incl. the ingested messages) and runs without error.
     const result = await graph.invoke(
@@ -142,10 +126,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       { configurable: { thread_id: graphThreadId } },
     );
     const contents = result.messages.map((m) => String(m.content));
-    // The human-agent reply is in history, marked so the model never mistakes it for its own output.
-    expect(
-      contents.some((c) => c.includes("<atendente") && c.includes("João")),
-    ).toBe(true);
     // The customer message the bot stayed silent on is in history.
     expect(contents.some((c) => c === "obrigado!")).toBe(true);
     // The de-duplicated text never made it in.
@@ -188,7 +168,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
         contactInboxId,
         graphThreadId,
         messageId,
-        role: "customer" as const,
         text,
         base: appDb,
         checkpointer: saver,
@@ -228,78 +207,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     expect(cut.open.map((m) => String(m.content))).toEqual(["queria remarcar"]);
   });
 
-  test("a human agent opening a new conversation starts the attendance, not ends the last one", async () => {
-    const saver = new MemorySaver();
-    const contactInboxId = 23457;
-    const graphThreadId = contactInboxThreadId(
-      tenantId,
-      instanceId,
-      contactInboxId,
-    );
-    const ingest = (
-      conversationId: number,
-      messageId: number,
-      role: "customer" | "human_agent",
-      text: string,
-      onAttendanceClosed?: (previousConversationId: number) => void,
-    ) =>
-      ingestMessageIntoThread({
-        ...(onAttendanceClosed ? { onAttendanceClosed } : {}),
-        tenantId,
-        instanceId,
-        conversationId,
-        contactInboxId,
-        graphThreadId,
-        messageId,
-        role,
-        text,
-        base: appDb,
-        checkpointer: saver,
-      });
-
-    const closed: number[] = [];
-    await ingest(810, 1, "customer", "primeira conversa");
-    // A NEW conversation, opened by the agent reaching out.
-    await ingest(
-      811,
-      2,
-      "human_agent",
-      "oi, passando para lembrar da revisão",
-      (prev) => {
-        closed.push(prev);
-      },
-    );
-    await ingest(811, 3, "customer", "ah sim, obrigado");
-    // The attendance that ENDED is reported to the caller, which is what arms its compaction. The
-    // marker advances on this message either way, so without the callback here the customer's reply
-    // no longer looks like a boundary and nothing ever arms it.
-    expect(closed).toEqual([810]);
-
-    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
-    const messages = ((
-      cp?.channel_values as { messages?: BaseMessage[] } | undefined
-    )?.messages ?? []) as BaseMessage[];
-    const cut = selectClosedPrefix(messages, {
-      currentAttendanceClosed: false,
-    });
-    // Only the first conversation closes. The agent's opener belongs to the attendance it OPENED.
-    expect(cut.closed).toHaveLength(1);
-    expect(String(cut.closed[0]?.content)).toBe("primeira conversa");
-    expect(
-      cut.open.some((m) => String(m.content).includes("lembrar da revisão")),
-    ).toBe(true);
-    // And the model is told too: the agent's message is an AIMessage, so the divider cannot ride
-    // inside it the way it does on a customer turn — it goes ahead of it.
-    expect(
-      cut.open[0] !== undefined && isConversationDivider(cut.open[0]),
-    ).toBe(true);
-    // EVERY message this writes carries the conversation it belongs to, the agent's included. The
-    // divider next to it carries one too, so a test that only read the divider would pass with the
-    // agent's message unstamped — and the boundary would be wrong the moment the divider is not there
-    // (an agent whose second message is all that survives a clobber).
-    expect(messages.map(stampedConversationId)).toEqual([810, 811, 811, 811]);
-  });
-
   test("a customer message starting a NEW conversation on the thread gets the fresh-attendance divider", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 23456;
@@ -316,7 +223,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       contactInboxId,
       graphThreadId,
       messageId: 1,
-      role: "customer",
       text: "primeira",
       base: appDb,
       checkpointer: saver,
@@ -329,7 +235,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       contactInboxId,
       graphThreadId,
       messageId: 2,
-      role: "customer",
       text: "segunda",
       base: appDb,
       checkpointer: saver,
@@ -370,7 +275,6 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
         contactInboxId,
         graphThreadId,
         messageId,
-        role: "customer",
         text,
         base: appDb,
         checkpointer: saver,

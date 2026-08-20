@@ -1,4 +1,4 @@
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
@@ -9,11 +9,15 @@ import { isTurnInFlight } from "./inflight";
 import { conversationDividerMessage, conversationStamp } from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
-// Continuous ingestion: fold a conversation message into the agent's graph memory thread WITHOUT
-// running a model, so the agent has full context even for messages no turn handled — a customer
-// message it stayed silent on (out of hours, a human handling, test/disabled aside), or a HUMAN
-// agent's reply sent while it was silent. The seam is graph.updateState, which appends to the
-// thread's MessagesAnnotation channel via the same reducer the real turn uses.
+// Continuous ingestion: fold a customer message into the agent's graph memory thread WITHOUT running
+// a model, so the agent has full context even for the messages no turn handled — the ones it stayed
+// silent on, out of hours or while a human owned the conversation. The seam is graph.updateState,
+// which appends to the thread's MessagesAnnotation channel via the same reducer the real turn uses.
+//
+// Customer messages only. A human agent's own reply is NOT ingested: `rt` is resolved solely for a
+// new INCOMING message (src/modules/chatwoot/webhook.ts), so an outgoing one never reaches this
+// module at all. That predates memory compaction and is tracked on its own; the branch that used to
+// handle it here was code no delivery could run.
 //
 // At-most-once: the delivery ledger dedups re-deliveries, message_created gating ignores edits, and a
 // monotonic per-thread watermark (AgentThread.lastSyncedMessageId, CAS under a per-thread advisory
@@ -23,8 +27,6 @@ import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
-
-export type IngestRole = "customer" | "human_agent";
 
 export interface IngestMessageParams {
   tenantId: bigint;
@@ -37,11 +39,8 @@ export interface IngestMessageParams {
   graphThreadId: string;
   // Chatwoot message id — the monotonic watermark guarding against re-append.
   messageId: number;
-  role: IngestRole;
   // The message body: a rendered customer message (renderInboundMessage) or a human agent's raw text.
   text: string;
-  // The human agent's display name, for the <atendente> marker (role "human_agent" only).
-  agentName?: string | null;
   base?: PrismaClient;
   checkpointer?: BaseCheckpointSaver;
   // Fired when this message OPENED a new attendance on the thread, carrying the display_id of the
@@ -49,15 +48,6 @@ export interface IngestMessageParams {
   // memory compaction) opens its own transaction, and this one runs under an advisory lock — so it
   // is invoked only after the lock is released.
   onAttendanceClosed?: (previousConversationId: number) => Promise<void> | void;
-}
-
-// Strip quotes/newlines from a human agent's display name so it can't break the <atendente nome="…">
-// marker. The name is our own staff (low risk), but keep the marker well-formed.
-function sanitizeName(name: string): string {
-  return name
-    .replace(/["\n\r]+/g, " ")
-    .trim()
-    .slice(0, 80);
 }
 
 export async function ingestMessageIntoThread(
@@ -71,7 +61,6 @@ export async function ingestMessageIntoThread(
     contactInboxId,
     graphThreadId,
     messageId,
-    role,
   } = params;
   if (!params.text.trim()) return "skipped";
   const checkpointer = params.checkpointer ?? (await getCheckpointer());
@@ -116,36 +105,20 @@ export async function ingestMessageIntoThread(
       const anotherInvokeIsReading = boundary && isTurnInFlight(graphThreadId);
       const newConversation = boundary && !anotherInvokeIsReading;
 
-      // Customer → HumanMessage; human agent → AIMessage (the business side of the dialogue, so the
-      // model reads it as an already-given reply), disambiguated by the <atendente> marker so it never
-      // mistakes a colleague's words for its OWN prior output. Every one of them carries the
-      // conversation it belongs to, which is what the compaction cut reads; the divider on top is
-      // prompt content, and goes through the factory because nothing else can make a message COUNT as
-      // one — the text alone never does, or a customer could type it (src/graph/markers.ts).
-      const stamp = conversationStamp(conversationId);
-      const msg =
-        role === "human_agent"
-          ? new AIMessage({
-              content: `<atendente${params.agentName ? ` nome="${sanitizeName(params.agentName)}"` : ""}>\n${params.text}\n</atendente>`,
-              additional_kwargs: stamp,
-            })
-          : newConversation
-            ? conversationDividerMessage(conversationId, params.text)
-            : new HumanMessage({
-                content: params.text,
-                additional_kwargs: stamp,
-              });
+      // Every message carries the conversation it belongs to, which is what the compaction cut reads.
+      // The divider on top is prompt content, and goes through the factory because nothing else can
+      // make a message COUNT as one — the text alone never does, or a customer could type it
+      // (src/graph/markers.ts).
+      const msg = newConversation
+        ? conversationDividerMessage(conversationId, params.text)
+        : new HumanMessage({
+            content: params.text,
+            additional_kwargs: conversationStamp(conversationId),
+          });
 
       await graph.updateState(
         { configurable: { thread_id: graphThreadId } },
-        {
-          messages:
-            // The human agent's own message is an AIMessage, so the divider cannot ride inside it the
-            // way it does on a customer turn: it goes ahead of it, as its own message.
-            newConversation && role === "human_agent"
-              ? [conversationDividerMessage(conversationId), msg]
-              : [msg],
-        },
+        { messages: [msg] },
         THREAD_STATE_NODE,
       );
 

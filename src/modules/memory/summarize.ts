@@ -46,26 +46,42 @@ const TRANSCRIPT_CLOSE = "</transcricao>";
 // the summarizer directly — and what the summarizer writes is what the agent believes forever after.
 const FENCE_TAG = /<\s*\/?\s*transcricao[^>]*>/gi;
 
-// Escolhido por medição, não por gosto: bateria A/B com n=24 a 32 por célula em gpt-5.4-mini, sobre
-// dois diálogos (um simples; um com o valor mudando no meio, uma restrição dita uma única vez logo no
-// começo e nenhum fechamento). O que a bateria comparou e o que ela achou:
+// Escolhido por medição, não por gosto: bateria A/B com n=32 por célula em gpt-5.4-mini, sobre dois
+// diálogos (o cenário 1 simples; o 2 com o valor mudando no meio, uma restrição dita uma única vez
+// logo no começo e nenhum fechamento). Números re-derivados contra este HEAD; o harness lê o prompt
+// deste arquivo, então dá para repetir a conta:
 //
-//   retenção factual  este prompt acerta todos os fatos em 32/32 no diálogo simples e 31/32 no
-//                     difícil (a falha foi omitir o NOME do cliente). Invenção: 0 em toda célula.
-//   variante A        a mesma coisa com quatro bullets enumerando o que preservar: mesma retenção,
-//                     mesma ausência de invenção, resumo 26% mais longo no diálogo difícil, e
-//                     escrita vazada em 8/64 contra 4/128 deste (p≈0,01).
-//   variante C        este mais "usando o mesmo alfabeto dela do começo ao fim", tentando matar o
-//                     vazamento: não mexeu no vazamento (1/32 contra 2/32) e DERRUBOU a retenção do
-//                     nome para 27/32 no diálogo difícil. Rejeitada.
+//                        fatos completos      nome (cen. 2)   escrita vazada    mediana de tamanho
+//   este prompt          32/32 e 31/32            31/32           3/64            310 e 340
+//   variante A           32/32 e 31/32            32/32           3/64            370 e 451
+//   variante C           32/32 e 26/32            27/32           0/64            261 e 339
+//
+// Invenção: 0/32 em todas as seis células. Nenhuma variante inventou nada, que é o eixo em que
+// nenhuma delas podia falhar.
+//
+//   variante A  os mesmos quatro bullets enumerando o que preservar. Mesma retenção, mesma ausência
+//               de invenção, e resumo 19% (cenário 1) a 33% (cenário 2) mais longo. É só isso que
+//               separa os dois, e é o suficiente: texto a mais sem fato a mais é contexto pago em
+//               todo turno seguinte, para sempre.
+//   variante C  este mais "usando o mesmo alfabeto dela do começo ao fim", mirando o vazamento.
+//               ZEROU o vazamento — e derrubou a retenção do nome do cliente para 27/32 no diálogo
+//               difícil. Rejeitada por isso: esquecer quem é o cliente é dano de memória, o
+//               vazamento é cosmético.
+//
+// CORREÇÃO de uma medição anterior, registrada porque o número estava publicado aqui e neste repo
+// público: a rodada que escolheu este prompt afirmava vazamento de 8/64 na variante A contra 4/128
+// aqui, com p≈0,01, e afirmava que C não mexia no vazamento. Nenhuma das duas se reproduziu. O
+// vazamento não distingue A deste prompt (3/64 nos dois), e C na verdade o elimina. O fenômeno gira
+// em torno de 3-5%, e nenhuma das duas rodadas tem n para separar variantes nessa faixa — tratar
+// aquele p≈0,01 como resultado foi erro meu. O que decide A contra este é o comprimento, e o que
+// rejeita C é a retenção do nome; as duas coisas se repetem e são grandes o bastante para enxergar.
 //
 // "Escrita vazada" é um pedaço em cirílico/persa/bengali no meio de uma frase em português ("com
-// обещa de retorno", "com মূল্য de R$ 250,00"): ~3% dos resumos, artefato do modelo e não do texto
-// acima, já que a única tentativa direta de corrigi-lo custou retenção. O sentido sobrevive, mas
-// aquilo fica gravado e reaparece em todo turno seguinte, então está registrado aqui como conhecido
-// e medido em vez de descoberto por um operador. Não há pós-processamento tirando caractere
-// não-latino: a regra do idioma é deliberada, e um cliente que fala russo tem que receber memória em
-// cirílico.
+// обещa de retorno", "com মূল্য de R$ 250,00"): artefato do modelo e não do texto acima. O sentido
+// sobrevive, mas aquilo fica gravado e reaparece em todo turno seguinte, então está registrado aqui
+// como conhecido e medido em vez de descoberto por um operador. Não há pós-processamento tirando
+// caractere não-latino: a regra do idioma é deliberada, e um cliente que fala russo tem que receber
+// memória em cirílico.
 const SYSTEM_PROMPT = `Você registra a memória de um atendimento que acabou, para o atendente que vai falar com este mesmo cliente da próxima vez.
 
 Escreva um resumo curto do atendimento entre as tags de transcrição, guardando o que um próximo atendimento precisaria saber.
