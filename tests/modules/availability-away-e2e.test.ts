@@ -4,9 +4,9 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import {
-  claimOutOfHoursNotices,
+  claimAwayMessage,
   processChatwootDelivery,
-  releaseOutOfHoursNotices,
+  releaseAwayMessage,
 } from "@/modules/chatwoot/webhook";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
@@ -124,6 +124,7 @@ function installChatwootDouble(): void {
 async function seedConversation(
   convId: number,
   inbox: bigint,
+  awaySentAt: Date | null = null,
   noticeSentAt: Date | null = null,
 ): Promise<bigint> {
   const row = await suDb.conversation.create({
@@ -136,6 +137,7 @@ async function seedConversation(
       threadId: `${tenantId}:${instanceId}:${convId}`,
       lastEventAt: new Date(Date.now() - 2 * 60_000),
       lastInboundAt: new Date(Date.now() - 3 * 60_000),
+      awayMessageSentAt: awaySentAt,
       outOfHoursNoticeSentAt: noticeSentAt,
     },
     select: { id: true },
@@ -372,8 +374,9 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     ).toBe(true);
     const conv = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: convId },
-      select: { outOfHoursNoticeSentAt: true },
+      select: { awayMessageSentAt: true, outOfHoursNoticeSentAt: true },
     });
+    expect(conv.awayMessageSentAt).not.toBeNull();
     expect(conv.outOfHoursNoticeSentAt).not.toBeNull();
   });
 
@@ -400,6 +403,19 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     expect(notesOn(convId)).toHaveLength(1);
   });
 
+  // The operator writes the copy at 20:10, on a conversation whose note went out at 20:00. Sharing one
+  // watermark made the note's stamp swallow the customer's first message of the feature's life, which
+  // is the worst possible first impression of a setting someone just turned on.
+  test("copy written after today's note still reaches the customer today", async () => {
+    const convId = 9108;
+    await seedConversation(convId, inboxWithCopyId, null, new Date());
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 11);
+
+    expect(publicOn(convId)).toHaveLength(1);
+    // And the note is not re-posted: its own watermark says it already went out.
+    expect(notesOn(convId)).toEqual([]);
+  });
+
   // Disabling an agent switches off everything it says to the CUSTOMER. The operator note is the
   // pre-existing behavior of this branch and stays.
   test("a disabled agent tells the operator but never the customer", async () => {
@@ -419,14 +435,14 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     const convId = 9105;
     const rowId = await seedConversation(convId, inboxWithCopyId);
     const now = new Date();
-    const first = await claimOutOfHoursNotices({
+    const first = await claimAwayMessage({
       tenantId,
       conversationId: rowId,
       previous: null,
       now,
       base: appDb,
     });
-    const second = await claimOutOfHoursNotices({
+    const second = await claimAwayMessage({
       tenantId,
       conversationId: rowId,
       previous: null,
@@ -437,7 +453,7 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     expect(second).toBe(false);
 
     // And releasing hands the day back, so the next message retries.
-    await releaseOutOfHoursNotices({
+    await releaseAwayMessage({
       tenantId,
       conversationId: rowId,
       previous: null,
@@ -446,9 +462,9 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     });
     const conv = await suDb.conversation.findUniqueOrThrow({
       where: { id: rowId },
-      select: { outOfHoursNoticeSentAt: true },
+      select: { awayMessageSentAt: true },
     });
-    expect(conv.outOfHoursNoticeSentAt).toBeNull();
+    expect(conv.awayMessageSentAt).toBeNull();
   });
 
   // Claiming before posting is what makes a failed send dangerous: the day would read as settled and
@@ -463,9 +479,9 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
     expect(publicOn(convId)).toEqual([]);
     const afterFailure = await suDb.conversation.findUniqueOrThrow({
       where: { id: rowId },
-      select: { outOfHoursNoticeSentAt: true },
+      select: { awayMessageSentAt: true },
     });
-    expect(afterFailure.outOfHoursNoticeSentAt).toBeNull();
+    expect(afterFailure.awayMessageSentAt).toBeNull();
 
     // The next message retries, and lands once Chatwoot is answering again.
     failPublicFor.delete(convId);
@@ -477,9 +493,12 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
   // not an edge one: the customer asking again tomorrow is asking again, and gets an answer.
   test("a new day re-sends the away message without re-posting the note", async () => {
     const convId = 9104;
+    // Both watermarks carry the older day: the away message is due again, the note is not (it is
+    // one-shot per conversation, and this conversation already has one).
     await seedConversation(
       convId,
       inboxWithCopyId,
+      new Date(Date.now() - 2 * 86_400_000),
       new Date(Date.now() - 2 * 86_400_000),
     );
     await deliverCustomerMessage(convId, INBOX_WITH_COPY, 5);

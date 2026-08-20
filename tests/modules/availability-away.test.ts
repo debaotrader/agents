@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  awayMessageDue,
   readAvailabilityConfig,
   renderAwayMessage,
 } from "@/modules/availability/away";
@@ -154,5 +155,40 @@ describe("renderAwayMessage", () => {
         now: SUNDAY,
       }),
     ).toEqual({ send: true, text: "Estamos fechados." });
+  });
+});
+
+// The cadence is the away message's own, on its own watermark: the operator note answers a question
+// that does not change, this one answers a question the customer asks again every day.
+describe("awayMessageDue", () => {
+  const SP: Schedule = {
+    windows: [{ day: 1, start: "09:00", end: "17:00" }],
+    exceptions: [],
+    timezone: "America/Sao_Paulo",
+  };
+
+  test("never sent → due", () => {
+    expect(awayMessageDue(MON_9_TO_17, SUNDAY, null)).toBe(true);
+  });
+
+  test("already sent the same local day → not due", () => {
+    expect(
+      awayMessageDue(MON_9_TO_17, SUNDAY, new Date("2024-01-07T08:00:00Z")),
+    ).toBe(false);
+  });
+
+  test("sent on an earlier local day → due again", () => {
+    expect(
+      awayMessageDue(MON_9_TO_17, SUNDAY, new Date("2024-01-06T20:00:00Z")),
+    ).toBe(true);
+  });
+
+  // The day boundary is the SCHEDULE's, not UTC's: 12:00 local is Jan 7 in UTC and 21:30 local is
+  // already Jan 8 there, so a UTC comparison would hand the customer a second message before their
+  // day ended.
+  test("the local day boundary is the schedule timezone's, not UTC's", () => {
+    const sentAt = new Date("2024-01-07T15:00:00Z"); // Sun 12:00 local, Jan 7 UTC
+    const now = new Date("2024-01-08T00:30:00Z"); // Sun 21:30 local, Jan 8 UTC
+    expect(awayMessageDue(SP, now, sentAt)).toBe(false);
   });
 });

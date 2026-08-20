@@ -19,12 +19,12 @@ import { AppError, UnauthorizedError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { shouldRunReset } from "@/modules/agents/test-mode";
 import {
+  awayMessageDue,
   readAvailabilityConfig,
   renderAwayMessage,
 } from "@/modules/availability/away";
 import {
   isOpenAt,
-  localDateKey,
   NEXT_OPEN_SCAN_DAYS,
   parseSchedule,
   type Schedule,
@@ -564,40 +564,32 @@ async function ingestUnhandledMessage(args: {
 
 // Reactive availability decision: the agent's business hours (the "Disponibilidade" schedule) gate
 // replies to the customer. Outside the configured window the agent stays SILENT; the operator gets a
-// one-shot private note (postNote true only the first time, mirroring the test-mode notice) and the
-// customer gets the agent's away message, when one is configured. No schedule / empty windows →
-// always on (never silenced). Pure (now injected) so it is unit-testable.
+// one-shot private note (postNote true only the first time, mirroring the test-mode notice). No
+// schedule / empty windows → always on (never silenced). Pure (now injected) so it is unit-testable.
 //
-// The two notices deliberately run on different clocks off the SAME watermark. The note answers "why
-// is the bot quiet", which the operator needs once and which does not change. The away message answers
-// "is anyone there", which the customer asks again every time they write — and a WhatsApp conversation
-// is never closed, so once-per-conversation would mean once per customer per lifetime. Once per local
-// day is also what Chatwoot's own inbox out-of-office does (messages.today.template.empty?), so an
-// operator migrating off that stopgap gets the cadence they already know.
+// The CUSTOMER-facing half of the same closure is a separate decision on a separate watermark
+// (awayMessageDue, src/modules/availability/away.ts): the two answer different questions on different
+// clocks, and a conversation whose note went out earlier today must still receive the message the
+// first time an operator writes one.
 export function outOfHoursGate(
   hours: Schedule | null,
   now: Date,
-  lastNoticeAt: Date | null,
-): { silence: boolean; postNote: boolean; sendAway: boolean } {
-  const open = { silence: false, postNote: false, sendAway: false };
-  if (!hours || hours.windows.length === 0) return open;
-  if (isOpenAt(hours, now)) return open;
-  return {
-    silence: true,
-    postNote: lastNoticeAt === null,
-    sendAway:
-      lastNoticeAt === null ||
-      localDateKey(lastNoticeAt, hours.timezone) !==
-        localDateKey(now, hours.timezone),
-  };
+  noticeAlreadySent: boolean,
+): { silence: boolean; postNote: boolean } {
+  if (!hours || hours.windows.length === 0) {
+    return { silence: false, postNote: false };
+  }
+  if (isOpenAt(hours, now)) {
+    return { silence: false, postNote: false };
+  }
+  return { silence: true, postNote: !noticeAlreadySent };
 }
 
-// Claim today's out-of-hours notices with a compare-and-swap on the watermark's exact previous value
-// (null included). The webhook dispatch is DETACHED, so a customer who writes twice in a row lands two
+// Claim the day's away message with a compare-and-swap on its watermark's exact previous value (null
+// included). The webhook dispatch is DETACHED, so a customer who writes twice in a row lands two
 // invocations that both read the same watermark before either writes it; without the claim both would
-// post, and the one the customer sees twice is the away message. The loser skips instead: the winner
-// is already posting the same thing.
-export async function claimOutOfHoursNotices(params: {
+// post and the customer would see the message twice. The loser skips: the winner is already posting.
+export async function claimAwayMessage(params: {
   tenantId: bigint;
   conversationId: bigint;
   previous: Date | null;
@@ -611,23 +603,19 @@ export async function claimOutOfHoursNotices(params: {
       db.conversation.updateMany({
         where: {
           id: params.conversationId,
-          outOfHoursNoticeSentAt: params.previous,
+          awayMessageSentAt: params.previous,
         },
-        data: { outOfHoursNoticeSentAt: params.now },
+        data: { awayMessageSentAt: params.now },
       }),
   );
   return claimed.count === 1;
 }
 
-// Give the day back when the message the CUSTOMER was supposed to receive never left. The watermark
-// means "this day is settled", and a claim that delivered nothing to the customer must not settle it,
-// or the retry the next message would have made is suppressed until tomorrow. Guarded on our own
-// stamp, so a claim that has since moved on is never clobbered.
-//
-// NOTE: this can cost the operator a repeated private note (the note may have gone out under the same
-// claim). A duplicated note is noise; a customer left in silence for the rest of the day because one
-// API call failed is the bug this whole change exists to fix.
-export async function releaseOutOfHoursNotices(params: {
+// Give the day back when the message never left. The watermark means "the customer heard from us
+// today", and a claim that delivered nothing must not settle it, or the retry the next message would
+// have made is suppressed until tomorrow. Guarded on our own stamp, so a claim that has since moved on
+// is never clobbered. The operator note has its own watermark and is untouched either way.
+export async function releaseAwayMessage(params: {
   tenantId: bigint;
   conversationId: bigint;
   previous: Date | null;
@@ -639,14 +627,14 @@ export async function releaseOutOfHoursNotices(params: {
       db.conversation.updateMany({
         where: {
           id: params.conversationId,
-          outOfHoursNoticeSentAt: params.claimed,
+          awayMessageSentAt: params.claimed,
         },
-        data: { outOfHoursNoticeSentAt: params.previous },
+        data: { awayMessageSentAt: params.previous },
       }),
     );
   } catch (err) {
     logger.warn(
-      "chatwoot: out-of-hours claim release failed (conv=%s): %s",
+      "chatwoot: away-message claim release failed (conv=%s): %s",
       String(params.conversationId),
       errMsg(err),
     );
@@ -692,6 +680,7 @@ async function maybeConsumeCommandOrGate(params: {
         testActivatedAt: true,
         testNoticeSentAt: true,
         outOfHoursNoticeSentAt: true,
+        awayMessageSentAt: true,
         redirectSentAt: true,
         redirectCount: true,
         redirectLinkedAt: true,
@@ -984,6 +973,7 @@ async function maybeConsumeCommandOrGate(params: {
             lastFollowUpAt: null,
             testNoticeSentAt: null,
             outOfHoursNoticeSentAt: null,
+            awayMessageSentAt: null,
           },
         }),
       ),
@@ -1087,17 +1077,17 @@ async function maybeConsumeCommandOrGate(params: {
   const availability = outOfHoursGate(
     ctx.hours,
     now,
-    ctx.conv.outOfHoursNoticeSentAt,
+    ctx.conv.outOfHoursNoticeSentAt !== null,
   );
   if (availability.silence) {
-    // The customer-facing half (#153). ctx.hours is non-null whenever the gate silences, so the
-    // schedule the message describes is the one that just silenced the agent.
-    // A DISABLED agent still reaches this branch and still tells the operator why it is quiet, which
-    // is the pre-existing behavior of a note nobody but the operator sees. It must not acquire a voice
-    // toward the CUSTOMER here: an operator who switched the agent off switched off everything it says
-    // to the customer, and the runtime refuses to run it a few lines later for exactly that reason.
+    // ── The CUSTOMER-facing half (#153), on its own watermark and its own cadence. A DISABLED agent
+    //    still tells the operator why it is quiet — that note is pre-existing behavior nobody but the
+    //    operator sees — but it acquires no voice toward the customer: switching an agent off switches
+    //    off everything it says to them, which is why the runtime refuses to run it a few lines later.
     const away =
-      availability.sendAway && ctx.agentEnabled && ctx.hours
+      ctx.agentEnabled &&
+      ctx.hours &&
+      awayMessageDue(ctx.hours, now, ctx.conv.awayMessageSentAt)
         ? renderAwayMessage({
             copy: readAvailabilityConfig(ctx.agentSettings).awayMessage,
             schedule: ctx.hours,
@@ -1111,12 +1101,9 @@ async function maybeConsumeCommandOrGate(params: {
         NEXT_OPEN_SCAN_DAYS,
       );
     }
-    // One watermark for both notices (see outOfHoursGate), claimed BEFORE either is posted and only
-    // when there is something to post — an agent with no away message that has already told the
-    // operator writes nothing here, which is exactly its pre-#153 behavior.
-    const previous = ctx.conv.outOfHoursNoticeSentAt;
-    if (availability.postNote || away.send) {
-      const claimed = await claimOutOfHoursNotices({
+    if (away.send) {
+      const previous = ctx.conv.awayMessageSentAt;
+      const claimed = await claimAwayMessage({
         tenantId,
         conversationId: ctx.conv.id,
         previous,
@@ -1124,33 +1111,40 @@ async function maybeConsumeCommandOrGate(params: {
         base,
       }).catch((err) => {
         logger.warn(
-          "chatwoot: out-of-hours claim failed (conv=%s): %s",
+          "chatwoot: away-message claim failed (conv=%s): %s",
           String(conversationId),
           errMsg(err),
         );
         return false;
       });
-      if (!claimed) {
-        logger.info(
-          "chatwoot: out-of-hours notices already claimed for this day (conv=%s)",
-          String(conversationId),
-        );
-        return true;
-      }
-      const delivered = away.send ? await postPublicMessage(away.text) : true;
-      if (availability.postNote) {
-        await postPrivateNote(
-          "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
-        );
-      }
-      if (!delivered) {
-        await releaseOutOfHoursNotices({
+      if (claimed && !(await postPublicMessage(away.text))) {
+        await releaseAwayMessage({
           tenantId,
           conversationId: ctx.conv.id,
           previous,
           claimed: now,
           base,
         });
+      }
+    }
+    // ── The operator note, unchanged: one shot per conversation, stamped after it is posted. ──
+    if (availability.postNote) {
+      await postPrivateNote(
+        "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
+      );
+      try {
+        await runScopedOn(base, sysCtx(tenantId), (db) =>
+          db.conversation.update({
+            where: { id: ctx.conv.id },
+            data: { outOfHoursNoticeSentAt: now },
+          }),
+        );
+      } catch (err) {
+        logger.warn(
+          "chatwoot: out-of-hours notice flag write failed (conv=%s): %s",
+          String(conversationId),
+          errMsg(err),
+        );
       }
     }
     logger.info(

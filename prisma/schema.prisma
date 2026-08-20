@@ -480,6 +480,12 @@ model Conversation {
   // one-shot as testNoticeSentAt: the agent stays silent outside its configured business hours and the
   // operator is notified once per conversation (NULL = not yet). /reset clears it.
   outOfHoursNoticeSentAt DateTime? @map("out_of_hours_notice_sent_at")
+  // When the customer-facing out-of-hours message was last SENT (issue #153). Separate from the note
+  // above because the two answer different questions on different clocks: the note tells the operator
+  // why the bot is quiet, once per conversation; the message tells the CUSTOMER, once per local day,
+  // and a conversation that already carried a note today must still get the message the first time the
+  // operator writes one. NULL = never sent. /reset clears it.
+  awayMessageSentAt      DateTime? @map("away_message_sent_at")
   // WhatsApp→chat redirect gate watermarks (only on the entry WhatsApp conversation). redirectSentAt =
   // when the redirect link was last sent (one-shot + cooldown anchor); redirectCount = how many times it
   // has been sent (bounded by maxResends). NULL/0 = never redirected.

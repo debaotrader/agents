@@ -1,5 +1,9 @@
 import { clipText, TEMPLATE_MESSAGE_MAX } from "@/modules/agents/text-caps";
-import { nextOpenAt, type Schedule } from "@/modules/business-hours/hours";
+import {
+  localDateKey,
+  nextOpenAt,
+  type Schedule,
+} from "@/modules/business-hours/hours";
 
 // The customer-facing side of the availability gate. The gate silences the agent outside its schedule
 // and tells the OPERATOR with a private note; until this module existed the CUSTOMER was told nothing,
@@ -91,4 +95,25 @@ export function renderAwayMessage(params: {
     );
   }
   return { send: true, text };
+}
+
+// Is the customer owed the message again? Once per LOCAL day per conversation, in the schedule's
+// timezone: a WhatsApp conversation is never closed, so once-per-conversation would mean once per
+// customer per lifetime, while a UTC comparison would roll the day over three hours early for
+// America/Sao_Paulo. Chatwoot's own inbox out-of-office lands on the same rule
+// (`conversation.messages.today.template.empty?`), so an operator migrating off that stopgap gets the
+// cadence they already know.
+//
+// This reads the away message's OWN watermark, never the operator note's: a conversation whose note
+// went out earlier today must still receive the message the first time an operator writes one.
+export function awayMessageDue(
+  schedule: Schedule,
+  now: Date,
+  lastSentAt: Date | null,
+): boolean {
+  if (lastSentAt === null) return true;
+  return (
+    localDateKey(lastSentAt, schedule.timezone) !==
+    localDateKey(now, schedule.timezone)
+  );
 }
