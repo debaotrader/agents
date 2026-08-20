@@ -13,6 +13,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "@/graph/inflight";
+import { isConversationDivider } from "@/graph/markers";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -673,11 +674,15 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       cp?.channel_values as { messages?: BaseMessage[] } | undefined
     )?.messages ?? []) as BaseMessage[];
     // Two: the first conversation's turn and its reply. The turn that ran while the boundary was
-    // deferred carries conversation 981 on its own message, so it stays in the OPEN attendance even
-    // though the divider only landed after it — the cut reads the stamp, not the divider.
+    // deferred carries conversation 981 on its own message, so it stays in the OPEN attendance — the
+    // cut reads the stamp, not the divider.
     expect(
       selectClosedPrefix(messages, { currentAttendanceClosed: false }).closed,
     ).toHaveLength(2);
+    // And no divider was appended: it could only land AFTER the exchange that already happened on
+    // this conversation, telling the model that part of the conversation it is in the middle of is a
+    // past attendance. A hint in the wrong place is worse than no hint.
+    expect(messages.some(isConversationDivider)).toBe(false);
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {

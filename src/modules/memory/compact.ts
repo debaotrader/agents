@@ -525,13 +525,26 @@ export async function runCompaction(
       level: "info",
       status: "ok",
       detail: {
-        attendanceConversationId: conversationId,
+        // The segment's own attendance, which on an owed rewrite is an OLDER one than the job was
+        // armed for. Logging the payload's would file the compaction under the wrong conversation in
+        // the operator's trail, exactly on the retries hardest to read.
+        attendanceConversationId: segmentConversationId,
         messagesCompacted: cut.closed.length,
         summaryChars: summary.length,
         reason,
       },
     },
   );
+  // An owed prefix is only the part a previous attempt already paid for. Anything the natural cut
+  // reaches past it is still raw, and nothing else is going to come back for it: this job's row is
+  // being retired right now, and the triggers that would re-arm it (a resolve, a new attendance) have
+  // already fired. So the job asks for one more pass instead of declaring the thread compacted.
+  if (owedIsPending && headOffset + natural.closed.length > owedIndex + 1) {
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + DEFER_ON_TURN_MS),
+    };
+  }
   return { outcome: "done" };
 }
 

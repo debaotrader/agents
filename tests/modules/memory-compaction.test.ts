@@ -843,7 +843,19 @@ describe.skipIf(!dbUp)("memory compaction", () => {
       { checkpointer: saver, makeModel: () => model },
     );
 
-    expect(retry.outcome).toBe("done");
+    // Rescheduled, not done: the owed prefix is only the part already paid for, and the turns the
+    // wider cut reaches past it are still raw. Nothing else is coming back for them — this job's row
+    // is being retired and its triggers have already fired.
+    expect(retry.outcome).toBe("reschedule");
+    // The trail names the attendance that was actually folded, not the one this job was armed for.
+    // Those differ exactly on a retry, which is when an operator most needs the line to be right.
+    await waitForFlowLines(threadId, 1);
+    const trail = await suDb.executionLog.findFirst({
+      where: { tenantId, stage: "memory", threadId },
+    });
+    expect(JSON.stringify(trail?.detail ?? {})).toContain(
+      '"attendanceConversationId":708',
+    );
     // No second generation, no second row: the owed prefix is what got folded.
     expect(model.calls).toBe(1);
     const rows = await suDb.attendanceSummary.findMany({
@@ -856,6 +868,24 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     // Everything the owed row did NOT cover is still raw, waiting for the next pass.
     expect(after.some((c) => c.includes("oi, voltei"))).toBe(true);
     expect(after.some((c) => c.includes("oi, de novo"))).toBe(true);
+
+    // And that pass finishes the job: the rest is summarized under its OWN attendance.
+    const third = await runCompaction(
+      tenantId,
+      payload(contactInboxId, 709, "new_attendance"),
+      appDb,
+      { checkpointer: saver, makeModel: () => model },
+    );
+    expect(third.outcome).toBe("done");
+    expect(model.calls).toBe(2);
+    const finalRows = await suDb.attendanceSummary.findMany({
+      where: { tenantId, contactInboxId },
+      orderBy: { id: "asc" },
+    });
+    expect(finalRows.map((r) => r.conversationId)).toEqual([708, 709]);
+    const settled = await readThread(saver, threadId);
+    expect(settled[0]).toStartWith(MEMORY_HEAD_OPEN);
+    expect(settled.some((c) => c.includes("oi, voltei"))).toBe(false);
   });
 
   test("a resolved attendance compacts the whole thread down to its memory", async () => {

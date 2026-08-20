@@ -1,5 +1,5 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { HumanMessage } from "@langchain/core/messages";
+import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
@@ -45,7 +45,11 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
-import { conversationDividerMessage, conversationStamp } from "./markers";
+import {
+  conversationDividerMessage,
+  conversationStamp,
+  stampedConversationId,
+} from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -527,11 +531,25 @@ export async function runLoadedTurn(
             // and withholding the arm would make it wait on a next turn that may never come.
             if (boundary && anotherInvokeIsReading) return prev as number;
             if (boundary) {
-              await dividerGraph.updateState(
-                { configurable: { thread_id: graphThreadId } },
-                { messages: [conversationDividerMessage(conversationId)] },
-                THREAD_STATE_NODE,
-              );
+              // Only when this attendance has not started yet. A claim skipped earlier (an
+              // overlapping invoke) leaves the turns that ran meanwhile in the thread, and the divider
+              // can only be APPENDED — landing after them, telling the model that part of the
+              // conversation it is in the middle of is a past attendance. A hint in the wrong place
+              // is worse than no hint, and the cut does not need it either way.
+              const already = await dividerGraph.getState({
+                configurable: { thread_id: graphThreadId },
+              });
+              const started = (
+                ((already.values as { messages?: BaseMessage[] } | undefined)
+                  ?.messages ?? []) as BaseMessage[]
+              ).some((m) => stampedConversationId(m) === conversationId);
+              if (!started) {
+                await dividerGraph.updateState(
+                  { configurable: { thread_id: graphThreadId } },
+                  { messages: [conversationDividerMessage(conversationId)] },
+                  THREAD_STATE_NODE,
+                );
+              }
             }
             await db.agentThread.upsert({
               where: key,
