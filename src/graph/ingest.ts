@@ -5,6 +5,7 @@ import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getCheckpointer } from "./checkpointer";
+import { isTurnInFlight } from "./inflight";
 import { conversationDividerMessage, conversationStamp } from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
@@ -102,7 +103,18 @@ export async function ingestMessageIntoThread(
       // sends the first message of it, and skipping them here left that message sitting inside the
       // PREVIOUS attendance — summarized and removed with it when the customer finally replied.
       const prevConv = row?.lastConversationId ?? null;
-      const newConversation = prevConv != null && prevConv !== conversationId;
+      const boundary = prevConv != null && prevConv !== conversationId;
+      // An invoke that started earlier on this thread is a read-modify-write of the WHOLE channel:
+      // it saves the state it loaded plus its own messages, erasing whatever landed meanwhile. So a
+      // boundary crossed while one is reading cannot be CONSUMED here — the divider would be erased
+      // and the marker below would advance for good, and the messages of the attendance that just
+      // ended would then carry no boundary the cut can find, leaving the due job a no-op that no
+      // later message re-arms. The marker stays put instead, and the next message on this thread
+      // writes the divider with no invoke in the way. Same reasoning as the reactive turn
+      // (src/graph/runtime.ts), and the same conclusion: only the PROMPT is at stake, since the cut
+      // reads the conversation stamped on each message, not the divider.
+      const anotherInvokeIsReading = boundary && isTurnInFlight(graphThreadId);
+      const newConversation = boundary && !anotherInvokeIsReading;
 
       // Customer → HumanMessage; human agent → AIMessage (the business side of the dialogue, so the
       // model reads it as an already-given reply), disambiguated by the <atendente> marker so it never
@@ -150,12 +162,21 @@ export async function ingestMessageIntoThread(
         },
         update: {
           lastSyncedMessageId: messageId,
-          lastConversationId: conversationId,
+          // Held back when an invoke owns the thread: see anotherInvokeIsReading above. The synced
+          // watermark still advances — it guards at-most-once append, and rewinding it would trade a
+          // lost divider for a duplicated message.
+          lastConversationId: anotherInvokeIsReading
+            ? prevConv
+            : conversationId,
         },
       });
       return {
         outcome: "ingested" as const,
-        closedConversationId: newConversation ? prevConv : null,
+        // Armed even when the boundary was not consumed. The attendance that just ended is
+        // compactable right now — its boundary lives on the messages, not on the divider this call
+        // declined to write — and withholding the arm would make it wait on a next message that may
+        // never come.
+        closedConversationId: boundary ? prevConv : null,
       };
     }),
   );

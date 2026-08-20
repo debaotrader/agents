@@ -11,6 +11,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import { buildAgentGraph } from "@/graph/graph";
+import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
 import { ingestMessageIntoThread } from "@/graph/ingest";
 import { isConversationDivider, stampedConversationId } from "@/graph/markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
@@ -350,5 +351,76 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     });
     expect(cut.closed).toHaveLength(1);
     expect(cut.open).toHaveLength(1);
+  });
+
+  test("a boundary crossed while a turn owns the thread is armed but not consumed", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 23459;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const closed: number[] = [];
+    const ingest = (conversationId: number, messageId: number, text: string) =>
+      ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        role: "customer",
+        text,
+        base: appDb,
+        checkpointer: saver,
+        onAttendanceClosed: (prev) => {
+          closed.push(prev);
+        },
+      });
+    await ingest(810, 1, "primeira");
+
+    // An older turn is still invoking on this thread. Its save will restore the channel it loaded,
+    // so a divider written now would be erased while the marker advanced for good.
+    markTurnInFlight(graphThreadId);
+    await ingest(811, 2, "segunda");
+    clearTurnInFlight(graphThreadId);
+
+    const mid = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const midMessages = ((mid?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    // No divider: the message went in raw. It still carries its conversation, which is what the cut
+    // reads, so the attendance stays compactable either way.
+    expect(midMessages.map((m) => isConversationDivider(m))).toEqual([
+      false,
+      false,
+    ]);
+    expect(stampedConversationId(midMessages[1] as BaseMessage)).toBe(811);
+    // Armed all the same: attendance 810 is compactable right now.
+    expect(closed).toEqual([810]);
+    // And the marker did NOT move, so the boundary is still owed.
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      select: { lastConversationId: true, lastSyncedMessageId: true },
+    });
+    expect(row?.lastConversationId).toBe(810);
+    // The synced watermark advances regardless: it guards at-most-once append.
+    expect(row?.lastSyncedMessageId).toBe(2);
+
+    // Next message on the free thread writes the divider the deferred one could not.
+    await ingest(811, 3, "terceira");
+    const after = await saver.get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const messages = ((after?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    expect(isConversationDivider(messages[2] as BaseMessage)).toBe(true);
+    expect(String(messages[2]?.content)).toContain("terceira");
   });
 });
