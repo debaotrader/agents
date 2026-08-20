@@ -1208,11 +1208,33 @@ export async function processChatwootDelivery(
         // ~0% past 24h), so compacting only when they return would miss the expensive turn. The
         // job re-checks the status at execution, because a resolve can be undone. Unlike the
         // redirect handling below, this applies to every agent, not only a widget inbox.
-        if (n.contactInboxId !== null) {
+        // From the MIRROR when the event does not carry it. A conversation_* payload can arrive
+        // without `contact_inbox` — the mirror handles that shape explicitly, preserving the stored
+        // id rather than nulling it — and reading only the event would skip compaction for a resolve
+        // that is otherwise complete. Nothing comes back for it either: if the customer returns on
+        // the same conversation there is no new-attendance boundary, so that history stays raw
+        // indefinitely, on exactly the resolve trigger that exists to make the return turn cheap.
+        const closingContactInboxId =
+          n.contactInboxId ??
+          (await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+            db.conversation
+              .findUnique({
+                where: {
+                  tenantId_chatwootInstanceId_chatwootConversationId: {
+                    tenantId: params.tenantId,
+                    chatwootInstanceId: params.instanceId,
+                    chatwootConversationId: conversationId,
+                  },
+                },
+                select: { contactInboxId: true },
+              })
+              .then((c) => c?.contactInboxId ?? null),
+          ));
+        if (closingContactInboxId !== null) {
           await armCompaction({
             tenantId: params.tenantId,
             instanceId: params.instanceId,
-            contactInboxId: n.contactInboxId,
+            contactInboxId: closingContactInboxId,
             conversationId,
             agentId: closingRt.agentId,
             reason: "resolved",

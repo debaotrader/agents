@@ -218,6 +218,36 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     expect(job?.runAt.getTime()).toBeGreaterThan(Date.now() + 60_000);
   });
 
+  // A conversation_* payload can arrive WITHOUT contact_inbox — the mirror handles that shape on
+  // purpose, keeping the stored id rather than nulling it. Reading only the event would skip the arm,
+  // and nothing comes back for it: a customer returning on the same conversation crosses no new
+  // attendance boundary, so that history stays raw indefinitely.
+  test("a resolve whose payload omits contact_inbox still arms, from the mirror", async () => {
+    const convId = 412;
+    // First a complete event, so the mirror knows the contact-inbox for this conversation.
+    stamp += 1;
+    await deliver(
+      "conversation_updated",
+      convPayload(convId, "pending", stamp),
+    );
+    expect(await jobFor(convId)).toBeNull();
+
+    // Then the resolve, sparse: same conversation, no contact_inbox.
+    stamp += 1;
+    const { contact_inbox: _omitted, ...sparse } = convPayload(
+      convId,
+      "resolved",
+      stamp,
+    );
+    await deliver("conversation_status_changed", sparse);
+
+    const job = await jobFor(convId);
+    expect(job).not.toBeNull();
+    const jobPayload = (job?.payload ?? {}) as Record<string, unknown>;
+    expect(jobPayload.reason).toBe("resolved");
+    expect(jobPayload.contactInboxId).toBe(CONTACT_INBOX_ID + convId);
+  });
+
   test("a re-delivered resolve does not stack a second job", async () => {
     const convId = 402;
     await resolve(convId);
