@@ -52,7 +52,57 @@ function build(shape: string): BaseMessage[] {
   });
 }
 
+// A thread where a conversation was REOPENED after another one already ran on it: the stamps read
+// 1 … 2 … 1, which `build` cannot express (its conversation counter only moves forward). Written by
+// hand for that reason, through the same stamp factory.
+function reopened(): BaseMessage[] {
+  const stamped = (conversation: number, text: string) =>
+    new HumanMessage({
+      content: text,
+      additional_kwargs: conversationStamp(conversation),
+    });
+  return [
+    stamped(1, "quanto custa?"),
+    new AIMessage("R$ 250."),
+    stamped(2, "outra dúvida"),
+    new AIMessage("Claro."),
+    stamped(1, "voltei naquele orçamento"),
+    new AIMessage("Vamos lá."),
+  ];
+}
+
 describe("selectClosedPrefix", () => {
+  // THE REOPENED CASE. Taking the FIRST message stamped with the current conversation put the start
+  // at index 0, so `start <= 0` read as "one attendance in progress" and nothing was EVER closed on
+  // this thread again — the ended attendances stayed raw in every prompt, silently, with no later
+  // boundary able to change the answer.
+  test("a reopened conversation closes what ran before it, not nothing", () => {
+    const cut = selectClosedPrefix(reopened(), {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed.map((m) => String(m.content))).toEqual([
+      "quanto custa?",
+      "R$ 250.",
+      "outra dúvida",
+      "Claro.",
+    ]);
+    expect(cut.open.map((m) => String(m.content))).toEqual([
+      "voltei naquele orçamento",
+      "Vamos lá.",
+    ]);
+  });
+
+  // The resolve trigger vouches that the current attendance ended too, so the reopened run closes
+  // along with everything under it. Same answer as any other thread — the run scan must not change
+  // that.
+  test("a reopened conversation that itself ended closes whole", () => {
+    const cut = selectClosedPrefix(reopened(), {
+      currentAttendanceClosed: true,
+    });
+    expect(cut.closed.length).toBe(6);
+    expect(cut.open).toEqual([]);
+  });
+
   const cases: {
     name: string;
     shape: string;

@@ -21,7 +21,11 @@ import {
   claimAttendanceBoundary,
   needsAttendanceStartProbe,
 } from "./attendance-boundary";
-import { resolveGraphThreadId, threadBelongsToTenant } from "./checkpointer";
+import {
+  getCheckpointer,
+  resolveGraphThreadId,
+  threadBelongsToTenant,
+} from "./checkpointer";
 import { lastAssistantText } from "./graph";
 import {
   clearTurnInFlight,
@@ -41,6 +45,7 @@ import {
   loadAgentConfig,
 } from "./prepare";
 import type { RuntimeDeps } from "./runtime";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { buildNativeTools } from "./tools/native";
 
 // agentNudge consumption: an inbound domain event (correlated to a conversation thread) is
@@ -454,9 +459,13 @@ export async function runAgentNudge(
   );
 
   // 3. Model + graph + callbacks (node="nudge").
+  // The SAME checkpointer the graph is built on, so the divider written below and the invoke's own
+  // messages land on one thread. Resolved here rather than inside the claim: `getCheckpointer` can
+  // reach the network on first use, and the claim runs inside an advisory-lock transaction.
+  const checkpointer = params.deps?.checkpointer ?? (await getCheckpointer());
   const graph = await buildModelAndGraph(cfg, tools, {
     makeModel: params.deps?.makeModel,
-    checkpointer: params.deps?.checkpointer,
+    checkpointer,
     // Same warn line the reactive turn leaves: a proactive send that only worked on the second
     // attempt must not read like a clean one, and this path can page an alert channel.
     onModelRetry: ({ attempt }) =>
@@ -575,6 +584,23 @@ export async function runAgentNudge(
           anotherInvokeIsReading,
           attendanceAlreadyStarted: alreadyStarted,
         });
+        // The divider goes in BEFORE the marker moves, and inside the claim — the same order and the
+        // same lock the reactive turn uses (./runtime.ts). It used to ride in this nudge's own invoke
+        // instead, which advanced the marker on a divider that did not exist yet: a turn arriving
+        // during the generation read the conversation as already recorded, declined to write one of
+        // its own, and then this invoke appended ours AFTER that turn's messages — a divider in the
+        // middle of the attendance, which is worse than none. An invoke that never succeeded left the
+        // marker advanced and no divider at all.
+        //
+        // The invoke below does not erase it either: an invoke saves the channel it LOADED, and this
+        // one has not started yet, so it loads the divider along with everything else.
+        if (decided.writeDivider) {
+          await buildThreadStateGraph(checkpointer).updateState(
+            { configurable: { thread_id: graphThreadId } },
+            { messages: [conversationDividerMessage(conversationId)] },
+            THREAD_STATE_NODE,
+          );
+        }
         // The sidecar row is what resolve-time compaction reads to know which attendance the thread
         // is on. A nudge that opens a conversation used to leave it absent, and the job then exited
         // at its generation fence with the attendance never summarized.
@@ -613,17 +639,9 @@ export async function runAgentNudge(
     // node already prepends the one-and-only system prompt, and a second system message in the thread
     // makes strict providers (Google) reject the call ("System messages are only permitted as the
     // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
-    //
-    // The divider, when this nudge opens a new attendance, rides in the SAME invoke rather than in a
-    // separate updateState: an invoke saves the channel it loaded, so a divider written just before
-    // one would be erased by it. Two messages, because a message carries a single marker and this one
-    // is already the nudge.
     result = await graph.invoke(
       {
         messages: [
-          ...(claim.writeDivider
-            ? [conversationDividerMessage(conversationId)]
-            : []),
           nudgeMessage(
             renderNudge(params.nudge, canMessagePre),
             conversationId,

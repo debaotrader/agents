@@ -622,6 +622,57 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(row?.lastConversationId).toBe(942);
   });
 
+  // ORDER, and observed at the only moment that proves it. The divider used to ride in the nudge's
+  // own invoke while the marker advanced inside the claim, so the marker moved on a divider that did
+  // not exist yet: a turn arriving in that window read the conversation as already recorded, declined
+  // to write one of its own, and this invoke then appended ours after that turn's messages — a
+  // divider in the middle of the attendance, which is worse than none. Watching the upsert itself is
+  // what pins the order; asserting afterwards proves nothing, since both versions end with a divider
+  // on the thread.
+  test("the divider is durable before the marker advances", async () => {
+    const contactInboxId = 8813;
+    const saver = new MemorySaver();
+    const threadId = await seedPriorAttendance(contactInboxId, 945, saver);
+    await seedConv(946, null, new Date(), contactInboxId);
+    const s = stub();
+    const dividerWasThere: boolean[] = [];
+    const watching = appDb.$extends({
+      query: {
+        agentThread: {
+          async upsert({ args, query }) {
+            const cp = await saver.get({
+              configurable: { thread_id: threadId },
+            });
+            const messages = ((
+              cp?.channel_values as {
+                messages?: BaseMessage[];
+              }
+            )?.messages ?? []) as BaseMessage[];
+            dividerWasThere.push(
+              messages.some((m) => isConversationDivider(m)),
+            );
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:946`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: watching,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+    expect(dividerWasThere).toEqual([true]);
+  });
+
   // Crossing the boundary is also what makes the attendance that ENDED compactable. A nudge that
   // consumed the boundary without arming would leave that attendance waiting on a next writer that
   // may never come.

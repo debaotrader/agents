@@ -61,29 +61,31 @@ export function selectClosedPrefix(
   // there is no open attendance to protect.
   if (opts.currentAttendanceClosed) return { head, closed: body, open: [] };
 
-  // The open attendance is whatever the LAST stamped message belongs to, and it starts at the FIRST
-  // message carrying that same conversation. Asking where it starts (rather than where the previous
-  // one ended) is what lets assistant replies go unstamped: they are generated inside the graph, and
-  // every one of them sits after the stamped human turn of its own attendance.
+  // The open attendance is whatever the LAST stamped message belongs to, and it starts at the first
+  // message of that conversation's LAST RUN — the earliest one not separated from the end by some
+  // other conversation. Asking where it starts (rather than where the previous one ended) is what
+  // lets assistant replies go unstamped: they are generated inside the graph, and every one of them
+  // sits after the stamped human turn of its own attendance, so the scan simply walks past them.
+  //
+  // The run, and not the first occurrence anywhere: a conversation can be REOPENED after another one
+  // has already run on this thread (an operator picking an old conversation back up, a human agent
+  // replying in it), which leaves stamps reading 1 … 2 … 1. Taking the first `1` put the start at the
+  // top of the thread, so nothing was ever closed and the ended attendances stayed raw in every
+  // prompt from then on — silently, and permanently, since no later boundary changes the answer.
+  // Threads carrying several raw attendances at once are exactly where this shows up: compaction
+  // newly enabled, or a run that kept failing.
   let current: number | null = null;
+  let start = -1;
   for (let i = body.length - 1; i >= 0; i--) {
     const m = body[i];
     if (m === undefined) continue;
     const stamp = stampedConversationId(m);
-    if (stamp !== null) {
-      current = stamp;
-      break;
-    }
-  }
-  let start = -1;
-  if (current !== null) {
-    for (let i = 0; i < body.length; i++) {
-      const m = body[i];
-      if (m !== undefined && stampedConversationId(m) === current) {
-        start = i;
-        break;
-      }
-    }
+    if (stamp === null) continue;
+    if (current === null) current = stamp;
+    // A different conversation ends the run: everything at or below it belongs to an attendance
+    // that is over.
+    if (stamp !== current) break;
+    start = i;
   }
   // NOTE: Invariant 3 — one attendance (or a thread written before stamps existed) means everything
   // present belongs to the attendance in progress. A thread that predates stamps compacts on its next
