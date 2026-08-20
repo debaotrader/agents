@@ -1146,15 +1146,59 @@ export async function processChatwootDelivery(
     mirror.prevStatus !== null &&
     mirror.prevStatus !== "resolved" &&
     mirror.status === "resolved" &&
-    n.inboxId !== null &&
     n.conversationId !== null
   ) {
     const conversationId = n.conversationId;
+    // Both ids FROM THE MIRROR when the event does not carry them. A conversation_* payload can
+    // arrive without `inbox` and without `contact_inbox` — the mirror handles that shape explicitly,
+    // preserving the stored ids rather than nulling them — and gating on the event alone would skip
+    // compaction for a resolve that is otherwise complete. Nothing comes back for it either: if the
+    // customer returns on the same conversation there is no new-attendance boundary, so that history
+    // stays raw indefinitely, on exactly the resolve trigger that exists to make the return turn
+    // cheap.
+    //
+    // In its OWN best-effort boundary, ahead of everything else. The redirect handling below is a
+    // different feature that happens to key off the same transition, and it is the one with a
+    // deadline: it cancels the follow-up chase and posts the closing message. A transient failure in
+    // this lookup would otherwise land in the shared catch, skip both of those, and still mark the
+    // delivery processed — losing the closing sequence for good, for a conversation that will never
+    // resolve again.
+    let storedInboxId: number | null = null;
+    let storedContactInboxId: number | null = null;
+    if (n.inboxId === null || n.contactInboxId === null) {
+      try {
+        const stored = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+          db.conversation.findUnique({
+            where: {
+              tenantId_chatwootInstanceId_chatwootConversationId: {
+                tenantId: params.tenantId,
+                chatwootInstanceId: params.instanceId,
+                chatwootConversationId: conversationId,
+              },
+            },
+            select: {
+              contactInboxId: true,
+              inbox: { select: { chatwootInboxId: true } },
+            },
+          }),
+        );
+        storedInboxId = stored?.inbox?.chatwootInboxId ?? null;
+        storedContactInboxId = stored?.contactInboxId ?? null;
+      } catch (err) {
+        logger.warn(
+          "chatwoot: resolving ids for compaction on resolve failed (conv=%s): %s",
+          String(conversationId),
+          errMsg(err),
+        );
+      }
+    }
+    const closingInboxId = n.inboxId ?? storedInboxId;
+    const closingContactInboxId = n.contactInboxId ?? storedContactInboxId;
     try {
       const closingRt = await inboxAgentRuntime(
         params.tenantId,
         params.instanceId,
-        n.inboxId,
+        closingInboxId,
         base,
       );
       if (closingRt) {
@@ -1164,37 +1208,8 @@ export async function processChatwootDelivery(
         // ~0% past 24h), so compacting only when they return would miss the expensive turn. The
         // job re-checks the status at execution, because a resolve can be undone. Unlike the
         // redirect handling below, this applies to every agent, not only a widget inbox.
-        // From the MIRROR when the event does not carry it. A conversation_* payload can arrive
-        // without `contact_inbox` — the mirror handles that shape explicitly, preserving the stored
-        // id rather than nulling it — and reading only the event would skip compaction for a resolve
-        // that is otherwise complete. Nothing comes back for it either: if the customer returns on
-        // the same conversation there is no new-attendance boundary, so that history stays raw
-        // indefinitely, on exactly the resolve trigger that exists to make the return turn cheap.
-        //
-        // In its OWN best-effort boundary. The redirect handling below is a different feature that
-        // happens to key off the same transition, and it is the one with a deadline: it cancels the
-        // follow-up chase and posts the closing message. A transient failure in the mirror lookup
-        // here would otherwise land in the shared catch, skip both of those, and still mark the
-        // delivery processed — losing the closing sequence for good, for a conversation that will
-        // never resolve again.
-        try {
-          const closingContactInboxId =
-            n.contactInboxId ??
-            (await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-              db.conversation
-                .findUnique({
-                  where: {
-                    tenantId_chatwootInstanceId_chatwootConversationId: {
-                      tenantId: params.tenantId,
-                      chatwootInstanceId: params.instanceId,
-                      chatwootConversationId: conversationId,
-                    },
-                  },
-                  select: { contactInboxId: true },
-                })
-                .then((c) => c?.contactInboxId ?? null),
-            ));
-          if (closingContactInboxId !== null) {
+        if (closingContactInboxId !== null) {
+          try {
             await armCompaction({
               tenantId: params.tenantId,
               instanceId: params.instanceId,
@@ -1205,16 +1220,23 @@ export async function processChatwootDelivery(
               enabled: readMemoryConfig(closingRt.settings).compaction.enabled,
               base,
             });
+          } catch (err) {
+            logger.warn(
+              "chatwoot: arming compaction on resolve failed (conv=%s): %s",
+              String(conversationId),
+              errMsg(err),
+            );
           }
-        } catch (err) {
-          logger.warn(
-            "chatwoot: arming compaction on resolve failed (conv=%s): %s",
-            String(conversationId),
-            errMsg(err),
-          );
         }
         const redirectCfg = readChannelRedirectConfig(closingRt.settings);
-        if (redirectCfg.enabled && redirectCfg.widgetInboxId === n.inboxId) {
+        // The redirect keys off the EVENT's inbox (it is the widget conversation that resolved).
+        // A sparse payload carries none, and `widgetInboxId === null` would otherwise read as a
+        // match on a half-configured agent.
+        if (
+          redirectCfg.enabled &&
+          n.inboxId !== null &&
+          redirectCfg.widgetInboxId === n.inboxId
+        ) {
           // (1) Stop chasing a resolved conversation, regardless of whether closing is on.
           await cancelPendingJob(
             params.tenantId,

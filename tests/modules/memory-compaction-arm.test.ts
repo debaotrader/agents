@@ -278,6 +278,95 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     expect(jobPayload.contactInboxId).toBe(CONTACT_INBOX_ID + convId);
   });
 
+  // Same shape one level up. The gate used to require `inbox_id` ON THE EVENT before it would even
+  // consult the mirror, so a resolve payload missing BOTH ids was dropped whole — including the
+  // fallback written for the contact-inbox right below it. Nothing re-arms it: the customer
+  // returning on the same conversation crosses no attendance boundary, so that history stays raw on
+  // exactly the trigger that exists to make the return turn cheap.
+  test("a resolve whose payload omits inbox_id still arms, from the mirror", async () => {
+    const convId = 418;
+    stamp += 1;
+    await deliver(
+      "conversation_updated",
+      convPayload(convId, "pending", stamp),
+    );
+    expect(await jobFor(convId)).toBeNull();
+
+    stamp += 1;
+    const {
+      inbox_id: _noInbox,
+      contact_inbox: _noContactInbox,
+      ...sparse
+    } = convPayload(convId, "resolved", stamp);
+    await deliver("conversation_status_changed", sparse);
+
+    const job = await jobFor(convId);
+    expect(job).not.toBeNull();
+    const payload = (job?.payload ?? {}) as Record<string, unknown>;
+    expect(payload.reason).toBe("resolved");
+    expect(payload.contactInboxId).toBe(CONTACT_INBOX_ID + convId);
+  });
+
+  // Consulting the mirror WIDENED this block's domain: it now runs for payloads that carry no inbox
+  // at all, and `redirectCfg.widgetInboxId === n.inboxId` would read null === null as a match. That
+  // branch was unreachable while the block required the event's inbox, so an agent with the redirect
+  // switched on but no widget inbox picked yet would have started calling off follow-ups and posting
+  // closing messages on a conversation that has nothing to do with the redirect.
+  test("a sparse resolve never wakes the redirect on a half-configured agent", async () => {
+    const convId = 419;
+    const dedupe = followUpDedupeKey(
+      chatwootThreadId(tenantId, instanceId, convId),
+    );
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          debounce: { enabled: false },
+          // Switched on, widget inbox not picked yet — the reader keeps the two independent.
+          channelRedirect: { enabled: true, widgetInboxId: null },
+        },
+      },
+    });
+    try {
+      stamp += 1;
+      await deliver(
+        "conversation_updated",
+        convPayload(convId, "pending", stamp),
+      );
+      await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "REDIRECT_FOLLOWUP",
+          dedupeKey: dedupe,
+          status: "PENDING",
+          runAt: new Date(Date.now() + 60_000),
+        },
+      });
+
+      stamp += 1;
+      const { inbox_id: _noInbox, ...sparse } = convPayload(
+        convId,
+        "resolved",
+        stamp,
+      );
+      await deliver("conversation_status_changed", sparse);
+
+      // Compaction armed, which is the whole point of consulting the mirror.
+      expect(await jobFor(convId)).not.toBeNull();
+      // The redirect did NOT run: its follow-up is untouched.
+      const followUp = await suDb.schedulerJob.findFirst({
+        where: { tenantId, kind: "REDIRECT_FOLLOWUP", dedupeKey: dedupe },
+        select: { status: true },
+      });
+      expect(followUp?.status).toBe("PENDING");
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: { debounce: { enabled: false } } },
+      });
+    }
+  });
+
   // The resolve transition drives TWO independent features: arming compaction, and the channel
   // redirect's closing sequence. Sharing one try/catch let a transient failure in the first skip the
   // second — and the delivery is still marked processed, so the closing never comes back.
