@@ -5,9 +5,10 @@ import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
-import { contactInboxThreadId } from "@/graph/checkpointer";
+import { chatwootThreadId, contactInboxThreadId } from "@/graph/checkpointer";
 import { CONVERSATION_DIVIDER } from "@/graph/markers";
 import { runAgentTurn } from "@/graph/runtime";
+import { followUpDedupeKey } from "@/modules/channel-redirect/followup";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
@@ -170,6 +171,35 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     });
   }
 
+  // Same driver, with the caller's own client — so a test can inject a failing query.
+  async function deliverWith(
+    client: PrismaClient,
+    event: string,
+    conversation: Record<string, unknown>,
+  ) {
+    deliverySeq += 1;
+    const n = normalizeChatwootEvent({ event, ...conversation });
+    if (!n) throw new Error("payload did not normalize");
+    const delivery = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `mca-${process.pid}-${deliverySeq}`,
+        event,
+        status: "PENDING",
+      },
+      select: { id: true },
+    });
+    await processChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryRowId: delivery.id,
+      agentBotId: 9,
+      normalized: n,
+      base: client,
+    });
+  }
+
   function jobFor(convId: number) {
     return suDb.schedulerJob.findFirst({
       where: {
@@ -246,6 +276,81 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     const jobPayload = (job?.payload ?? {}) as Record<string, unknown>;
     expect(jobPayload.reason).toBe("resolved");
     expect(jobPayload.contactInboxId).toBe(CONTACT_INBOX_ID + convId);
+  });
+
+  // The resolve transition drives TWO independent features: arming compaction, and the channel
+  // redirect's closing sequence. Sharing one try/catch let a transient failure in the first skip the
+  // second — and the delivery is still marked processed, so the closing never comes back.
+  test("a failure arming compaction does not swallow the redirect closing", async () => {
+    const convId = 415;
+    const dedupe = followUpDedupeKey(
+      chatwootThreadId(tenantId, instanceId, convId),
+    );
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          debounce: { enabled: false },
+          channelRedirect: { enabled: true, widgetInboxId: INBOX_ID },
+        },
+      },
+    });
+    try {
+      stamp += 1;
+      await deliver(
+        "conversation_updated",
+        convPayload(convId, "pending", stamp),
+      );
+      // The redirect follow-up the resolve is supposed to call off.
+      await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "REDIRECT_FOLLOWUP",
+          dedupeKey: dedupe,
+          status: "PENDING",
+          runAt: new Date(Date.now() + 60_000),
+        },
+      });
+
+      // The mirror lookup the sparse payload forces compaction through, made to fail.
+      const failing = appDb.$extends({
+        query: {
+          conversation: {
+            findUnique({ args, query }) {
+              if (
+                (args.select as { contactInboxId?: boolean } | undefined)
+                  ?.contactInboxId
+              ) {
+                throw new Error("injected: mirror lookup unavailable");
+              }
+              return query(args);
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+
+      stamp += 1;
+      const { contact_inbox: _omitted, ...sparse } = convPayload(
+        convId,
+        "resolved",
+        stamp,
+      );
+      await deliverWith(failing, "conversation_status_changed", sparse);
+
+      // Compaction did not arm — that is the failure being injected.
+      expect(await jobFor(convId)).toBeNull();
+      // The redirect follow-up was called off anyway.
+      const followUp = await suDb.schedulerJob.findFirst({
+        where: { tenantId, kind: "REDIRECT_FOLLOWUP", dedupeKey: dedupe },
+        select: { status: true },
+      });
+      expect(followUp?.status).toBe("DONE");
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: { debounce: { enabled: false } } },
+      });
+    }
   });
 
   test("a re-delivered resolve does not stack a second job", async () => {

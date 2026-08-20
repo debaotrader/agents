@@ -1,4 +1,4 @@
-import { HumanMessage } from "@langchain/core/messages";
+import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
@@ -6,7 +6,11 @@ import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getCheckpointer } from "./checkpointer";
 import { isTurnInFlight } from "./inflight";
-import { conversationDividerMessage, conversationStamp } from "./markers";
+import {
+  conversationDividerMessage,
+  conversationStamp,
+  stampedConversationId,
+} from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
 // Continuous ingestion: fold a customer message into the agent's graph memory thread WITHOUT running
@@ -103,7 +107,27 @@ export async function ingestMessageIntoThread(
       // (src/graph/runtime.ts), and the same conclusion: only the PROMPT is at stake, since the cut
       // reads the conversation stamped on each message, not the divider.
       const anotherInvokeIsReading = boundary && isTurnInFlight(graphThreadId);
-      const newConversation = boundary && !anotherInvokeIsReading;
+      // ...and only while the attendance has not started yet. A boundary deferred above leaves the
+      // marker on the OLD conversation, so the next unhandled message of this same conversation
+      // arrives with `boundary` still true — and by then messages of this attendance are already in
+      // the thread. Appending the divider there would tell the model that part of the conversation
+      // it is in the middle of is a PAST attendance, which is worse than no hint at all. The cut does
+      // not need it either way: it reads the stamp. Same check the reactive turn makes before it
+      // writes one (src/graph/runtime.ts).
+      const alreadyStarted =
+        boundary &&
+        !anotherInvokeIsReading &&
+        (
+          (
+            (
+              await graph.getState({
+                configurable: { thread_id: graphThreadId },
+              })
+            ).values as { messages?: BaseMessage[] } | undefined
+          )?.messages ?? []
+        ).some((m) => stampedConversationId(m) === conversationId);
+      const newConversation =
+        boundary && !anotherInvokeIsReading && !alreadyStarted;
 
       // Every message carries the conversation it belongs to, which is what the compaction cut reads.
       // The divider on top is prompt content, and goes through the factory because nothing else can

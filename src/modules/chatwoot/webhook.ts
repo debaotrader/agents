@@ -1170,33 +1170,48 @@ export async function processChatwootDelivery(
         // that is otherwise complete. Nothing comes back for it either: if the customer returns on
         // the same conversation there is no new-attendance boundary, so that history stays raw
         // indefinitely, on exactly the resolve trigger that exists to make the return turn cheap.
-        const closingContactInboxId =
-          n.contactInboxId ??
-          (await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-            db.conversation
-              .findUnique({
-                where: {
-                  tenantId_chatwootInstanceId_chatwootConversationId: {
-                    tenantId: params.tenantId,
-                    chatwootInstanceId: params.instanceId,
-                    chatwootConversationId: conversationId,
+        //
+        // In its OWN best-effort boundary. The redirect handling below is a different feature that
+        // happens to key off the same transition, and it is the one with a deadline: it cancels the
+        // follow-up chase and posts the closing message. A transient failure in the mirror lookup
+        // here would otherwise land in the shared catch, skip both of those, and still mark the
+        // delivery processed — losing the closing sequence for good, for a conversation that will
+        // never resolve again.
+        try {
+          const closingContactInboxId =
+            n.contactInboxId ??
+            (await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+              db.conversation
+                .findUnique({
+                  where: {
+                    tenantId_chatwootInstanceId_chatwootConversationId: {
+                      tenantId: params.tenantId,
+                      chatwootInstanceId: params.instanceId,
+                      chatwootConversationId: conversationId,
+                    },
                   },
-                },
-                select: { contactInboxId: true },
-              })
-              .then((c) => c?.contactInboxId ?? null),
-          ));
-        if (closingContactInboxId !== null) {
-          await armCompaction({
-            tenantId: params.tenantId,
-            instanceId: params.instanceId,
-            contactInboxId: closingContactInboxId,
-            conversationId,
-            agentId: closingRt.agentId,
-            reason: "resolved",
-            enabled: readMemoryConfig(closingRt.settings).compaction.enabled,
-            base,
-          });
+                  select: { contactInboxId: true },
+                })
+                .then((c) => c?.contactInboxId ?? null),
+            ));
+          if (closingContactInboxId !== null) {
+            await armCompaction({
+              tenantId: params.tenantId,
+              instanceId: params.instanceId,
+              contactInboxId: closingContactInboxId,
+              conversationId,
+              agentId: closingRt.agentId,
+              reason: "resolved",
+              enabled: readMemoryConfig(closingRt.settings).compaction.enabled,
+              base,
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            "chatwoot: arming compaction on resolve failed (conv=%s): %s",
+            String(conversationId),
+            errMsg(err),
+          );
         }
         const redirectCfg = readChannelRedirectConfig(closingRt.settings);
         if (redirectCfg.enabled && redirectCfg.widgetInboxId === n.inboxId) {

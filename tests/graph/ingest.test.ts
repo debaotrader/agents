@@ -317,14 +317,28 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
     // The synced watermark advances regardless: it guards at-most-once append.
     expect(row?.lastSyncedMessageId).toBe(2);
 
-    // Next message on the free thread writes the divider the deferred one could not.
+    // The next message of the SAME conversation does NOT get the divider, even with the thread free
+    // and the marker still owing the boundary. This attendance has already started, so a divider
+    // here would sit in the middle of it and tell the model that the messages before it — messages of
+    // the conversation it is answering right now — are a past attendance. A hint in the wrong place
+    // is worse than no hint.
     await ingest(811, 3, "terceira");
     const after = await saver.get({
       configurable: { thread_id: graphThreadId },
     });
     const messages = ((after?.channel_values as { messages?: BaseMessage[] })
       ?.messages ?? []) as BaseMessage[];
-    expect(isConversationDivider(messages[2] as BaseMessage)).toBe(true);
-    expect(String(messages[2]?.content)).toContain("terceira");
+    expect(messages.map((m) => isConversationDivider(m))).toEqual([
+      false,
+      false,
+      false,
+    ]);
+    // The boundary is on the messages either way, which is the whole reason losing the divider is
+    // survivable: the cut still ends the old attendance in the right place.
+    expect(messages.map(stampedConversationId)).toEqual([810, 811, 811]);
+    const cut = selectClosedPrefix(messages, {
+      currentAttendanceClosed: false,
+    });
+    expect(cut.closed.map((m) => String(m.content))).toEqual(["primeira"]);
   });
 });
