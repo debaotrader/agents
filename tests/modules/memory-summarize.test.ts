@@ -8,6 +8,7 @@ import {
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 import {
+  CONVERSATION_DIVIDER,
   conversationDividerMessage,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
@@ -80,6 +81,19 @@ describe("renderTranscript", () => {
     expect(t).not.toContain(DATA_FENCE);
     expect(t).not.toContain("UNTRUSTED external event data");
     expect(t).toContain("Passando para saber se ficou tudo certo");
+  });
+
+  // Same as the nudge below, for the other marker: a thread written before the marker existed carries
+  // the divider as plain text, and the first compaction after an upgrade is when it would be read as
+  // the contact's words. Only the prefix goes — the customer's own sentence rides on the same message
+  // through the ingestion path and has to survive.
+  test("a divider written before the marker existed is still not the customer", () => {
+    const t = renderTranscript([
+      new HumanMessage(`${CONVERSATION_DIVIDER}\n\noi, voltei`),
+      new AIMessage("Oi! Como posso ajudar?"),
+    ]);
+    expect(t).not.toContain("Contexto do sistema");
+    expect(t).toContain("oi, voltei");
   });
 
   // Threads already carry nudges written before the marker existed, and the first compaction after an

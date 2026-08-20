@@ -8,7 +8,6 @@ import {
 import logger from "@/api/lib/logger";
 import {
   CONVERSATION_DIVIDER,
-  isConversationDivider,
   isMemoryHead,
   isNudgeTurn,
 } from "@/graph/markers";
@@ -118,7 +117,20 @@ export function renderTranscript(messages: BaseMessage[]): string {
     // missing from the memory of that attendance. An attendance whose only stored message IS the bare
     // divider (an input guardrail answered the first turn before the model ran) renders nothing at
     // all, and costs no generation.
-    if (isConversationDivider(m)) {
+    //
+    // Keyed on the TEXT, not on the marker, which is the one place in this codebase where that is the
+    // right way round. What happens here is not a decision about the message, it is trimming a known
+    // prefix off it — and trimming is only safe when the prefix is actually there. A marker-keyed
+    // trim would cut CONVERSATION_DIVIDER.length characters off whatever the message happens to hold,
+    // which is the customer's words the moment the two disagree. It also covers, for free, the
+    // threads written before the marker existed: on the first compaction after an upgrade those
+    // dividers are plain text, and left in they are quoted to the summarizer as things the CONTACT
+    // said. A customer can open a message with this exact text and lose that prefix from the summary;
+    // they never lose the rest of the message, which is what keeps the trade safe in this direction.
+    //
+    // The CUT still decides from the stamp and only from the stamp (src/graph/markers.ts). The worst
+    // case here is a clipped prefix; there it is a boundary in the wrong place.
+    if (type === "human" && text.startsWith(CONVERSATION_DIVIDER)) {
       text = text.slice(CONVERSATION_DIVIDER.length).trim();
     }
     if (type === "human") {
