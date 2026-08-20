@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
-import { buildNativeTools, NATIVE_TOOL_NAMES } from "@/graph/tools/native";
+import {
+  buildNativeTools,
+  type HandoffTurnState,
+  NATIVE_TOOL_NAMES,
+} from "@/graph/tools/native";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 
 function recordingClient() {
@@ -101,6 +105,20 @@ describe("native tools", () => {
       ["sendPrivateNote", [42, "cliente pediu humano"]],
       ["toggleStatus", [42, "open"]],
     ]);
+  });
+
+  test("a delivered handoff customerMessage marks the turn as terminal", async () => {
+    const { client } = recordingClient();
+    const handoffState: HandoffTurnState = { customerMessageSent: false };
+    const tools = buildNativeTools({
+      client,
+      conversationId: 42,
+      handoffState,
+    });
+    await byName(tools, "handoff_to_human").invoke({
+      customerMessage: "Vou te transferir para um atendente, um momento.",
+    });
+    expect(handoffState.customerMessageSent).toBe(true);
   });
 
   test("handoff without a reason only sets status open", async () => {
@@ -811,9 +829,11 @@ describe("swallowed side effects reach onSideEffectError (issue #46)", () => {
       },
     } as unknown as ChatwootClient;
     const effects: SideEffect[] = [];
+    const handoffState: HandoffTurnState = { customerMessageSent: false };
     const tools = buildNativeTools({
       client,
       conversationId: 5,
+      handoffState,
       onSideEffectError: (e) => effects.push(e),
     });
     const out = String(
@@ -825,6 +845,7 @@ describe("swallowed side effects reach onSideEffectError (issue #46)", () => {
     expect(calls).toContain("toggleStatus");
     expect(effects.map((e) => e.phase)).toEqual(["customer_message"]);
     expect(effects[0]?.tool).toBe("handoff_to_human");
+    expect(handoffState.customerMessageSent).toBe(false);
   });
 
   test("set_custom_attribute mirror write-through failure reports phase mirror_write after the Chatwoot write", async () => {

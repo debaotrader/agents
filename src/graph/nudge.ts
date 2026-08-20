@@ -423,6 +423,7 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
 
+  const handoffState = { customerMessageSent: false };
   const tools = await buildToolset(
     cfg,
     {
@@ -432,6 +433,7 @@ export async function runAgentNudge(
       client,
       conversationId,
       threadId: params.threadId,
+      handoffState,
     },
     { buildNativeTools, mcp: params.deps?.mcp, flow },
   );
@@ -486,6 +488,13 @@ export async function runAgentNudge(
     { messages: [new HumanMessage(renderNudge(params.nudge, canMessagePre))] },
     invokeConfig,
   );
+  // handoff_to_human already delivered customerMessage. That delivery is the proactive message;
+  // never let a lagging mirror turn the model's final text into a second customer-facing post, and
+  // do not apply follow-up labels/resolve after the conversation was handed to a human.
+  if (handoffState.customerMessageSent) {
+    markFollowUp("messaged");
+    return "messaged";
+  }
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
   const replyRaw = lastAssistantText(result.messages);

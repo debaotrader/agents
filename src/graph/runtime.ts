@@ -252,6 +252,7 @@ export async function runLoadedTurn(
     imagesInFlight: 0,
     imagesSeq: 0,
   };
+  const handoffState = { customerMessageSent: false };
   const tools = await buildToolset(
     loaded,
     {
@@ -264,6 +265,7 @@ export async function runLoadedTurn(
       messageId: params.messageId,
       imageDeps: params.deps?.imageDeps,
       turnState,
+      handoffState,
     },
     { buildNativeTools, mcp: params.deps?.mcp, flow },
   );
@@ -479,6 +481,16 @@ export async function runLoadedTurn(
         ),
     );
     let reply = lastAssistantText(result.messages).trim();
+
+    // handoff_to_human already sent customerMessage from inside the tool. Treat that successful
+    // delivery as terminal even while Chatwoot's open/assignee event is still in flight: otherwise
+    // the mirror recheck can read the old bot-owned row and post this final text as a duplicate.
+    if (handoffState.customerMessageSent) {
+      turnState.pendingImages.length = 0;
+      turnState.resolveRequested = false;
+      deliveredBalloons = 1;
+      return "posted";
+    }
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during
     // the LLM call. NOTE: small TOCTOU between this read and the POST (the post is network and
