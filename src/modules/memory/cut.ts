@@ -1,10 +1,10 @@
 import type { BaseMessage, HumanMessage } from "@langchain/core/messages";
 import {
-  isConversationDivider,
   isMemoryHead,
   MEMORY_HEAD_CLOSE,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
+  stampedConversationId,
 } from "@/graph/markers";
 import { formatWithPattern } from "@/graph/time";
 
@@ -25,10 +25,11 @@ import { formatWithPattern } from "@/graph/time";
 //      on every compaction, so feeding it back to the summarizer would summarize a summary — the
 //      compounding loss this whole design exists to avoid. Each attendance is summarized ONCE, from
 //      its raw turns.
-//   2. Whole attendances only. The cut lands on a CONVERSATION_DIVIDER, which is the exact string
-//      both writers prepend to the first human turn of a new conversation. Cutting anywhere else
-//      would summarize half a conversation and leave the other half raw, describing the same events
-//      twice.
+//   2. Whole attendances only. The cut lands where the CURRENT attendance starts, found from the
+//      conversation stamped on each message (src/graph/markers.ts) — not from the divider, which is
+//      prompt content that can be erased by a concurrent invoke or never written at all. Cutting
+//      anywhere else would summarize half a conversation and leave the other half raw, describing the
+//      same events twice.
 //   3. Nothing is closed just because the thread is long. Without a later attendance, the only
 //      attendance present is the open one, and the answer is "nothing to compact" — the ceiling
 //      (src/graph/history-window.ts) is what bounds a single endless attendance, not this.
@@ -60,16 +61,33 @@ export function selectClosedPrefix(
   // there is no open attendance to protect.
   if (opts.currentAttendanceClosed) return { head, closed: body, open: [] };
 
-  let start = -1;
+  // The open attendance is whatever the LAST stamped message belongs to, and it starts at the FIRST
+  // message carrying that same conversation. Asking where it starts (rather than where the previous
+  // one ended) is what lets assistant replies go unstamped: they are generated inside the graph, and
+  // every one of them sits after the stamped human turn of its own attendance.
+  let current: number | null = null;
   for (let i = body.length - 1; i >= 0; i--) {
     const m = body[i];
-    if (m !== undefined && isConversationDivider(m)) {
-      start = i;
+    if (m === undefined) continue;
+    const stamp = stampedConversationId(m);
+    if (stamp !== null) {
+      current = stamp;
       break;
     }
   }
-  // NOTE: Invariant 3 — no divider (or one that opens the body) means everything present belongs to
-  // the attendance in progress.
+  let start = -1;
+  if (current !== null) {
+    for (let i = 0; i < body.length; i++) {
+      const m = body[i];
+      if (m !== undefined && stampedConversationId(m) === current) {
+        start = i;
+        break;
+      }
+    }
+  }
+  // NOTE: Invariant 3 — one attendance (or a thread written before stamps existed) means everything
+  // present belongs to the attendance in progress. A thread that predates stamps compacts on its next
+  // boundary, when the first stamped message arrives.
   if (start <= 0) return { head, closed: [], open: body };
   return { head, closed: body.slice(0, start), open: body.slice(start) };
 }

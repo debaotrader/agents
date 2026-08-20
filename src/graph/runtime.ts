@@ -45,7 +45,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
-import { conversationDividerMessage } from "./markers";
+import { conversationDividerMessage, conversationStamp } from "./markers";
 import { createChatModel, type ResolvedModelConfig } from "./models";
 import {
   type AgentConfig,
@@ -511,21 +511,21 @@ export async function runLoadedTurn(
             const prev = existing?.lastConversationId ?? null;
             if (prev === conversationId) return null;
             const boundary = prev !== null;
-            // The divider is a checkpoint write by something that is not an invoke, so an invoke that
-            // started earlier — a turn of the conversation that just ended, still generating — will
-            // save the channel it loaded and erase it. The marker below, though, is a DB row: it
-            // would advance for good. The boundary would then exist nowhere, no later turn would look
-            // for it again (the marker already says we moved on), and the two attendances would be
-            // summarized as one.
+            // The divider is a checkpoint write by something that is not an invoke, so an invoke
+            // that started earlier — a turn of the conversation that just ended, still generating —
+            // will save the channel it loaded and erase it, while the marker below is a DB row that
+            // would advance for good. Advancing the marker for a divider that got erased spends the
+            // one chance to write it.
             //
-            // So this turn does not claim the boundary at all. The marker stays put, and the next
-            // turn on this conversation claims it with no invoke in the way. The cost is one turn
-            // whose prompt lacks the divider; the alternative is losing the boundary permanently.
+            // So this turn does not claim the boundary: the marker stays put and the next turn writes
+            // the divider with no invoke in the way. Only the PROMPT is at stake either way — the cut
+            // finds the boundary from the conversation stamped on each message, so a divider that
+            // never lands costs a hint in one prompt, not an attendance.
             if (boundary && anotherInvokeIsReading) return null;
             if (boundary) {
               await dividerGraph.updateState(
                 { configurable: { thread_id: graphThreadId } },
-                { messages: [conversationDividerMessage()] },
+                { messages: [conversationDividerMessage(conversationId)] },
                 THREAD_STATE_NODE,
               );
             }
@@ -592,7 +592,16 @@ export async function runLoadedTurn(
       },
       () =>
         graph.invoke(
-          { messages: [new HumanMessage(text)] },
+          {
+            messages: [
+              // Stamped with the conversation it belongs to: that stamp, not the divider, is what the
+              // compaction cut reads to find where this attendance starts.
+              new HumanMessage({
+                content: text,
+                additional_kwargs: conversationStamp(conversationId),
+              }),
+            ],
+          },
           {
             configurable: { thread_id: graphThreadId },
             callbacks: [...callbacks, status, toolLogger],

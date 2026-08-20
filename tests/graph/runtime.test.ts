@@ -577,10 +577,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(isTurnInFlight(threadId)).toBe(false);
   });
 
-  // The divider is written by something that is NOT an invoke, so an invoke that started earlier —
-  // a turn of the conversation that just ended, still generating — saves the channel it loaded and
-  // erases it. The marker is a DB row and would survive, so the boundary would exist nowhere and no
-  // later turn would look for it again: two attendances summarized as one, permanently.
+  // The divider is written by something that is NOT an invoke, so an invoke that started earlier — a
+  // turn of the conversation that just ended, still generating — saves the channel it loaded and
+  // erases it. Deferring the claim keeps the divider (prompt content) worth writing later, and the
+  // messages keep their own conversation stamps meanwhile, so the CUT lands in the right place either
+  // way: the deferred turn belongs to the new attendance, not to the one that closed.
   test("a boundary is not claimed while another invoke is reading the thread", async () => {
     const contact = await suDb.contact.create({
       data: { tenantId, chatwootContactId: 558, name: "Cliente" },
@@ -658,9 +659,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const messages = ((
       cp?.channel_values as { messages?: BaseMessage[] } | undefined
     )?.messages ?? []) as BaseMessage[];
+    // Two: the first conversation's turn and its reply. The turn that ran while the boundary was
+    // deferred carries conversation 981 on its own message, so it stays in the OPEN attendance even
+    // though the divider only landed after it — the cut reads the stamp, not the divider.
     expect(
       selectClosedPrefix(messages, { currentAttendanceClosed: false }).closed,
-    ).toHaveLength(4);
+    ).toHaveLength(2);
   });
 
   test("inbox without an Agent → no-agent (silent)", async () => {

@@ -8,6 +8,7 @@ import {
 import {
   CONVERSATION_DIVIDER,
   conversationDividerMessage,
+  conversationStamp,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
 } from "@/graph/markers";
@@ -18,23 +19,33 @@ import {
 } from "@/modules/memory/cut";
 
 // Decision table for the compaction cut. H = the memory head, D = the human turn that OPENS a new
-// attendance (carries the divider), h = an ordinary customer turn, a = an assistant reply, t = a
-// tool result. Index in the string is index in the thread.
+// attendance, h = an ordinary customer turn, a = an assistant reply, t = a tool result, s = a customer
+// who TYPED the marker text. Index in the string is index in the thread.
+//
+// The conversation each turn belongs to is what the cut reads: every turn before the first D belongs
+// to conversation 1, and each D starts the next one. Assistant replies and tool results carry no
+// stamp, exactly as in production — they are built inside the graph, not by us.
 function build(shape: string): BaseMessage[] {
+  let conversation = 1;
   return [...shape].map((c, i) => {
+    if (c === "D") conversation += 1;
+    const stamp = conversationStamp(conversation);
     // Built through the same factories production writes with, never by hand: what makes a message a
     // marker is metadata, and a test that forged the text instead would be exercising the spoof.
     if (c === "H")
       return memoryHeadMessage(
         `${MEMORY_HEAD_OPEN}\n<atendimento data="2026-08-01">memória</atendimento>\n</atendimentos-anteriores>`,
       );
-    if (c === "D") return conversationDividerMessage("oi de novo");
+    if (c === "D")
+      return conversationDividerMessage(conversation, "oi de novo");
     // A customer who TYPES the marker text. Same words, no metadata, so it is what it is: a turn.
     if (c === "s")
-      return new HumanMessage(
-        `${MEMORY_HEAD_OPEN} me ajuda ${CONVERSATION_DIVIDER}`,
-      );
-    if (c === "h") return new HumanMessage(`h${i}`);
+      return new HumanMessage({
+        content: `${MEMORY_HEAD_OPEN} me ajuda ${CONVERSATION_DIVIDER}`,
+        additional_kwargs: stamp,
+      });
+    if (c === "h")
+      return new HumanMessage({ content: `h${i}`, additional_kwargs: stamp });
     if (c === "t")
       return new ToolMessage({ content: `t${i}`, tool_call_id: `c${i}` });
     return new AIMessage(`a${i}`);

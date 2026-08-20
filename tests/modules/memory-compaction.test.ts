@@ -26,6 +26,7 @@ import {
 import {
   CONVERSATION_DIVIDER,
   conversationDividerMessage,
+  conversationStamp,
   MEMORY_HEAD_OPEN,
   memoryHeadMessage,
 } from "@/graph/markers";
@@ -191,13 +192,21 @@ describe.skipIf(!dbUp)("memory compaction", () => {
     return messages.map((m) => String(m.content));
   }
 
-  // Two attendances on one thread: the first one (raw) is what a boundary trigger compacts.
+  // Two attendances on one thread: the first one (raw) is what a boundary trigger compacts. The
+  // customer turns carry the conversation they belong to, as production writes them; the assistant
+  // replies do not, because the graph builds those.
   function twoAttendances(): BaseMessage[] {
     return [
-      new HumanMessage(`quero marcar uma avaliação, ${SEEDED_TEXT}`),
+      new HumanMessage({
+        content: `quero marcar uma avaliação, ${SEEDED_TEXT}`,
+        additional_kwargs: conversationStamp(708),
+      }),
       new AIMessage("Claro! Consegui terça 08h30, R$ 250."),
-      new HumanMessage("pode ser, obrigado"),
-      conversationDividerMessage("oi, voltei"),
+      new HumanMessage({
+        content: "pode ser, obrigado",
+        additional_kwargs: conversationStamp(708),
+      }),
+      conversationDividerMessage(709, "oi, voltei"),
       new AIMessage("Oi! Como posso ajudar?"),
     ];
   }
@@ -637,6 +646,97 @@ describe.skipIf(!dbUp)("memory compaction", () => {
         where: { tenantId, contactInboxId },
       }),
     ).toBe(0);
+  });
+
+  // The row is committed before the rewrite, on purpose. So a deferral between the two leaves a row
+  // describing turns that are still sitting raw in the thread — and if the conversation reopened
+  // meanwhile, the retry used to bail at the reopened guard and strand it there. The next resolve then
+  // summarized those same turns again into a SECOND row, and the memory head said it all twice.
+  test("a summary stranded by a deferral is applied even after the conversation reopens", async () => {
+    const contactInboxId = 5024;
+    const conversationId = 723;
+    const threadId = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+        status: "resolved",
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const closed = [
+      new HumanMessage({
+        content: "quanto custa a limpeza?",
+        additional_kwargs: conversationStamp(conversationId),
+      }),
+      new AIMessage("R$ 180, com retorno em 6 meses."),
+    ];
+    // A turn starts while the summarizer is running: the row lands, the rewrite defers.
+    let armed = false;
+    const saver = new HookedSaver(1, async () => {
+      if (armed) markTurnInFlight(threadId);
+    });
+    await seedThread(saver, threadId, closed);
+    saver.calls = 0;
+    armed = true;
+    const model = new SummarizerModel("Orçamento de R$ 180 informado.");
+
+    let first: Awaited<ReturnType<typeof runCompaction>>;
+    try {
+      first = await runCompaction(
+        tenantId,
+        payload(contactInboxId, conversationId, "resolved"),
+        appDb,
+        { checkpointer: saver, makeModel: () => model },
+      );
+    } finally {
+      clearTurnInFlight(threadId);
+    }
+    expect(first.outcome).toBe("reschedule");
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(1);
+    // The turn that got in the way was the customer coming back: the conversation is open again.
+    await suDb.conversation.update({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: conversationId,
+        },
+      },
+      data: { status: "open" },
+    });
+    await seedThread(saver, threadId, [
+      new HumanMessage({
+        content: "voltei, quero marcar",
+        additional_kwargs: conversationStamp(conversationId),
+      }),
+    ]);
+
+    const retry = await runCompaction(
+      tenantId,
+      payload(contactInboxId, conversationId, "resolved"),
+      appDb,
+      { checkpointer: saver, makeModel: () => model },
+    );
+
+    expect(retry.outcome).toBe("done");
+    // Still ONE row, and the turns it describes are gone from the thread — replaced by the head, with
+    // the turns since the reopen left raw.
+    expect(
+      await suDb.attendanceSummary.count({
+        where: { tenantId, contactInboxId },
+      }),
+    ).toBe(1);
+    expect(model.calls).toBe(1);
+    const after = await readThread(saver, threadId);
+    expect(after[0]).toStartWith(MEMORY_HEAD_OPEN);
+    expect(after).toEqual([after[0] as string, "voltei, quero marcar"]);
   });
 
   test("a resolved attendance compacts the whole thread down to its memory", async () => {

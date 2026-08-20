@@ -5,7 +5,7 @@ import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { getCheckpointer } from "./checkpointer";
-import { conversationDividerMessage } from "./markers";
+import { conversationDividerMessage, conversationStamp } from "./markers";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 
 // Continuous ingestion: fold a conversation message into the agent's graph memory thread WITHOUT
@@ -97,29 +97,43 @@ export async function ingestMessageIntoThread(
         return { outcome: "skipped" as const, closedConversationId: null };
       }
 
-      // A customer message that starts a NEW conversation on this thread gets the fresh-attendance
-      // divider (same as the reactive turn). Human-agent replies never carry it.
+      // A message that starts a NEW conversation on this thread gets the fresh-attendance divider
+      // (same as the reactive turn). Human-agent messages count: an agent who opens the conversation
+      // sends the first message of it, and skipping them here left that message sitting inside the
+      // PREVIOUS attendance — summarized and removed with it when the customer finally replied.
       const prevConv = row?.lastConversationId ?? null;
-      const newConversation =
-        role === "customer" && prevConv != null && prevConv !== conversationId;
+      const newConversation = prevConv != null && prevConv !== conversationId;
 
       // Customer → HumanMessage; human agent → AIMessage (the business side of the dialogue, so the
       // model reads it as an already-given reply), disambiguated by the <atendente> marker so it never
-      // mistakes a colleague's words for its OWN prior output. The divider case goes through the
-      // marker factory, which is the only thing that can make a message COUNT as a divider — the text
-      // alone never does, or a customer could type one (src/graph/markers.ts).
+      // mistakes a colleague's words for its OWN prior output. Every one of them carries the
+      // conversation it belongs to, which is what the compaction cut reads; the divider on top is
+      // prompt content, and goes through the factory because nothing else can make a message COUNT as
+      // one — the text alone never does, or a customer could type it (src/graph/markers.ts).
+      const stamp = conversationStamp(conversationId);
       const msg =
         role === "human_agent"
-          ? new AIMessage(
-              `<atendente${params.agentName ? ` nome="${sanitizeName(params.agentName)}"` : ""}>\n${params.text}\n</atendente>`,
-            )
+          ? new AIMessage({
+              content: `<atendente${params.agentName ? ` nome="${sanitizeName(params.agentName)}"` : ""}>\n${params.text}\n</atendente>`,
+              additional_kwargs: stamp,
+            })
           : newConversation
-            ? conversationDividerMessage(params.text)
-            : new HumanMessage(params.text);
+            ? conversationDividerMessage(conversationId, params.text)
+            : new HumanMessage({
+                content: params.text,
+                additional_kwargs: stamp,
+              });
 
       await graph.updateState(
         { configurable: { thread_id: graphThreadId } },
-        { messages: [msg] },
+        {
+          messages:
+            // The human agent's own message is an AIMessage, so the divider cannot ride inside it the
+            // way it does on a customer turn: it goes ahead of it, as its own message.
+            newConversation && role === "human_agent"
+              ? [conversationDividerMessage(conversationId), msg]
+              : [msg],
+        },
         THREAD_STATE_NODE,
       );
 
@@ -132,15 +146,11 @@ export async function ingestMessageIntoThread(
           contactInboxId,
           threadId: graphThreadId,
           lastSyncedMessageId: messageId,
-          ...(role === "customer"
-            ? { lastConversationId: conversationId }
-            : {}),
+          lastConversationId: conversationId,
         },
         update: {
           lastSyncedMessageId: messageId,
-          ...(role === "customer"
-            ? { lastConversationId: conversationId }
-            : {}),
+          lastConversationId: conversationId,
         },
       });
       return {

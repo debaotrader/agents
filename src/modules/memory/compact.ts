@@ -181,7 +181,10 @@ export async function runCompaction(
     }
     // A conversation that was reopened inside the grace window is NOT a closed attendance, and
     // compacting it would hand the model a summary of the very conversation it is still in the
-    // middle of. The boundary trigger picks it up later, when a genuinely new attendance opens.
+    // middle of. The boundary trigger picks it up later, when a genuinely new attendance opens. It is
+    // not a reason to stop, though: an earlier attempt may have left a summary row owed a rewrite,
+    // and that one still has to land (see `owed` below).
+    let reopened = false;
     if (reason === "resolved") {
       const conv = await db.conversation.findUnique({
         where: {
@@ -193,7 +196,7 @@ export async function runCompaction(
         },
         select: { status: true },
       });
-      if (conv && conv.status !== "resolved") return "reopened" as const;
+      if (conv && conv.status !== "resolved") reopened = true;
     }
     const mirrored = await db.conversation.findUnique({
       where: {
@@ -230,6 +233,7 @@ export async function runCompaction(
     if (!cfg) return null;
     return {
       cfg,
+      reopened,
       lastConversationId: thread?.lastConversationId ?? null,
       threadRowId: thread?.id ?? null,
       // When the attendance actually happened. The boundary trigger fires only when the contact
@@ -238,7 +242,7 @@ export async function runCompaction(
       attendanceAt: mirrored?.lastEventAt ?? null,
     };
   });
-  if (loaded === "off" || loaded === "reopened" || loaded === null) {
+  if (loaded === "off" || loaded === null) {
     return { outcome: "done" };
   }
   const cfg = loaded.cfg;
@@ -260,9 +264,38 @@ export async function runCompaction(
   const messages = ((state.values as { messages?: BaseMessage[] } | undefined)
     ?.messages ?? []) as BaseMessage[];
 
-  const cut = selectClosedPrefix(messages, {
-    currentAttendanceClosed: reason === "resolved" && attendanceIsCurrent,
+  // A conversation reopened inside the grace window is not a closed attendance — but a PREVIOUS
+  // attempt may already have summarized part of it and been deferred before it could rewrite (the row
+  // is committed first, on purpose). That row is owed a rewrite: dropping it here strands it, and the
+  // next resolve writes a SECOND row over turns the first one already covered, so the memory head
+  // says the same thing twice. Applying it is not "compacting a live conversation" either — it folds
+  // exactly the turns that were already summarized, and the ones since stay raw.
+  const owed = loaded.reopened
+    ? await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.attendanceSummary.findFirst({
+          where: { tenantId, chatwootInstanceId: instanceId, contactInboxId },
+          orderBy: { id: "desc" },
+          select: { lastMessageId: true },
+        }),
+      )
+    : null;
+  const owedIndex = owed
+    ? messages.findIndex((m) => m.id === owed.lastMessageId)
+    : -1;
+  if (loaded.reopened && owedIndex < 0) return { outcome: "done" };
+
+  const natural = selectClosedPrefix(messages, {
+    currentAttendanceClosed:
+      !loaded.reopened && reason === "resolved" && attendanceIsCurrent,
   });
+  const cut =
+    owedIndex >= 0
+      ? {
+          head: natural.head,
+          closed: messages.slice(natural.head ? 1 : 0, owedIndex + 1),
+          open: messages.slice(owedIndex + 1),
+        }
+      : natural;
   // What this row will be a summary OF: the last turn in the cut. It is the segment's identity, and
   // the reason a reopened conversation does not lose half its memory — a second cut on the same
   // conversation carries different turns, so it writes its OWN row instead of replacing or reusing

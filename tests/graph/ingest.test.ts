@@ -1,5 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
+import {
+  type BaseMessage,
+  HumanMessage,
+  RemoveMessage,
+} from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -8,6 +12,8 @@ import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
 import { buildAgentGraph } from "@/graph/graph";
 import { ingestMessageIntoThread } from "@/graph/ingest";
+import { isConversationDivider, stampedConversationId } from "@/graph/markers";
+import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
@@ -156,6 +162,126 @@ describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
       select: { lastSyncedMessageId: true },
     });
     expect(at.lastSyncedMessageId).toBe(11);
+  });
+
+  // An agent who opens the conversation sends its FIRST message. Detecting the transition only on
+  // customer messages left that message inside the previous attendance, so when the customer finally
+  // replied the boundary landed after it — and the agent's opener was summarized and removed with the
+  // attendance that had already ended.
+  // The whole reason the cut reads a stamp instead of the divider: the divider is one message, and an
+  // invoke that started earlier saves the channel it loaded and erases it. Erased, the boundary has to
+  // survive anyway — it lives on the messages themselves.
+  test("the boundary survives losing the divider", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 23458;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const ingest = (conversationId: number, messageId: number, text: string) =>
+      ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        role: "customer" as const,
+        text,
+        base: appDb,
+        checkpointer: saver,
+      });
+
+    await ingest(820, 1, "atendimento antigo");
+    await ingest(821, 2, "oi, voltei");
+    await ingest(821, 3, "queria remarcar");
+
+    const read = async () => {
+      const cp = await saver.get({
+        configurable: { thread_id: graphThreadId },
+      });
+      return ((cp?.channel_values as { messages?: BaseMessage[] } | undefined)
+        ?.messages ?? []) as BaseMessage[];
+    };
+    const withDivider = await read();
+    expect(
+      selectClosedPrefix(withDivider, { currentAttendanceClosed: false })
+        .closed,
+    ).toHaveLength(1);
+
+    // An older invoke finishing mid-attendance takes the divider with it.
+    const divider = withDivider.find(isConversationDivider);
+    expect(divider).toBeDefined();
+    await buildThreadStateGraph(saver).updateState(
+      { configurable: { thread_id: graphThreadId } },
+      { messages: [new RemoveMessage({ id: divider?.id as string })] },
+      THREAD_STATE_NODE,
+    );
+
+    const without = await read();
+    expect(without.some(isConversationDivider)).toBe(false);
+    const cut = selectClosedPrefix(without, { currentAttendanceClosed: false });
+    expect(cut.closed).toHaveLength(1);
+    expect(String(cut.closed[0]?.content)).toBe("atendimento antigo");
+    expect(cut.open.map((m) => String(m.content))).toEqual(["queria remarcar"]);
+  });
+
+  test("a human agent opening a new conversation starts the attendance, not ends the last one", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 23457;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const ingest = (
+      conversationId: number,
+      messageId: number,
+      role: "customer" | "human_agent",
+      text: string,
+    ) =>
+      ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        role,
+        text,
+        base: appDb,
+        checkpointer: saver,
+      });
+
+    await ingest(810, 1, "customer", "primeira conversa");
+    // A NEW conversation, opened by the agent reaching out.
+    await ingest(811, 2, "human_agent", "oi, passando para lembrar da revisão");
+    await ingest(811, 3, "customer", "ah sim, obrigado");
+
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((
+      cp?.channel_values as { messages?: BaseMessage[] } | undefined
+    )?.messages ?? []) as BaseMessage[];
+    const cut = selectClosedPrefix(messages, {
+      currentAttendanceClosed: false,
+    });
+    // Only the first conversation closes. The agent's opener belongs to the attendance it OPENED.
+    expect(cut.closed).toHaveLength(1);
+    expect(String(cut.closed[0]?.content)).toBe("primeira conversa");
+    expect(
+      cut.open.some((m) => String(m.content).includes("lembrar da revisão")),
+    ).toBe(true);
+    // And the model is told too: the agent's message is an AIMessage, so the divider cannot ride
+    // inside it the way it does on a customer turn — it goes ahead of it.
+    expect(
+      cut.open[0] !== undefined && isConversationDivider(cut.open[0]),
+    ).toBe(true);
+    // EVERY message this writes carries the conversation it belongs to, the agent's included. The
+    // divider next to it carries one too, so a test that only read the divider would pass with the
+    // agent's message unstamped — and the boundary would be wrong the moment the divider is not there
+    // (an agent whose second message is all that survives a clobber).
+    expect(messages.map(stampedConversationId)).toEqual([810, 811, 811, 811]);
   });
 
   test("a customer message starting a NEW conversation on the thread gets the fresh-attendance divider", async () => {

@@ -25,6 +25,35 @@ function hasMarker(message: BaseMessage, marker: SystemMarker): boolean {
   return message.additional_kwargs?.[MARKER_KWARG] === marker;
 }
 
+// WHICH ATTENDANCE A MESSAGE BELONGS TO, stamped on the message itself.
+//
+// This is what the cut reads, and the divider is NOT. The divider is one message that somebody has to
+// notice the need for, write in the right place, and keep: an invoke that started earlier saves the
+// channel it loaded and erases it, ingestion only looked for the transition on customer messages, and
+// the marker row recording "we already wrote one" advances independently of it. Each of those is a way
+// for the boundary to end up somewhere the cut cannot find, and a boundary the cut cannot find merges
+// two attendances into one summary, silently.
+//
+// A stamp has none of those failure modes: it is written with the message it describes, by whoever
+// writes it, and an invoke that restores an older channel restores the stamps with it. Assistant
+// replies are deliberately NOT stamped — they are built inside the graph, not by us — which is why the
+// cut asks where the CURRENT attendance STARTS rather than where the previous one ended.
+//
+// Inert on the wire: the OpenAI, Google and Anthropic adapters read only known keys out of
+// additional_kwargs (tool calls, thought signatures) and never spread the rest into the request.
+const CONVERSATION_KWARG = "fazerConversationId";
+
+export function conversationStamp(
+  conversationId: number,
+): Record<string, unknown> {
+  return { [CONVERSATION_KWARG]: conversationId };
+}
+
+export function stampedConversationId(message: BaseMessage): number | null {
+  const raw = message.additional_kwargs?.[CONVERSATION_KWARG];
+  return typeof raw === "number" ? raw : null;
+}
+
 // Folded into the first human turn of a NEW conversation when the contact-inbox thread already
 // carries memory from a prior one. Written by both the reactive turn (src/graph/runtime.ts) and the
 // silent-message ingestion (src/graph/ingest.ts) — the first as its own message, the second prepended
@@ -39,14 +68,20 @@ export const CONVERSATION_DIVIDER =
 export const MEMORY_HEAD_OPEN = "<atendimentos-anteriores>";
 export const MEMORY_HEAD_CLOSE = "</atendimentos-anteriores>";
 
+// The divider is PROMPT CONTENT: it tells the model a new attendance started. It is not what the cut
+// reads — see conversationStamp above — so losing one costs a hint in one prompt, never a boundary.
 export function conversationDividerMessage(
+  conversationId: number,
   trailingText?: string,
 ): HumanMessage {
   return new HumanMessage({
     content: trailingText
       ? `${CONVERSATION_DIVIDER}\n\n${trailingText}`
       : CONVERSATION_DIVIDER,
-    additional_kwargs: { [MARKER_KWARG]: "divider" satisfies SystemMarker },
+    additional_kwargs: {
+      [MARKER_KWARG]: "divider" satisfies SystemMarker,
+      ...conversationStamp(conversationId),
+    },
   });
 }
 
