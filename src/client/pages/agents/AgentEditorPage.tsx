@@ -1133,6 +1133,7 @@ function AgentEditor() {
     // bag including tool-owned handoff/kanban) so a Tools save never falsely lights up Behavior's dot.
     behavior: JSON.stringify({
       businessHoursId,
+      awayMessage,
       followUpHoursId,
       debounce,
       stt,

@@ -3,7 +3,11 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
-import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import {
+  claimOutOfHoursNotices,
+  processChatwootDelivery,
+  releaseOutOfHoursNotices,
+} from "@/modules/chatwoot/webhook";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // Issue #153, wiring end. The availability gate silenced the agent and told only the OPERATOR, so the
@@ -71,6 +75,9 @@ interface Posted {
   token: string;
 }
 const posted: Posted[] = [];
+// Conversations whose PUBLIC posts the double rejects, and the attempts it saw.
+const failPublicFor = new Set<number>();
+const publicAttempts: number[] = [];
 let realFetch: typeof globalThis.fetch;
 
 // The double AUTHENTICATES like Chatwoot: a client built without the persona's bot token gets the same
@@ -95,6 +102,11 @@ function installChatwootDouble(): void {
       return json({ payload: [] });
     if (messages && init?.method === "POST") {
       const body = JSON.parse(String(init.body ?? "{}"));
+      const convId = Number(messages[1]);
+      if (body.private !== true && failPublicFor.has(convId)) {
+        publicAttempts.push(convId);
+        return json({ error: "boom" }, 500);
+      }
       posted.push({
         conversationId: Number(messages[1]),
         content: String(body.content ?? ""),
@@ -358,6 +370,66 @@ describe.skipIf(!dbUp)("out-of-hours away message (issue #153)", () => {
 
     expect(publicOn(convId)).toHaveLength(1);
     expect(notesOn(convId)).toHaveLength(1);
+  });
+
+  // The dispatch is detached: two messages in a row can be processed by two invocations that both
+  // read the same watermark. The claim is what stops the customer seeing the message twice.
+  test("the day is claimed once, so a concurrent invocation posts nothing", async () => {
+    const convId = 9105;
+    const rowId = await seedConversation(convId, inboxWithCopyId);
+    const now = new Date();
+    const first = await claimOutOfHoursNotices({
+      tenantId,
+      conversationId: rowId,
+      previous: null,
+      now,
+      base: appDb,
+    });
+    const second = await claimOutOfHoursNotices({
+      tenantId,
+      conversationId: rowId,
+      previous: null,
+      now: new Date(now.getTime() + 1000),
+      base: appDb,
+    });
+    expect(first).toBe(true);
+    expect(second).toBe(false);
+
+    // And releasing hands the day back, so the next message retries.
+    await releaseOutOfHoursNotices({
+      tenantId,
+      conversationId: rowId,
+      previous: null,
+      claimed: now,
+      base: appDb,
+    });
+    const conv = await suDb.conversation.findUniqueOrThrow({
+      where: { id: rowId },
+      select: { outOfHoursNoticeSentAt: true },
+    });
+    expect(conv.outOfHoursNoticeSentAt).toBeNull();
+  });
+
+  // Claiming before posting is what makes a failed send dangerous: the day would read as settled and
+  // the customer would get nothing until tomorrow.
+  test("a rejected away message does not settle the day", async () => {
+    const convId = 9106;
+    failPublicFor.add(convId);
+    const rowId = await seedConversation(convId, inboxWithCopyId);
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 8);
+
+    expect(publicAttempts.filter((c) => c === convId)).toHaveLength(1);
+    expect(publicOn(convId)).toEqual([]);
+    const afterFailure = await suDb.conversation.findUniqueOrThrow({
+      where: { id: rowId },
+      select: { outOfHoursNoticeSentAt: true },
+    });
+    expect(afterFailure.outOfHoursNoticeSentAt).toBeNull();
+
+    // The next message retries, and lands once Chatwoot is answering again.
+    failPublicFor.delete(convId);
+    await deliverCustomerMessage(convId, INBOX_WITH_COPY, 9);
+    expect(publicOn(convId)).toHaveLength(1);
   });
 
   // A WhatsApp conversation is never closed, so a watermark from a previous day is the ordinary case,
