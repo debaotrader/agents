@@ -15,7 +15,10 @@ import {
 } from "@/graph/nudge";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { seedChatwootInstance } from "../utils/chatwoot";
-import { EmptyThenReplyModel } from "../utils/scripted-models";
+import {
+  EmptyThenReplyModel,
+  HandoffThenReplyModel,
+} from "../utils/scripted-models";
 
 describe("renderNudge (prompt-injection boundary)", () => {
   test("directive comes first and is authoritative", () => {
@@ -284,6 +287,35 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(outcome).toBe("messaged");
     expect(s.messages).toEqual([[900, "Pagamento confirmado!"]]);
     expect(s.notes).toEqual([]);
+  });
+
+  test("handoff customerMessage is terminal when the nudge mirror event lags", async () => {
+    await seedConv(999, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:999`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["must-not-apply"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            "Vou te encaminhar para o time!",
+            "Vou te encaminhar para o time.",
+          ) as never,
+        // stub() does not mirror toggleStatus, reproducing the Chatwoot webhook lag.
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+    expect(s.messages).toEqual([[999, "Vou te encaminhar para o time."]]);
+    expect(s.labelSets).toEqual([]);
+    // The only status call is the handoff's `open`; postActions.resolve must not run.
+    expect(s.resolved).toEqual([999]);
+    expect(s.order).toEqual(["message", "resolve"]);
   });
 
   test("invokes on the per-contact-inbox memory thread, not the per-conversation thread (unification)", async () => {

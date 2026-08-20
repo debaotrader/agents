@@ -18,6 +18,7 @@ import { readGuardrailHealth } from "@/modules/guardrails/health";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
+  HandoffThenReplyModel,
   ResolveThenReplyModel,
   SendImageAndResolveModel,
   SendImageBatchModel,
@@ -547,6 +548,33 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       if (!resolvedLogged) await new Promise((r) => setTimeout(r, 100));
     }
     expect(resolvedLogged).toBe(true);
+  });
+
+  test("handoff customerMessage is terminal when the mirror status event lags", async () => {
+    await seedConversation(996, null);
+    const CLOSING = "Vou te encaminhar para o time.";
+    const FINAL = "Vou te encaminhar para o time!";
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 996 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(FINAL, CLOSING) as unknown as BaseChatModel,
+        // Deliberately do NOT mirror toggleStatus: this is the production lag that allowed the final
+        // reply through after the tool had already sent customerMessage.
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 996, CLOSING],
+      ["toggleStatus", 996, "open"],
+    ]);
   });
 
   test("taken over mid-turn discards the resolve intent", async () => {

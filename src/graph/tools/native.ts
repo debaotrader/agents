@@ -81,6 +81,12 @@ export interface TurnState {
   imagesSeq: number;
 }
 
+// Isolated from TurnState on purpose: reactive turns and proactive nudges share handoff delivery,
+// while resolve/image post-actions have different semantics on those two paths.
+export interface HandoffTurnState {
+  customerMessageSent: boolean;
+}
+
 export interface PendingImage {
   bytes: ArrayBuffer;
   mime: string;
@@ -96,6 +102,9 @@ export interface ToolCtx {
   // Absent (nudge turns, playground, hand-built ctx) ⇒ resolve_conversation keeps the legacy
   // immediate toggle. Only runLoadedTurn passes it.
   turnState?: TurnState;
+  // Present on every real customer-messaging path. A successful handoff customerMessage is terminal:
+  // the caller must not also post the model's final assistant text.
+  handoffState?: HandoffTurnState;
   // Per-agent toggle (default ON when undefined): when false, a handoff posts NO summary note even
   // if the model supplies a reason — the operator opted out of leaving internal summaries.
   transferWithSummary?: boolean;
@@ -230,6 +239,7 @@ function handoffTool(ctx: ToolCtx) {
             ctx.conversationId,
             customerMessage.trim(),
           );
+          if (ctx.handoffState) ctx.handoffState.customerMessageSent = true;
         } catch (e) {
           logger.warn(
             "handoff customer message failed (conv=%s): %s",

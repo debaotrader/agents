@@ -647,6 +647,7 @@ export interface ToolsetCtx {
     imagesInFlight: number;
     imagesSeq: number;
   };
+  handoffState?: { customerMessageSent: boolean };
 }
 
 export interface ToolBuildDeps {
@@ -668,6 +669,7 @@ export interface ToolBuildDeps {
         imagesInFlight: number;
         imagesSeq: number;
       };
+      handoffState?: { customerMessageSent: boolean };
       transferWithSummary?: boolean;
       handoff?: HandoffConfig;
       handoffTargets?: HandoffTargets;
@@ -972,6 +974,7 @@ export async function buildToolset(
         client: ctx.client,
         conversationId: ctx.conversationId,
         turnState: ctx.turnState,
+        handoffState: ctx.handoffState,
         transferWithSummary: cfg.transferWithSummary,
         handoff: effectiveHandoff,
         handoffTargets,

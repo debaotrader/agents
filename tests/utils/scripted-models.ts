@@ -100,6 +100,39 @@ export class ResolveThenReplyModel {
   }
 }
 
+// Calls handoff_to_human with a customer-facing closing line, then also returns a final reply.
+// Reproduces the double-send when the handoff's mirror event lands after generation.
+export class HandoffThenReplyModel {
+  constructor(
+    private reply: string,
+    private customerMessage: string,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(this.reply);
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        return n === 1
+          ? new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "handoff_to_human",
+                  args: { customerMessage: self.customerMessage },
+                  id: "call_handoff",
+                },
+              ],
+            })
+          : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
 // Calls send_image once (a product photo the agent already has the URL for), then answers with text.
 // Mirrors ResolveThenReplyModel: the point is the ORDER of what reaches Chatwoot, not the content.
 export class SendImageThenReplyModel {
