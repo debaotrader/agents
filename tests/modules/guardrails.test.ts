@@ -582,18 +582,27 @@ describe("analyzeGuardrail", () => {
           suggestedReply: reply,
         });
 
+      // NOTE: each half reports a REAL policy key, the way the prompt asks for. The fixture used to
+      // reuse the half's own name ("policies"), which is not a key the prompt defines anywhere, so
+      // it was asserting the merge over a category that could never occur.
+      const HALF_CATEGORY = {
+        policies: "toxicity",
+        relevance: "answer_relevance",
+      } as const;
+
       test("a violation on either side wins, with its categories and rationale", async () => {
         for (const violatingHalf of ["policies", "relevance"] as const) {
+          const category = HALF_CATEGORY[violatingHalf];
           const r = recordingModel((c) =>
             (violatingHalf === "relevance") === isFenced(c)
-              ? violation(violatingHalf, "TROCA")
+              ? violation(category, "TROCA")
               : clean,
           );
           const v = await analyzeGuardrail(r.model, split);
           expect(r.calls().length).toBe(2);
           expect(v.violated).toBe(true);
-          expect(v.categories).toEqual([violatingHalf]);
-          expect(v.rationale).toBe(`r-${violatingHalf}`);
+          expect(v.categories).toEqual([category]);
+          expect(v.rationale).toBe(`r-${category}`);
           // A replacement is only ever taken from the half that judges the reply. The relevance
           // half would have to invent the answer, so its suggestion is dropped even when it writes
           // one unasked, and the runtime falls back to the configured template.

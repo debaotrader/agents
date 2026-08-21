@@ -851,6 +851,7 @@
       "hoursNotFound": "O horário \"{{name}}\" não foi encontrado aqui, então ficou em branco.",
       "hoursReused": "O horário \"{{name}}\" já existia e foi reaproveitado; confira se a agenda está certa.",
       "httpGrantNotFound": "A ferramenta \"{{name}}\" não foi encontrada, então a concessão foi ignorada.",
+      "httpToolBodyIgnored": "A ferramenta \"{{name}}\" tinha um corpo de requisição num formato que esta versão não aceita, então ele foi reduzido à parte que de fato estava sendo enviada. A requisição não mudou; abra em Corpo da requisição para conferir.",
       "httpToolCredNotFound": "A credencial \"{{credential}}\" da ferramenta \"{{tool}}\" não foi encontrada aqui, então ficou em branco.",
       "httpToolReused": "A ferramenta \"{{name}}\" já existia e foi reaproveitada; confira se está certa.",
       "integrationGrantNotFound": "A integração \"{{name}}\" não foi encontrada, então a concessão foi ignorada.",
@@ -1827,6 +1828,9 @@
   },
   "tenant": {
     "create": "Criar tenant",
+    "deepLinkUnavailable": "Este link aponta para um tenant que você não pode abrir. Nada foi trocado.",
+    "deepLinkUnverified": "Não foi possível conferir este link",
+    "deepLinkUnverifiedHelp": "Este link abre outro tenant, e não foi possível ler a lista de tenants que você pode abrir. Nada foi trocado.",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Nome",
@@ -1849,6 +1853,9 @@
     "light": "Claro"
   },
   "toolpackTools": {
+    "argNote": {
+      "calendarId": "O agente só recebe este argumento quando a integração permite vários calendários; com um só, ele é usado automaticamente."
+    },
     "asaas_create_pix_charge": {
       "desc": "Abre uma cobrança PIX e retorna o código copia-e-cola e a página de pagamento.",
       "label": "Gerar cobrança PIX"
@@ -2041,6 +2048,7 @@
       "secretKey": "Secret key"
     },
     "fill": "Preencher",
+    "fillLinkNotHere": "Essa credencial não está no tenant que você tem aberto. Troque de tenant e siga o link de novo.",
     "fillTitle": "Preencher credencial pendente",
     "getKeyLink": "Pegue a sua em {{service}}",
     "getKeyPrompt": "Precisa de uma chave de API?",

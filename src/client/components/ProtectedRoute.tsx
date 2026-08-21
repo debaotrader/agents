@@ -2,6 +2,7 @@ import { Loader2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { Navigate, useLocation } from "react-router";
 import { Layout } from "@/client/components/Layout";
+import { TenantDeepLink } from "@/client/components/TenantDeepLink";
 import { useAuth } from "@/client/contexts/AuthContext";
 import { isAdminRole } from "@/client/lib/roles";
 
@@ -40,5 +41,13 @@ export function ProtectedRoute({
     return <Navigate to="/conversations" replace />;
   }
 
-  return <Layout>{children}</Layout>;
+  // A console link can name the tenant it belongs to. Applying that is the app shell's job, not any
+  // one page's, and it WRAPS the content rather than sitting beside it: a page that mounts while the
+  // switch is still being decided fetches the tenant the console is about to leave (see
+  // TenantDeepLink).
+  return (
+    <TenantDeepLink>
+      <Layout>{children}</Layout>
+    </TenantDeepLink>
+  );
 }

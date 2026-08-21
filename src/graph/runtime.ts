@@ -29,6 +29,7 @@ import {
   withFlowStage,
 } from "@/modules/flowlog/service";
 import { analyzeGuardrail } from "@/modules/guardrails/analyze";
+import { loggableCategories } from "@/modules/guardrails/log-categories";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import { armCompaction } from "@/modules/memory/compact";
 import { deliverReply } from "@/modules/split/service";
@@ -434,11 +435,16 @@ export async function runLoadedTurn(
       stage: "guardrail",
       status: "ok",
       level: "warn",
+      // NOTE: `categories` and `rationale` are both model-written, so neither can be copied into
+      // this row as it stands: `rationale` explains what in the message violated the policy, so it
+      // quotes the message, and `categories` is asked for as policy keys but arrives as whatever
+      // the model wrote. What goes in is the part with a known vocabulary, plus a COUNT of what did
+      // not match it, which is how "it violated something we cannot name here" stays visible. The
+      // private note two lines below carries both in full, on the conversation the text came from.
       detail: {
         direction,
         action: effectiveAction,
-        categories: verdict.categories,
-        rationale: verdict.rationale,
+        ...loggableCategories(verdict.categories),
       },
     });
     await client
@@ -607,10 +613,10 @@ export async function runLoadedTurn(
       {
         provider: loaded.mc.provider,
         model: loaded.mc.model,
-        // The fully-resolved system prompt the agent received THIS turn (item 15), so the operator can
-        // inspect it in the Logs page. Passes through redactSecretsDeep on write (secret-scrubbed +
-        // length-bounded); it is the tenant's own config, never customer PII.
-        detail: { systemPrompt: loaded.systemPrompt },
+        // The prompt the agent was given THIS turn (item 15), audited: the RESOLVED one is not the
+        // tenant's own config, it is where the contact's name, phone and attributes entered. See
+        // prompt-audit.ts.
+        detail: { systemPrompt: loaded.systemPromptAudit },
       },
       () =>
         graph.invoke(

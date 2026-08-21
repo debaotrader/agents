@@ -492,12 +492,13 @@ async function runIngestJobForTenant(
 ): Promise<JobResult> {
   // 1. Load document + KB config (scoped read, no network).
   const loaded = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    // NOTE: the content is deliberately NOT read here. It is read by the claim below, in the same
+    // transaction that takes the mark — see there for why the two cannot be separated.
     const doc = await db.knowledgeDocument.findUnique({
       where: { id: documentId },
       select: {
         id: true,
         status: true,
-        content: true,
         knowledgeBaseId: true,
       },
     });
@@ -546,13 +547,24 @@ async function runIngestJobForTenant(
     return { outcome: "done" };
   }
 
-  // Mark PROCESSING + emit event.
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
-    db.knowledgeDocument.updateMany({
+  // NOTE: PENDING → PROCESSING marks the document as owned by THIS run, and the text to index is
+  // read back under the same transaction. The two are one step because an edit landing between them
+  // leaves the row PENDING — the value it already had — so a claim taken on separately-read text
+  // still succeeds, and the run would go on to index text the document no longer has while holding
+  // a mark that says it may publish. The UPDATE holds this row's lock for the rest of the
+  // transaction, so the content read after it is the content as of the claim.
+  const claimed = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const { count } = await db.knowledgeDocument.updateMany({
       where: { id: documentId, status: "PENDING" },
       data: { status: "PROCESSING" },
-    }),
-  );
+    });
+    if (count === 0) return null;
+    return db.knowledgeDocument.findUnique({
+      where: { id: documentId },
+      select: { content: true },
+    });
+  });
+  if (!claimed) return { outcome: "done" };
   broadcastDocumentEvent(tenantId, {
     knowledgeBaseId: String(doc.knowledgeBaseId),
     documentId: String(documentId),
@@ -562,14 +574,25 @@ async function runIngestJobForTenant(
   try {
     // 2. Chunk + embed (NO transaction, network I/O). Embedding config came from the prerequisite
     // check above.
-    const chunks = await chunkText(doc.content, {
+    const chunks = await chunkText(claimed.content, {
       chunkSize: kb.chunkSize,
       chunkOverlap: kb.chunkOverlap,
     });
     const vectors = chunks.length ? await embedTexts(chunks, emb.config) : [];
 
-    // 4. Replace chunks + mark READY (scoped write).
-    await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    // NOTE: step 4, publish — release the mark, then replace the chunks (one scoped transaction).
+    const published = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+      // NOTE: only the run still holding the mark may publish (issue #163). An edit landing during
+      // the embed above sets the row back to PENDING to ask for a re-index, and an unconditional
+      // `READY` erased that marker, leaving the new text in the row and the old text in the index.
+      // Releasing BEFORE the chunk writes is the rest of it: a stale run returns having written
+      // nothing, so the previous index survives until the re-armed job replaces it, and a live run
+      // holds this row lock for the rest of the transaction, so no edit lands mid-write.
+      const released = await db.knowledgeDocument.updateMany({
+        where: { id: documentId, status: "PROCESSING" },
+        data: { status: "READY", chunkCount: chunks.length, error: null },
+      });
+      if (released.count === 0) return false;
       // Delete old chunks for this document.
       await db.knowledgeChunk.deleteMany({ where: { documentId } });
       // Insert new chunks with documentId.
@@ -579,11 +602,9 @@ async function runIngestJobForTenant(
           INSERT INTO knowledge_chunks (tenant_id, knowledge_base_id, document_id, content, embedding, metadata, created_at)
           VALUES (${tenantId}, ${doc.knowledgeBaseId}, ${documentId}, ${chunks[i]}, ${vec}::vector, ${JSON.stringify({ documentId: String(documentId) })}::jsonb, now())`;
       }
-      await db.knowledgeDocument.updateMany({
-        where: { id: documentId },
-        data: { status: "READY", chunkCount: chunks.length, error: null },
-      });
+      return true;
     });
+    if (!published) return { outcome: "done" };
 
     broadcastDocumentEvent(tenantId, {
       knowledgeBaseId: String(doc.knowledgeBaseId),
@@ -603,18 +624,24 @@ async function runIngestJobForTenant(
           ? err.message.slice(0, 500)
           : String(err);
     logger.error({ err, documentId: String(documentId) }, "RAG ingest failed");
-    await runScopedOn(base, sysCtx(tenantId), (db) =>
+    // NOTE: the same release, and for the same reason. A failure belongs to the content this run
+    // read, so stamping it on a document that has since been edited both reports the wrong thing
+    // and buries the re-index (FAILED is no more PENDING than READY is, and the re-armed job
+    // returns on it). Leaving the row PENDING lets the re-armed job try the new content instead.
+    const stamped = await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.knowledgeDocument.updateMany({
-        where: { id: documentId },
+        where: { id: documentId, status: "PROCESSING" },
         data: { status: "FAILED", error: message },
       }),
     );
-    broadcastDocumentEvent(tenantId, {
-      knowledgeBaseId: String(doc.knowledgeBaseId),
-      documentId: String(documentId),
-      status: "FAILED",
-      error: message,
-    });
+    if (stamped.count > 0) {
+      broadcastDocumentEvent(tenantId, {
+        knowledgeBaseId: String(doc.knowledgeBaseId),
+        documentId: String(documentId),
+        status: "FAILED",
+        error: message,
+      });
+    }
     return { outcome: "fail", error: message };
   }
 }

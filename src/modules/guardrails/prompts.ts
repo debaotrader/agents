@@ -18,18 +18,53 @@ export interface GuardrailPromptParams {
   generationPrompt?: string;
 }
 
-const CHECK_DEFINITIONS: Record<keyof GuardrailChecks, string> = {
-  toxicity:
-    "toxicity — harassment, hate speech, insults, or abusive/threatening language.",
-  unsafeContent:
-    "unsafe_content — sexual content, graphic violence, instructions for illegal or dangerous acts, or self-harm.",
-  competitorMentions:
-    "competitor_mention — any mention, recommendation, or promotion of a competitor from the list below.",
-  promptAdherence:
-    "prompt_adherence — the assistant reply goes outside the scope, persona, or policy set by the agent's instructions (off-topic, contradicts those instructions, or leaks internal details).",
-  answerRelevance:
-    "answer_relevance — the assistant reply does not answer what the customer actually asked: it addresses a different question, or leaves the question the customer asked unanswered.",
+// The policy key each check is named by IN THE PROMPT, separate from its description, because the
+// key is also the vocabulary the LOG is allowed to record (GUARDRAIL_CATEGORY_KEYS below). It used
+// to be glued to the front of the description string, so the only place that knew the keys was the
+// model.
+const CHECK_DEFINITIONS: Record<
+  keyof GuardrailChecks,
+  { key: string; description: string }
+> = {
+  toxicity: {
+    key: "toxicity",
+    description:
+      "harassment, hate speech, insults, or abusive/threatening language.",
+  },
+  unsafeContent: {
+    key: "unsafe_content",
+    description:
+      "sexual content, graphic violence, instructions for illegal or dangerous acts, or self-harm.",
+  },
+  competitorMentions: {
+    key: "competitor_mention",
+    description:
+      "any mention, recommendation, or promotion of a competitor from the list below.",
+  },
+  promptAdherence: {
+    key: "prompt_adherence",
+    description:
+      "the assistant reply goes outside the scope, persona, or policy set by the agent's instructions (off-topic, contradicts those instructions, or leaks internal details).",
+  },
+  answerRelevance: {
+    key: "answer_relevance",
+    description:
+      "the assistant reply does not answer what the customer actually asked: it addresses a different question, or leaves the question the customer asked unanswered.",
+  },
 };
+
+// The keys the prompt asks a verdict to answer with. `categories` is model-written and nothing holds
+// it to this list, which is fine for the private note (it lives on the conversation the text came
+// from) and NOT fine for `execution_logs.detail`, documented to carry enums and exported by
+// GET /v1/logs. So the log records the ones from this vocabulary and counts the rest (issue #141).
+//
+// NOTE: an operator's `customPolicy` is deliberately absent, because the prompt gives it no key
+// either ("Additional policy: …"). A violation of it therefore has no name the log can record, and
+// naming it would mean editing the prompt of a model that JUDGES, which this repo does not do
+// without an A/B battery. It shows up in the count, and in full on the private note.
+export const GUARDRAIL_CATEGORY_KEYS: readonly string[] = Object.values(
+  CHECK_DEFINITIONS,
+).map((d) => d.key);
 
 // The checks that only mean something on an assistant reply, so they never enter an input prompt:
 // one compares the reply against the agent's instructions, the other against the customer's message.
@@ -89,7 +124,10 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
     `You are a content-moderation guardrail. Analyze ${subject} and decide whether it violates any of the ENABLED policies below.`,
     "",
     "ENABLED policies:",
-    ...active.map((k) => `- ${CHECK_DEFINITIONS[k]}`),
+    ...active.map(
+      (k) =>
+        `- ${CHECK_DEFINITIONS[k].key} — ${CHECK_DEFINITIONS[k].description}`,
+    ),
   ];
   if (p.checks.competitorMentions && p.competitors.length > 0) {
     lines.push("", `Competitors: ${p.competitors.join(", ")}.`);

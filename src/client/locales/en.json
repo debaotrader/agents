@@ -849,6 +849,7 @@
       "hoursNotFound": "Business hours \"{{name}}\" were not found here, so they were left unset.",
       "hoursReused": "Business hours \"{{name}}\" already existed and were reused; check the schedule is right.",
       "httpGrantNotFound": "Tool \"{{name}}\" was not found, so its grant was skipped.",
+      "httpToolBodyIgnored": "Tool \"{{name}}\" had a request body in a shape this version does not accept, so it was reduced to the part that was actually being sent. The request is unchanged; open it under Body to check it.",
       "httpToolCredNotFound": "Tool \"{{tool}}\" credential \"{{credential}}\" was not found here, so it was left unset.",
       "httpToolReused": "Tool \"{{name}}\" already existed and was reused; check it is right.",
       "integrationGrantNotFound": "Integration \"{{name}}\" was not found, so its grant was skipped.",
@@ -1820,6 +1821,9 @@
   },
   "tenant": {
     "create": "Create tenant",
+    "deepLinkUnavailable": "This link points at a tenant you cannot open. Nothing was switched.",
+    "deepLinkUnverified": "Could not check this link",
+    "deepLinkUnverifiedHelp": "This link opens a different tenant, and the list of tenants you can open could not be read. Nothing was switched.",
     "demo": "Demo",
     "label": "Tenant",
     "name": "Name",
@@ -1842,6 +1846,9 @@
     "light": "Light"
   },
   "toolpackTools": {
+    "argNote": {
+      "calendarId": "The agent only receives this argument when the integration allows several calendars; with a single one it is used automatically."
+    },
     "asaas_create_pix_charge": {
       "desc": "Open a PIX charge and return the copy-and-paste code plus the payment page.",
       "label": "PIX charge"
@@ -2034,6 +2041,7 @@
       "secretKey": "Secret key"
     },
     "fill": "Fill",
+    "fillLinkNotHere": "That credential is not in the tenant you have open. Switch tenant and follow the link again.",
     "fillTitle": "Fill pending credential",
     "getKeyLink": "Get yours at {{service}}",
     "getKeyPrompt": "Need an API key?",
