@@ -96,6 +96,17 @@ function cappedFields(settings: unknown): CappedField[] {
   if (handoff) {
     add(handoff, "instructions", "handoff.instructions", TOOL_INSTRUCTIONS_MAX);
   }
+  // Same shape as guardrails.templateMessage: fixed operator copy the CUSTOMER reads when a gate
+  // trips, so it gets the same ceiling.
+  const availability = bagOf(root.availability);
+  if (availability) {
+    add(
+      availability,
+      "awayMessage",
+      "availability.awayMessage",
+      TEMPLATE_MESSAGE_MAX,
+    );
+  }
   const kanban = bagOf(root.kanban);
   if (kanban) {
     add(kanban, "instructions", "kanban.instructions", TOOL_INSTRUCTIONS_MAX);

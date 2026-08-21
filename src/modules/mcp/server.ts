@@ -579,7 +579,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "tool_list",
       {
         description:
-          "List the tenant's HTTP tool definitions (id, name, method, urlTemplate, riskTier, enabled, credentialRef as a vault NAME). No secrets.",
+          "List the tenant's HTTP tool definitions (id, name, method, urlTemplate, enabled, credentialRef as a vault NAME). No secrets.",
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await toolList(eff)),
@@ -1088,7 +1088,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "agent_settings_set",
       {
         description:
-          "Patch an agent's BEHAVIOR config. Each block (debounce, stt, tts, split, serviceWindow, grounding, limits) is a PARTIAL patch MERGED into the existing settings (untouched keys preserved) and re-validated/clamped by the runtime readers. Previews a normalized diff and applies NOTHING unless dry_run is false. credentialRef accepts a vault entry NAME or a stable vault:<id> ref (use vault:<id> when multiple entries share the same name). debounce: {enabled,windowSeconds,maxMessagesPerBurst,maxWindowSeconds}. stt: {enabled,provider,model,language,credentialRef,baseURL}. tts: {mode(never|mirror|preference),provider,model,voice,credentialRef,normalize(bool),normalizeProvider,normalizeModel,normalizeCredentialRef,normalizeBaseURL,stability(0-1),similarityBoost(0-1),style(0-1),speed(0.25-4),speakerBoost(bool)}. normalize rewrites the reply to be SPOKEN before synthesis (numbers/dates/amounts in words, lists turned into sentences, same language) as a second model call, billed and logged on its own (usage node tts_normalize, `normalize` flow stage); the four normalize* fields override the agent's model for that call and all default to inheriting it, so an untouched agent behaves exactly as before; normalizeModel and normalizeCredentialRef must be sent WITH normalizeProvider (even the agent's own value), because a model id and a key belong to the vendor they were picked from and the agent's provider can change under them — a bag that omits it is refused and the rewrite is skipped. The last five are ElevenLabs delivery knobs, FLAT on the block and clamped on write; null/omitted leaves the field to the voice's own saved setting, and LOW stability is what stops a voice note sounding monotone. vision: {enabled,provider(openai|gemini|anthropic),model,credentialRef,baseURL,extractionPrompt} — image/document reading at message arrival. split: {enabled,maxChars,typingWpm,minDelayMs,maxDelayMs,maxChunks}. serviceWindow: {enabled,windowHours,templateName,templateLanguage,templateCategory,templateParams,templateContent}. grounding: {maxDistance}. followUp: {enabled,pauseWhileAppointment,steps:[{delayValue,delayUnit(minutes|hours|days),instructions,assignLabels?,resolve?(last step only)}]}. handoff: {mode(route|pinned|agent_choice),targetAgentId?,targetTeamId?,targetInstanceId?,instructions?}. limits: {maxToolCalls(1-50, default 10), maxHistoryTokens(2000-1000000, null/0/absent = OFF)}. maxHistoryTokens caps how much of the contact's remembered history travels to the model each turn (the thread spans EVERY conversation that contact had on the channel and is otherwise unbounded); the conversation being answered is never dropped; the count is an ESTIMATE that runs low on tool-heavy threads, and the system prompt and tool definitions are NOT counted, so leave room above the cap for them. A trim is recorded on the turn trail as an info line on the `generate` stage (historyKept/historyDropped/historyTokens). attributeContext (which Chatwoot custom attributes are injected into the agent's prompt as current values): {conversation:[keys],contact:[keys],task:[keys]} — attribute KEYS per scope, max 20 each; empty arrays disable the block. sendImage (hosts the send_image tool may fetch an image from — the model picks the URL, so this list is the operator's fence; empty refuses every call): {allowedHosts:[hostnames, one per entry, \"*.\" prefix covers a domain and its subdomains]}. channelRedirect (WhatsApp→web-chat funnel): {enabled,entryInboxId,widgetInboxId,redirectMessage(with {link}),resendDelayValue,resendDelayUnit(minutes|hours|days),maxResends,openWidget,cloneWaMessage,chatFollowupEnabled,chatFollowupDelayValue,chatFollowupDelayUnit,chatFollowupInstructions,waFollowupEnabled,waFollowupDelayValue,waFollowupDelayUnit,waFollowupMessage(fixed text with {link}, re-sends the redirect link on WhatsApp — NOT AI),closingEnabled,closingDelayValue,closingDelayUnit,closingMessage(fixed goodbye, posted on BOTH chat + WhatsApp — NOT AI)} — the follow-up chain is a timed ladder (chat→whatsapp→closing); widgetInboxId is provisioned via the console (the web widget inbox), not set by hand. observability (what this agent's tool calls leave on the Logs page): {logToolValues(bool, default false)} — false records the SHAPE of each tool argument and result ({cpf:\"string(11)\"}), which is what keeps execution_logs free of message text and PII; true records the values as sent, kept for the whole log retention window and included in every export. Operator free text is length-capped and a longer value is REFUSED (not trimmed), on the preview as well as the apply: handoff.instructions 1500, followUp step instructions 2000, vision.extractionPrompt 4000. (Appointment reminders live on the Calendar integration's config, not here — see integration_update.)",
+          "Patch an agent's BEHAVIOR config. Each block (debounce, stt, tts, split, serviceWindow, grounding, limits) is a PARTIAL patch MERGED into the existing settings (untouched keys preserved) and re-validated/clamped by the runtime readers. Previews a normalized diff and applies NOTHING unless dry_run is false. credentialRef accepts a vault entry NAME or a stable vault:<id> ref (use vault:<id> when multiple entries share the same name). debounce: {enabled,windowSeconds,maxMessagesPerBurst,maxWindowSeconds}. stt: {enabled,provider,model,language,credentialRef,baseURL}. tts: {mode(never|mirror|preference),provider,model,voice,credentialRef,normalize(bool),normalizeProvider,normalizeModel,normalizeCredentialRef,normalizeBaseURL,stability(0-1),similarityBoost(0-1),style(0-1),speed(0.25-4),speakerBoost(bool)}. normalize rewrites the reply to be SPOKEN before synthesis (numbers/dates/amounts in words, lists turned into sentences, same language) as a second model call, billed and logged on its own (usage node tts_normalize, `normalize` flow stage); the four normalize* fields override the agent's model for that call and all default to inheriting it, so an untouched agent behaves exactly as before; normalizeModel and normalizeCredentialRef must be sent WITH normalizeProvider (even the agent's own value), because a model id and a key belong to the vendor they were picked from and the agent's provider can change under them — a bag that omits it is refused and the rewrite is skipped. The last five are ElevenLabs delivery knobs, FLAT on the block and clamped on write; null/omitted leaves the field to the voice's own saved setting, and LOW stability is what stops a voice note sounding monotone. vision: {enabled,provider(openai|gemini|anthropic),model,credentialRef,baseURL,extractionPrompt} — image/document reading at message arrival. split: {enabled,maxChars,typingWpm,minDelayMs,maxDelayMs,maxChunks}. serviceWindow: {enabled,windowHours,templateName,templateLanguage,templateCategory,templateParams,templateContent}. grounding: {maxDistance}. followUp: {enabled,pauseWhileAppointment,steps:[{delayValue,delayUnit(minutes|hours|days),instructions,assignLabels?,resolve?(last step only)}]}. handoff: {mode(route|pinned|agent_choice),targetAgentId?,targetTeamId?,targetInstanceId?,instructions?}. limits: {maxToolCalls(1-50, default 10), maxHistoryTokens(2000-1000000, null/0/absent = OFF)}. maxHistoryTokens caps how much of the contact's remembered history travels to the model each turn (the thread spans EVERY conversation that contact had on the channel and is otherwise unbounded); the conversation being answered is never dropped; the count is an ESTIMATE that runs low on tool-heavy threads, and the system prompt and tool definitions are NOT counted, so leave room above the cap for them. A trim is recorded on the turn trail as an info line on the `generate` stage (historyKept/historyDropped/historyTokens). attributeContext (which Chatwoot custom attributes are injected into the agent's prompt as current values): {conversation:[keys],contact:[keys],task:[keys]} — attribute KEYS per scope, max 20 each; empty arrays disable the block. sendImage (hosts the send_image tool may fetch an image from — the model picks the URL, so this list is the operator's fence; empty refuses every call): {allowedHosts:[hostnames, one per entry, \"*.\" prefix covers a domain and its subdomains]}. availability (what the CUSTOMER receives while the agent is outside its schedule; the operator's private note is unchanged): {enabled(bool, default false), awayMessage} — switched off, or on with empty copy, sends nothing, which is how every agent behaved before this block existed. {proximo_atendimento} / {next_open} interpolate the next opening (weekday + date + time) in the placeholder's own language; copy carrying one is WITHHELD when the schedule never reopens, because there is no return time to promise. At most once per local day per conversation, in the schedule's timezone. No model call. channelRedirect (WhatsApp→web-chat funnel): {enabled,entryInboxId,widgetInboxId,redirectMessage(with {link}),resendDelayValue,resendDelayUnit(minutes|hours|days),maxResends,openWidget,cloneWaMessage,chatFollowupEnabled,chatFollowupDelayValue,chatFollowupDelayUnit,chatFollowupInstructions,waFollowupEnabled,waFollowupDelayValue,waFollowupDelayUnit,waFollowupMessage(fixed text with {link}, re-sends the redirect link on WhatsApp — NOT AI),closingEnabled,closingDelayValue,closingDelayUnit,closingMessage(fixed goodbye, posted on BOTH chat + WhatsApp — NOT AI)} — the follow-up chain is a timed ladder (chat→whatsapp→closing); widgetInboxId is provisioned via the console (the web widget inbox), not set by hand. observability (what this agent's tool calls leave on the Logs page): {logToolValues(bool, default false)} — false records the SHAPE of each tool argument and result ({cpf:\"string(11)\"}), which is what keeps execution_logs free of message text and PII; true records the values as sent, kept for the whole log retention window and included in every export. memory (what the agent keeps of past conversations with a contact): {compaction:{enabled(bool, default TRUE)}} — the graph thread spans EVERY conversation that contact had on the channel, and with compaction on, an attendance that ENDS has its raw turns replaced by one summary of it (written by the agent's own model, off the hot path, once per attendance and never re-summarized), so the memory reads as N summarized attendances plus the current one raw. What a summary keeps is who the contact is, what was agreed and what was left open; exact wording does not survive, so turn it off for an agent that must quote an old conversation verbatim. A compaction is recorded on the trail as an info line on the `memory` stage. Operator free text is length-capped and a longer value is REFUSED (not trimmed), on the preview as well as the apply: handoff.instructions 1500, followUp step instructions 2000, vision.extractionPrompt 4000. (Appointment reminders live on the Calendar integration's config, not here — see integration_update.)",
         inputSchema: {
           agent_id: z.string(),
           debounce: z.record(z.string(), z.unknown()).optional(),
@@ -1101,10 +1101,12 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           followUp: z.record(z.string(), z.unknown()).optional(),
           handoff: z.record(z.string(), z.unknown()).optional(),
           limits: z.record(z.string(), z.unknown()).optional(),
+          availability: z.record(z.string(), z.unknown()).optional(),
           channelRedirect: z.record(z.string(), z.unknown()).optional(),
           attributeContext: z.record(z.string(), z.unknown()).optional(),
           sendImage: z.record(z.string(), z.unknown()).optional(),
           observability: z.record(z.string(), z.unknown()).optional(),
+          memory: z.record(z.string(), z.unknown()).optional(),
           dry_run: z.boolean().optional(),
         },
       },
@@ -1121,10 +1123,12 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           followUp?: Record<string, unknown>;
           handoff?: Record<string, unknown>;
           limits?: Record<string, unknown>;
+          availability?: Record<string, unknown>;
           channelRedirect?: Record<string, unknown>;
           attributeContext?: Record<string, unknown>;
           sendImage?: Record<string, unknown>;
           observability?: Record<string, unknown>;
+          memory?: Record<string, unknown>;
           dry_run?: boolean;
         },
         eff,
@@ -1359,7 +1363,6 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           body: z.record(z.string(), z.unknown()).optional(),
           credential_ref: z.string().nullable().optional(),
           enabled: z.boolean().optional(),
-          risk_tier: z.enum(["low", "medium", "high"]).optional(),
           expected_statuses: z
             .array(z.number().int())
             .optional()
@@ -1386,7 +1389,6 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           body?: Record<string, unknown>;
           credential_ref?: string | null;
           enabled?: boolean;
-          risk_tier?: "low" | "medium" | "high";
           expected_statuses?: number[];
           ack_enabled?: boolean;
           ack_message?: string | null;
@@ -1418,7 +1420,6 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           body: z.record(z.string(), z.unknown()).optional(),
           credential_ref: z.string().nullable().optional(),
           enabled: z.boolean().optional(),
-          risk_tier: z.enum(["low", "medium", "high"]).optional(),
           expected_statuses: z
             .array(z.number().int())
             .optional()
@@ -1446,7 +1447,6 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           body?: Record<string, unknown>;
           credential_ref?: string | null;
           enabled?: boolean;
-          risk_tier?: "low" | "medium" | "high";
           expected_statuses?: number[];
           ack_enabled?: boolean;
           ack_message?: string | null;
@@ -2205,7 +2205,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "business_hours_create",
       {
         description:
-          "Create a business-hours profile. windows is an array of { day (0-6), start (HH:mm), end (HH:mm) }. Previews and creates NOTHING unless dry_run is false.",
+          "Create a business-hours profile. windows is an array of { day (0-6), start (HH:mm), end (HH:mm) }. exceptions is an array of date overrides that REPLACE the weekly grid on the dates they match: { date (YYYY-MM-DD), dateEnd (optional, inclusive span end), recurring (optional, matches the same month-day every year), label, ranges (array of { start, end }; empty = closed all day) }. Previews and creates NOTHING unless dry_run is false.",
         inputSchema: {
           name: z.string(),
           timezone: z.string().optional(),
@@ -2218,6 +2218,19 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
               }),
             )
             .optional(),
+          exceptions: z
+            .array(
+              z.object({
+                date: z.string(),
+                dateEnd: z.string().optional(),
+                recurring: z.boolean().optional(),
+                label: z.string().optional(),
+                ranges: z.array(
+                  z.object({ start: z.string(), end: z.string() }),
+                ),
+              }),
+            )
+            .optional(),
           dry_run: z.boolean().optional(),
         },
       },
@@ -2226,6 +2239,13 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           name: string;
           timezone?: string;
           windows?: Array<{ day: number; start: string; end: string }>;
+          exceptions?: Array<{
+            date: string;
+            dateEnd?: string;
+            recurring?: boolean;
+            label?: string;
+            ranges: Array<{ start: string; end: string }>;
+          }>;
           dry_run?: boolean;
         },
         eff,
@@ -2238,7 +2258,7 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
       "business_hours_update",
       {
         description:
-          "Update a business-hours profile (name, timezone, windows). Previews a diff and applies NOTHING unless dry_run is false.",
+          "Update a business-hours profile (name, timezone, windows, exceptions). exceptions is an array of date overrides that REPLACE the weekly grid on the dates they match: { date (YYYY-MM-DD), dateEnd (optional, inclusive span end), recurring (optional, matches the same month-day every year), label, ranges (array of { start, end }; empty = closed all day) }. Previews a diff and applies NOTHING unless dry_run is false.",
         inputSchema: {
           business_hours_id: z.string(),
           name: z.string().optional(),
@@ -2252,6 +2272,19 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
               }),
             )
             .optional(),
+          exceptions: z
+            .array(
+              z.object({
+                date: z.string(),
+                dateEnd: z.string().optional(),
+                recurring: z.boolean().optional(),
+                label: z.string().optional(),
+                ranges: z.array(
+                  z.object({ start: z.string(), end: z.string() }),
+                ),
+              }),
+            )
+            .optional(),
           dry_run: z.boolean().optional(),
         },
       },
@@ -2261,6 +2294,13 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
           name?: string;
           timezone?: string;
           windows?: Array<{ day: number; start: string; end: string }>;
+          exceptions?: Array<{
+            date: string;
+            dateEnd?: string;
+            recurring?: boolean;
+            label?: string;
+            ranges: Array<{ start: string; end: string }>;
+          }>;
           dry_run?: boolean;
         },
         eff,

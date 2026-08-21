@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowRightLeft,
+  Brain,
   CalendarClock,
   Gauge,
   Image,
@@ -41,14 +42,15 @@ import {
   VISION_DEFAULT_MODEL,
 } from "@/client/lib/providerDefaults";
 import { providerLabel } from "@/client/lib/providerLabels";
-import { formatWindowsSummary } from "@/client/lib/schedulePreview";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
+  TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
+import { formatWindowsSummary } from "@/modules/business-hours/announce";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
@@ -186,6 +188,10 @@ interface BehaviorTabProps {
   hours: Hours[];
   businessHoursId: string;
   setBusinessHoursId: (v: string) => void;
+  awayEnabled: boolean;
+  setAwayEnabled: (v: boolean) => void;
+  awayMessage: string;
+  setAwayMessage: (v: string) => void;
   followUpHoursId: string;
   setFollowUpHoursId: (v: string) => void;
   debounce: DebounceState;
@@ -209,6 +215,10 @@ interface BehaviorTabProps {
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
   limits: LimitsState;
+  memory: { compactionEnabled: boolean };
+  setMemory: React.Dispatch<
+    React.SetStateAction<{ compactionEnabled: boolean }>
+  >;
   observability: { logToolValues: boolean };
   setObservability: React.Dispatch<
     React.SetStateAction<{ logToolValues: boolean }>
@@ -240,6 +250,7 @@ function toScheduleOption(h: Hours): ScheduleOption {
     id: String(h.id),
     name: h.name,
     windows: (h.windows ?? []) as ScheduleOption["windows"],
+    exceptions: (h.exceptions ?? []) as ScheduleOption["exceptions"],
     timezone: h.timezone,
   };
 }
@@ -755,6 +766,10 @@ export function BehaviorTab({
   hours,
   businessHoursId,
   setBusinessHoursId,
+  awayEnabled,
+  setAwayEnabled,
+  awayMessage,
+  setAwayMessage,
   followUpHoursId,
   setFollowUpHoursId,
   debounce,
@@ -775,6 +790,8 @@ export function BehaviorTab({
   setVision,
   visionCredBaseUrl,
   limits,
+  memory,
+  setMemory,
   observability,
   setObservability,
   setLimits,
@@ -906,6 +923,11 @@ export function BehaviorTab({
       label: t("editor.limits", "Execution limits"),
     },
     {
+      id: "memory",
+      icon: Brain,
+      label: t("editor.memory", "Memory"),
+    },
+    {
       id: "observability",
       icon: ScrollText,
       label: t("editor.observability", "Logs"),
@@ -928,7 +950,7 @@ export function BehaviorTab({
             title={t("editor.availability", "Availability")}
             description={t(
               "editor.availabilityHint",
-              "When the agent is active and answering. Outside these hours it stays silent and notifies the operator with a private note.",
+              "When the agent is active and answering. Outside these hours it stays silent, notifies the operator with a private note, and, if you turn it on below, tells the customer too.",
             )}
           >
             <FormField
@@ -946,6 +968,34 @@ export function BehaviorTab({
                 }}
               />
             </FormField>
+            <SwitchField
+              checked={awayEnabled}
+              onCheckedChange={setAwayEnabled}
+              label={t(
+                "editor.awayEnabled",
+                "Reply to the customer while closed",
+              )}
+            />
+            {awayEnabled && (
+              <FormField
+                label={t("editor.awayMessage", "Out-of-hours message")}
+                description={t(
+                  "editor.awayMessageHint",
+                  'Sent to the customer while the agent is outside these hours, at most once a day per conversation. Write {next_open} (or {proximo_atendimento} for a Portuguese message) where the next opening should appear: the customer reads something like "Monday, 08/25, 09:00".',
+                )}
+              >
+                <Textarea
+                  value={awayMessage}
+                  onChange={(e) => setAwayMessage(e.target.value)}
+                  rows={2}
+                  maxLength={TEMPLATE_MESSAGE_MAX}
+                  placeholder={t(
+                    "editor.awayMessagePlaceholder",
+                    "We are closed right now. We will be back {next_open}.",
+                  )}
+                />
+              </FormField>
+            )}
           </Section>
 
           <Section
@@ -1880,6 +1930,25 @@ export function BehaviorTab({
                 />
               </FormField>
             </div>
+          </Section>
+
+          <Section
+            id="memory"
+            icon={Brain}
+            title={t("editor.memory", "Memory")}
+            description={t(
+              "editor.memoryHint",
+              'The agent remembers every conversation it has had with this contact on this channel. When an attendance ends, its messages are replaced by a summary of it, so the memory becomes "N summarized attendances + the current one". What survives a summary is the useful part: who the contact is, what was agreed, what was left open. Exact wording does not, so turn this off if the agent must be able to quote an old conversation word for word. The summary is written by the agent\'s own model, after the reply is sent, so no customer waits for it.',
+            )}
+          >
+            <SwitchField
+              checked={memory.compactionEnabled}
+              onCheckedChange={(v) => setMemory({ compactionEnabled: v })}
+              label={t(
+                "editor.memoryCompaction",
+                "Summarize attendances that have ended",
+              )}
+            />
           </Section>
 
           <Section

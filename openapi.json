@@ -7043,6 +7043,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7110,6 +7114,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7175,6 +7183,10 @@
                     "properties": {
                       "systemPrompt": {
                         "maxLength": 100000,
+                        "type": "string"
+                      },
+                      "businessHoursId": {
+                        "maxLength": 20,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7312,7 +7324,7 @@
           "Agents"
         ],
         "summary": "List playground tools",
-        "description": "Returns the agent's tools (name, description, category, risk, auto-simulated flag) for the simulate-a-return UI.",
+        "description": "Returns the agent's tools (name, description, category, auto-simulated flag) for the simulate-a-return UI.",
         "parameters": [
           {
             "name": "id",
@@ -7468,6 +7480,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7527,6 +7543,10 @@
                         "maxLength": 100000,
                         "type": "string"
                       },
+                      "businessHoursId": {
+                        "maxLength": 20,
+                        "type": "string"
+                      },
                       "modelConfig": {
                         "type": "object",
                         "patternProperties": {
@@ -7584,6 +7604,10 @@
                     "properties": {
                       "systemPrompt": {
                         "maxLength": 100000,
+                        "type": "string"
+                      },
+                      "businessHoursId": {
+                        "maxLength": 20,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7763,6 +7787,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -7830,6 +7858,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -7895,6 +7927,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8083,6 +8119,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8162,6 +8202,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8239,6 +8283,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8431,6 +8479,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8498,6 +8550,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8563,6 +8619,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8751,6 +8811,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8834,6 +8898,10 @@
                             "maxLength": 100000,
                             "type": "string"
                           },
+                          "businessHoursId": {
+                            "maxLength": 20,
+                            "type": "string"
+                          },
                           "modelConfig": {
                             "type": "object",
                             "patternProperties": {
@@ -8915,6 +8983,10 @@
                         "properties": {
                           "systemPrompt": {
                             "maxLength": 100000,
+                            "type": "string"
+                          },
+                          "businessHoursId": {
+                            "maxLength": 20,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -10046,14 +10118,6 @@
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
                   },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
-                  },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
                     "type": "array",
@@ -10182,14 +10246,6 @@
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
                   },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
-                  },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
                     "type": "array",
@@ -10317,14 +10373,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -10690,14 +10738,6 @@
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
                   },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
-                  },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
                     "type": "array",
@@ -10826,14 +10866,6 @@
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
                   },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
-                  },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
                     "type": "array",
@@ -10961,14 +10993,6 @@
                   "enabled": {
                     "description": "Whether the tool is available to agents.",
                     "type": "boolean"
-                  },
-                  "riskTier": {
-                    "type": "string",
-                    "enum": [
-                      "low",
-                      "medium",
-                      "high"
-                    ]
                   },
                   "expectedStatuses": {
                     "description": "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
@@ -12462,6 +12486,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12517,6 +12591,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12570,6 +12694,56 @@
                         "day",
                         "start",
                         "end"
+                      ]
+                    }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
                       ]
                     }
                   }
@@ -12844,6 +13018,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12899,6 +13123,56 @@
                         "end"
                       ]
                     }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
+                      ]
+                    }
                   }
                 }
               }
@@ -12952,6 +13226,56 @@
                         "day",
                         "start",
                         "end"
+                      ]
+                    }
+                  },
+                  "exceptions": {
+                    "description": "Date exceptions (holidays, shutdowns, half-days) that replace the weekly windows on the dates they match.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "date": {
+                          "description": "Calendar date the exception applies to, \"YYYY-MM-DD\". With recurring, only the month and day are compared.",
+                          "type": "string"
+                        },
+                        "dateEnd": {
+                          "description": "Inclusive last date of the span, \"YYYY-MM-DD\". Under recurring, a month-day before the start wraps the year end (e.g. Dec 23 through Jan 2).",
+                          "type": "string"
+                        },
+                        "recurring": {
+                          "description": "Match the same month-day every year. Only for fixed-date holidays; movable ones (Carnival, Good Friday) need a dated entry per year.",
+                          "type": "boolean"
+                        },
+                        "label": {
+                          "description": "Operator-facing name, e.g. Independence Day.",
+                          "type": "string"
+                        },
+                        "ranges": {
+                          "description": "Hours in force on the matched dates, REPLACING the weekly windows. Empty = closed all day.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "start": {
+                                "description": "Range start time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              },
+                              "end": {
+                                "description": "Range end time as \"HH:mm\" (24-hour, in the schedule timezone).",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "start",
+                              "end"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "date",
+                        "ranges"
                       ]
                     }
                   }

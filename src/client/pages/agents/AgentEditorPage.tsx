@@ -14,7 +14,7 @@ import {
   Wrench,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Link,
@@ -62,6 +62,7 @@ import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import type { Schedule } from "@/modules/business-hours/hours";
 import {
   CHANNEL_REDIRECT_DEFAULTS,
   type ChannelRedirectConfig,
@@ -73,6 +74,7 @@ import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
 } from "@/modules/guardrails/settings";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { BehaviorTab, type SendImageState } from "./BehaviorTab";
 import {
@@ -287,6 +289,7 @@ function readBehaviorState(a: Agent) {
   const li = (s.limits ?? {}) as Record<string, unknown>;
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
   const si = (s.sendImage ?? {}) as Record<string, unknown>;
+  const av = (s.availability ?? {}) as Record<string, unknown>;
 
   // NOTE: Attribute keys per scope: plain string lists (the runtime reader trims/dedups/caps them).
   const attrKeys = (v: unknown): string[] =>
@@ -300,6 +303,8 @@ function readBehaviorState(a: Agent) {
     businessHoursId: a.businessHoursId ?? "",
     followUpHoursId: a.followUpHoursId ?? "",
     settings: s,
+    awayEnabled: av.enabled === true,
+    awayMessage: str(av.awayMessage),
     debounce: {
       enabled: typeof d.enabled === "boolean" ? d.enabled : true,
       windowSeconds: num(d.windowSeconds) || "15",
@@ -376,6 +381,10 @@ function readBehaviorState(a: Agent) {
     // here would show the switch off while values were being logged, and would then persist that lie
     // on the next save.
     observability: readObservabilityConfig(s),
+    // NOTE: Same reason as observability above — through the runtime's own reader, because this one
+    // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
+    // predates the feature, then persist that lie on the next save.
+    memory: { compactionEnabled: readMemoryConfig(s).compaction.enabled },
   };
 }
 
@@ -565,6 +574,8 @@ function AgentEditor() {
   );
   const [transferWithSummary, setTransferWithSummary] = useState(true);
   const [businessHoursId, setBusinessHoursId] = useState("");
+  const [awayEnabled, setAwayEnabled] = useState(false);
+  const [awayMessage, setAwayMessage] = useState("");
   const [followUpHoursId, setFollowUpHoursId] = useState("");
   // Free-form settings bag, preserved on save so editing one section never wipes another
   // (e.g. grounding). The debounce sub-state mirrors settings.debounce (see modules/debounce).
@@ -628,6 +639,9 @@ function AgentEditor() {
   // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
   // agent.settings.observability (modules/flowlog/settings).
   const [observability, setObservability] = useState({ logToolValues: false });
+  // Whether an attendance that ended is folded into a summary. Mirrors agent.settings.memory
+  // (modules/memory/settings), which defaults to ON.
+  const [memory, setMemory] = useState({ compactionEnabled: true });
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -718,6 +732,24 @@ function AgentEditor() {
 
   // Pools
   const [hours, setHours] = useState<Hours[]>([]);
+  // The Availability the prompt preview resolves {{esta_aberto}} & co. against: the schedule this
+  // agent is bound to, as the Behavior tab currently has it (unsaved changes included, so the preview
+  // answers for the schedule the operator is looking at). Not configured → null, which the runtime and
+  // the gate both read as always on.
+  const promptAvailability = useMemo(() => {
+    const h = hours.find((x) => String(x.id) === businessHoursId);
+    // Built field by field rather than passed through: the sibling picker guards windows/exceptions
+    // with `?? []` for rows that come back without them, and a preview is not the place to find out.
+    return {
+      schedule: h
+        ? {
+            windows: (h.windows ?? []) as Schedule["windows"],
+            exceptions: (h.exceptions ?? []) as Schedule["exceptions"],
+            timezone: h.timezone,
+          }
+        : null,
+    };
+  }, [hours, businessHoursId]);
 
   const confirm = useModalController<ConfirmPayload>();
   const cloneModal = useModalController();
@@ -793,6 +825,8 @@ function AgentEditor() {
     setModel(readModelState(a));
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -804,6 +838,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -826,6 +861,8 @@ function AgentEditor() {
     syncedAgentRef.current = a;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -837,6 +874,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -1017,6 +1055,7 @@ function AgentEditor() {
       // reading the live channelRedirect form in a Behavior save would clobber that tab's unsaved
       // edits. The `...settings` spread preserves the last-synced channelRedirect; saveChannelRedirect
       // keeps that bag in step after its own write (same pattern as saveTools does for handoff/kanban).
+      availability: { enabled: awayEnabled, awayMessage: awayMessage.trim() },
       debounce: {
         enabled: debounce.enabled,
         windowSeconds: Number(debounce.windowSeconds) || 15,
@@ -1096,6 +1135,7 @@ function AgentEditor() {
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
       observability: { logToolValues: observability.logToolValues },
+      memory: { compaction: { enabled: memory.compactionEnabled } },
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1127,6 +1167,8 @@ function AgentEditor() {
     // bag including tool-owned handoff/kanban) so a Tools save never falsely lights up Behavior's dot.
     behavior: JSON.stringify({
       businessHoursId,
+      awayEnabled,
+      awayMessage,
       followUpHoursId,
       debounce,
       stt,
@@ -1139,6 +1181,7 @@ function AgentEditor() {
       attributeContext,
       sendImage,
       observability,
+      memory,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1746,6 +1789,7 @@ function AgentEditor() {
   // those need saving). Read fresh at send time inside the hook, so it always reflects the form.
   const getDraft = () => ({
     systemPrompt,
+    businessHoursId,
     modelConfig: buildModelConfig(),
     settings: buildSettings(),
   });
@@ -1778,6 +1822,8 @@ function AgentEditor() {
     if (!a) return;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -1789,6 +1835,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
@@ -2566,6 +2613,7 @@ function AgentEditor() {
 
             {tab === "general" && (
               <GeneralTab
+                availability={promptAvailability}
                 name={name}
                 setName={setName}
                 systemPrompt={systemPrompt}
@@ -2662,6 +2710,10 @@ function AgentEditor() {
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}
+                awayEnabled={awayEnabled}
+                setAwayEnabled={setAwayEnabled}
+                awayMessage={awayMessage}
+                setAwayMessage={setAwayMessage}
                 followUpHoursId={followUpHoursId}
                 setFollowUpHoursId={setFollowUpHoursId}
                 debounce={debounce}
@@ -2695,6 +2747,8 @@ function AgentEditor() {
                 visionCredBaseUrl={visionCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
+                memory={memory}
+                setMemory={setMemory}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}
@@ -2875,6 +2929,10 @@ function AgentEditor() {
               name: businessHoursReviewItem.name,
               timezone: businessHoursReviewItem.timezone,
               windows: businessHoursReviewItem.windows.map((w) => ({ ...w })),
+              exceptions: businessHoursReviewItem.exceptions.map((e) => ({
+                ...e,
+                ranges: e.ranges.map((r) => ({ ...r })),
+              })),
             }}
             onSaved={() => businessHoursReviewModal.close()}
             onCancel={() => businessHoursReviewModal.close()}

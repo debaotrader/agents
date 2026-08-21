@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { z } from "zod";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
 import type { TenantContext } from "@/lib/tenancy";
@@ -568,6 +569,12 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
         name: "Comercial",
         timezone: "America/Sao_Paulo",
         windows: [],
+        // Date exceptions are part of the schedule, so they have to travel with it. Nothing in the
+        // type system says so: the bundle carries the schedule as raw JSON, and a forgotten field
+        // here would arrive at the destination as a schedule that quietly forgot its holidays.
+        exceptions: [
+          { date: "2026-09-07", label: "Independência", ranges: [] },
+        ],
       },
     });
     const agent = await suDb.agent.create({
@@ -655,6 +662,9 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
     expect(c?.knowledgeBases.find((k) => k.name === "Catálogo")).toBeDefined();
     // Business hours are bundled so the import can recreate them.
     expect(c?.businessHours?.some((h) => h.name === "Comercial")).toBe(true);
+    expect(
+      c?.businessHours?.find((h) => h.name === "Comercial")?.exceptions,
+    ).toEqual([{ date: "2026-09-07", label: "Independência", ranges: [] }]);
     const json = JSON.stringify(exp);
     // No inbound secret / route token hash / vault id ever travels.
     expect(json).not.toContain("vault:");
@@ -713,6 +723,9 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
       where: { tenantId: dstTenant, name: "Comercial" },
     });
     expect(bh).not.toBeNull();
+    expect(bh?.exceptions).toEqual([
+      { date: "2026-09-07", label: "Independência", ranges: [] },
+    ]);
     const agentRow = await suDb.agent.findUnique({
       where: { id: BigInt(agent.id) },
       select: { businessHoursId: true },
@@ -763,6 +776,45 @@ describe.skipIf(!dbUp)("agent export/import with components", () => {
     expect(row?.inputSchema).toEqual({
       order_id: { type: "string", required: true },
     });
+  });
+
+  test("a bundle this build produces still carries riskTier, for an older importer (issue #137)", async () => {
+    // The other direction of the same compatibility. The bundle format is versioned as a whole, so
+    // an instance one release behind parses OUR bundle with a schema where `riskTier` is REQUIRED —
+    // dropping the key from the export would make every bundle this build writes unimportable there.
+    // The literal below stands in for that older required-field check.
+    const exp = await exportAgent(srcCtx(), srcAgentId, appDb, {
+      includeComponents: true,
+    });
+    const previousReleaseShape = z.object({ riskTier: z.string() });
+    for (const tool of exp.components?.httpTools ?? []) {
+      expect(previousReleaseShape.safeParse(tool).success).toBe(true);
+    }
+  });
+
+  test("a bundle carrying the retired riskTier still imports (issue #137)", async () => {
+    // Bundles exported before the risk tier was dropped carry `riskTier` on every HTTP tool. The
+    // import schema is a plain z.object, which STRIPS unknown keys — the removal is only safe as
+    // long as that holds, so pin it against a bundle from an older instance.
+    const exp = await exportAgent(srcCtx(), srcAgentId, appDb, {
+      includeComponents: true,
+    });
+    const dated = structuredClone(exp);
+    const tool = dated.components?.httpTools.find(
+      (h) => h.name === "lookup_order",
+    );
+    if (!tool) throw new Error("bundle missing lookup_order");
+    tool.name = "retired_tier_lookup";
+    (tool as unknown as Record<string, unknown>).riskTier = "high";
+    const grant = dated.agent.tools.find(
+      (g) => g.source === "HTTP" && g.tool === "lookup_order",
+    );
+    if (grant?.source === "HTTP") grant.tool = "retired_tier_lookup";
+    await importAgent(dstCtx(), dated, appDb);
+    const row = await suDb.toolDefinition.findFirst({
+      where: { tenantId: dstTenant, name: "retired_tier_lookup" },
+    });
+    expect(row?.name).toBe("retired_tier_lookup");
   });
 
   test("re-import reuses same-name components (never overwrites) and warns", async () => {

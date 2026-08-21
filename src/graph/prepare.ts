@@ -6,6 +6,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import config from "@/config";
+import { parseDbId } from "@/lib/db-id";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
@@ -17,7 +18,8 @@ import {
   cancelAppointmentReminders,
   enqueueAppointmentReminders,
 } from "@/modules/appointments/reminders";
-import { parseWindows, type WindowSpec } from "@/modules/business-hours/hours";
+import { parseSchedule, type Schedule } from "@/modules/business-hours/hours";
+import { readSchedule } from "@/modules/business-hours/service";
 import {
   attributeBagsFrom,
   buildAttributeContextSection,
@@ -63,6 +65,7 @@ import {
   type SideEffectErrorReporter,
 } from "@/modules/integrations/toolpacks";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import {
   readServiceWindowConfig,
   type ServiceWindowConfig,
@@ -224,6 +227,10 @@ export interface AgentConfig {
   // Ceiling on the history tokens sent to the model (agent.settings.limits.maxHistoryTokens).
   // null = no ceiling, send the whole thread.
   maxHistoryTokens: number | null;
+  // Whether a closed attendance gets folded into the contact's memory instead of staying raw on
+  // the thread (agent.settings.memory.compaction). Read here so the turn that CROSSES an
+  // attendance boundary can arm the compaction job without a second query.
+  memoryCompaction: boolean;
   // Whether this agent's tool lines log the VALUES the model sent instead of their shape
   // (agent.settings.observability.logToolValues; off by default — see src/modules/flowlog/shape.ts).
   logToolValues: boolean;
@@ -243,6 +250,11 @@ export interface LoadAgentArgs {
 // overridable in v1 (they need id/ownership re-validation); the playground uses the saved set.
 export interface AgentConfigOverrides {
   systemPrompt?: string;
+  // Playground: the Availability the operator has selected but not saved yet, as the console's own
+  // string ("" = none). Absent = read the saved column. Without it the playground answers
+  // {{esta_aberto}} & co. from the schedule the picker no longer shows, which is the same drift
+  // between description and enforcement these variables exist to remove.
+  businessHoursId?: string;
   modelConfig?: Record<string, unknown>;
   settings?: Record<string, unknown>;
   // Playground tool-simulation: tool name → canned result. Consumed by the playground graph builder
@@ -283,7 +295,16 @@ function pickPromptVar(
 export async function loadAgentConfig(
   db: ScopedDb,
   args: LoadAgentArgs,
-  opts: { ignoreDisabled?: boolean; overrides?: AgentConfigOverrides } = {},
+  opts: {
+    ignoreDisabled?: boolean;
+    overrides?: AgentConfigOverrides;
+    // Skips the A/B variant resolution. Resolving one is not a read: it INSERTS the thread's
+    // assignment when there is none, and that row lands in the denominator of every result for the
+    // experiment. A caller that never runs the tested prompt — memory compaction summarizes with a
+    // fixed prompt of its own — would be inventing participants for an experiment it takes no part
+    // in, lowering its reported rates with nothing in the numbers to say why.
+    skipExperiment?: boolean;
+  } = {},
 ): Promise<AgentConfig | null> {
   const agent = await db.agent.findUnique({
     where: { id: args.agentId },
@@ -421,26 +442,45 @@ export async function loadAgentConfig(
     },
     select: { chatwootAgentBotId: true, accessToken: true },
   });
-  // Timezone for the clock (get_current_time tool + {{hora_atual}} var): the agent's BusinessHours,
-  // falling back to the product default. A single small scoped read when configured.
+  // The agent's Availability, in one scoped read when configured. It feeds the clock (get_current_time
+  // tool + {{hora_atual}} var) through its timezone, and the schedule variables ({{esta_aberto}},
+  // {{proximo_atendimento}}, {{horario_atendimento}}) through the grid and its exceptions. Until this
+  // read carried more than the timezone, the agent described its own hours from the operator's prose
+  // and drifted from the gate the moment either changed. `null` = no Availability = always on.
   let timezone = DEFAULT_TIMEZONE;
-  if (agent.businessHoursId !== null) {
+  let schedule: Schedule | null = null;
+  // A draft id is console input, so it goes through parseDbId (digits AND range: a value past 2^63-1
+  // parses as a BigInt and then fails in the query BIND, turning a bad field into a 500) and is read
+  // through the SAME scoped client: another tenant's row simply does not come back, and the turn
+  // falls through to always-on rather than to the saved schedule — an unresolvable selection is "no
+  // schedule", not "the old one".
+  const draftHoursId = ov?.businessHoursId;
+  const hoursId =
+    draftHoursId === undefined
+      ? agent.businessHoursId
+      : parseDbId(draftHoursId);
+  if (hoursId !== null) {
     const bh = await db.businessHours.findUnique({
-      where: { id: agent.businessHoursId },
-      select: { timezone: true },
+      where: { id: hoursId },
+      select: { timezone: true, windows: true, exceptions: true },
     });
-    if (bh?.timezone) timezone = bh.timezone;
+    if (bh) {
+      schedule = parseSchedule(bh);
+      if (bh.timezone) timezone = bh.timezone;
+    }
   }
   // Company name for the {{nome_empresa}} prompt variable (the tenant's own row under RLS).
   const tenant = await db.tenant.findFirst({ select: { name: true } });
   const langfuseCfg = await resolveLangfuseConfig(db, args.tenantId);
   const sel = await loadToolSelections(db, agent.id);
   // A/B: an active experiment for this agent may override the system prompt for this thread.
-  const promptOverride = await resolveVariantOverride(db, {
-    tenantId: args.tenantId,
-    agentId: agent.id,
-    threadId: args.threadId,
-  });
+  const promptOverride = opts.skipExperiment
+    ? null
+    : await resolveVariantOverride(db, {
+        tenantId: args.tenantId,
+        agentId: agent.id,
+        threadId: args.threadId,
+      });
   // Grounding is a runtime invariant: when the agent can search the KB, append the grounding
   // directive (don't fabricate / cite / "I don't know" → human) instead of trusting the tenant
   // prompt. The threshold lives in agent.settings (no column on the RAG selection row).
@@ -499,6 +539,10 @@ export async function loadAgentConfig(
       now: ov?.promptNow
         ? (zonedWallClockToInstant(ov.promptNow, timezone) ?? undefined)
         : undefined,
+      // Passed on every real path, so a schedule variable is answered rather than left literal. The
+      // playground's time simulation reaches it through `now` above: an operator testing "what does
+      // it say at 22:00" sees the agent report itself closed, exactly as the gate would.
+      availability: { schedule },
     },
   );
   // NOTE: The current values of the attribute keys the operator selected, rendered as an XML block
@@ -611,6 +655,7 @@ export async function loadAgentConfig(
     timezone,
     maxToolCalls: limits.maxToolCalls,
     maxHistoryTokens: limits.maxHistoryTokens,
+    memoryCompaction: readMemoryConfig(effSettings).compaction.enabled,
     logToolValues: readObservabilityConfig(effSettings).logToolValues,
   };
 }
@@ -705,23 +750,11 @@ export async function buildToolset(
 ): Promise<StructuredToolInterface[]> {
   const resolveCredential = (ref: string) =>
     resolveInjectableCredential(ctx.base, ctx.tenantId, ref);
-  // Resolves an integration's chosen BusinessHours by id → windows + timezone (scoped read; RLS fences
-  // it to this tenant, so a stale/other-tenant id yields null ⇒ the Calendar availability tool treats
-  // the schedule as "always on"). Mirrors resolveCredential's bound-closure shape.
-  const resolveBusinessHours = async (
-    id: string,
-  ): Promise<{ windows: WindowSpec[]; timezone: string } | null> => {
-    const bhId = /^\d+$/.test(id) ? BigInt(id) : null;
-    if (bhId === null) return null;
-    const row = await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
-      db.businessHours.findUnique({
-        where: { id: bhId },
-        select: { windows: true, timezone: true },
-      }),
-    );
-    if (!row) return null;
-    return { windows: parseWindows(row.windows), timezone: row.timezone };
-  };
+  // Resolves an integration's chosen BusinessHours by id → the whole schedule (scoped read; RLS
+  // fences it to this tenant, so a stale/other-tenant id yields null ⇒ the Calendar availability tool
+  // treats the schedule as "always on"). Mirrors resolveCredential's bound-closure shape.
+  const resolveBusinessHours = (id: string): Promise<Schedule | null> =>
+    readSchedule(sysCtx(ctx.tenantId), id, ctx.base);
   const flow = deps.flow;
   // NOTE: A side effect that fails INSIDE a tool that still returns success is invisible in the
   // tool's own flowlog line (the tool legitimately succeeded for the model). This binding lets toolpacks and
@@ -1037,6 +1070,11 @@ export interface CallbacksArgs {
   // turn itself; a secondary call on a separately-configured model (the speech normalizer) must pass
   // the model it actually billed, or the row attributes that spend to the wrong model.
   model?: string;
+  // The conversation to ATTRIBUTE the usage row and the trace to. Defaults to the one the config was
+  // loaded for, which is right for a turn; memory compaction is the exception, because a claimed job
+  // can find the thread already past the conversation its payload named, and the summary it bills is
+  // of the segment it actually cut.
+  conversationId?: bigint | null;
   // Passed through to the Langfuse handler: false for a secondary call sharing the turn's trace.
   // See TraceContext.updateRoot.
   updateRoot?: boolean;
@@ -1049,6 +1087,20 @@ export interface CallbacksArgs {
   tools?: StructuredToolInterface[];
 }
 
+// `??` was wrong here, and the case it got wrong is the one the override exists for: compaction
+// passes an explicit null when the segment it summarized belongs to a conversation whose mirrored row
+// is gone (an owed backlog, a conversation deleted since). Coalescing that back to the config's own
+// conversation charges the generation to an unrelated attendance — louder than the bug the override
+// was added to fix. Omitted and explicitly-null are different answers, so they are read differently.
+function resolveUsageConversation(
+  cfg: AgentConfig,
+  args: CallbacksArgs,
+): bigint | null {
+  return args.conversationId !== undefined
+    ? args.conversationId
+    : cfg.conversationDbId;
+}
+
 export function buildCallbacks(
   cfg: AgentConfig,
   args: CallbacksArgs,
@@ -1056,7 +1108,7 @@ export function buildCallbacks(
   const usage = new UsageCapture({
     tenantId: args.tenantId,
     agentId: cfg.agentId,
-    conversationId: cfg.conversationDbId,
+    conversationId: resolveUsageConversation(cfg, args),
     inboxId: cfg.inboxDbId,
     threadId: args.threadId,
     model: args.model ?? cfg.mc.model,
@@ -1069,7 +1121,7 @@ export function buildCallbacks(
   const langfuse = buildLangfuseHandler(cfg.langfuseCfg, {
     tenantId: args.tenantId,
     threadId: args.threadId,
-    conversationId: cfg.conversationDbId,
+    conversationId: resolveUsageConversation(cfg, args),
     agentId: cfg.agentId,
     userId: cfg.langfuseCfg?.tenantSlug,
     turnId: args.turnId,

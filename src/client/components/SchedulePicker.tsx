@@ -2,20 +2,22 @@ import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronDown, Pencil, Plus } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { BusinessHoursForm } from "@/client/components/BusinessHoursForm";
+import {
+  BusinessHoursForm,
+  type ScheduleException,
+} from "@/client/components/BusinessHoursForm";
 import { Button } from "@/client/components/Button";
 import { Modal, useModalController } from "@/client/components/Modal";
-import {
-  formatWindowsSummary,
-  type WindowSpec,
-} from "@/client/lib/schedulePreview";
 import { formatTimezoneLabel } from "@/client/lib/timezones";
 import { cn } from "@/client/lib/utils";
+import { formatWindowsSummary } from "@/modules/business-hours/announce";
+import type { WindowSpec } from "@/modules/business-hours/hours";
 
 export type ScheduleOption = {
   id: string;
   name: string;
   windows: WindowSpec[];
+  exceptions: ScheduleException[];
   timezone: string;
 };
 
@@ -35,9 +37,11 @@ type Props = {
 
 function ScheduleSummary({
   windows,
+  exceptions,
   timezone,
 }: {
   windows: WindowSpec[];
+  exceptions: ScheduleException[];
   timezone: string;
 }) {
   const { t, i18n } = useTranslation();
@@ -46,9 +50,15 @@ function ScheduleSummary({
     t("schedule.noWindows", "No windows"),
     i18n.language,
   );
+  // The count, not the dates: the summary line is one truncated row, and what the operator needs from
+  // it is whether this schedule has a second dimension at all before opening the editor.
+  const extra =
+    exceptions.length > 0
+      ? ` · ${t("schedule.exceptionCount", "{{count}} exception", { count: exceptions.length })}`
+      : "";
   return (
     <span className="truncate">
-      {`${summary} · ${formatTimezoneLabel(timezone)}`}
+      {`${summary} · ${formatTimezoneLabel(timezone)}${extra}`}
     </span>
   );
 }
@@ -91,6 +101,7 @@ export function SchedulePicker({
                 {selected ? (
                   <ScheduleSummary
                     windows={selected.windows}
+                    exceptions={selected.exceptions}
                     timezone={selected.timezone}
                   />
                 ) : (
@@ -147,6 +158,7 @@ export function SchedulePicker({
                   <span className="truncate text-text-muted text-xs">
                     <ScheduleSummary
                       windows={s.windows}
+                      exceptions={s.exceptions}
                       timezone={s.timezone}
                     />
                   </span>
@@ -215,6 +227,7 @@ export function SchedulePicker({
                   name: selected.name,
                   timezone: selected.timezone,
                   windows: selected.windows,
+                  exceptions: selected.exceptions,
                 }
               : undefined
           }
