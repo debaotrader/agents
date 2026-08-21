@@ -687,11 +687,13 @@ export async function runLoadedTurn(
       }
       return { ours, voiceReply };
     });
-    // A handoff WE completed this turn also reads as "not ours" here, and it is not a takeover: the
-    // row left `pending` because the tool put it there. Bailing on it would make everything below
-    // depend on Chatwoot's event losing a race — an image the model queued and the tool already
-    // promised the customer would arrive only while the mirror happened to lag.
-    if (!recheck.ours && !handoffState.completed) {
+    // NOTE: A handoff we completed this turn reads as "not ours" here too, and the mirror records
+    // no reason for a status change, so there is nothing to tell our own transition apart from a
+    // human who grabbed the conversation in the same window. This gate exists for the second one,
+    // so it keeps failing closed for both: past this point the bot posts nothing, and an image the
+    // model queued before handing off is delivered only while Chatwoot's event is still in flight.
+    // Widening it on `handoffState.completed` would hand a genuine takeover back to the bot.
+    if (!recheck.ours) {
       emitFlowEvent(flow, {
         stage: "handoff",
         status: "ok",

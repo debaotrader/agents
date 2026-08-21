@@ -960,10 +960,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // The premise of the duplicate is a mirror that lags. When it does NOT lag, the recheck below
-  // reads the row the tool just opened and would call our own handoff a human takeover, dropping
-  // the attachment the closing line promised. Delivery cannot depend on which side wins that race.
-  test("a handoff delivers its queued image even when the mirror already caught up", async () => {
+  // The bound on the case above, pinned so it is a decision and not a surprise: once the mirror
+  // reflects the status the tool set, the takeover gate ends the turn and the queued image does not
+  // go out. The gate cannot tell our own transition from a human grabbing the conversation in the
+  // same window, and it fails closed for the one that matters.
+  test("a handoff stops at the takeover gate once the mirror reflects it", async () => {
     await allowImageHost();
     await seedConversation(9988, null);
     const calls: Array<[string, number, string]> = [];
@@ -1003,11 +1004,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         imageDeps,
       },
     });
-    expect(outcome).toBe("posted");
+    expect(outcome).toBe("taken-over");
     expect(calls).toEqual([
       ["sendMessage", 9988, "Segue a foto. Vou te passar para um humano."],
       ["toggleStatus", 9988, "open"],
-      ["sendFileAttachment", 9988, "imagem.png"],
     ]);
   });
 
