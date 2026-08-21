@@ -43,7 +43,7 @@ import {
 } from "./prepare";
 import type { RuntimeDeps } from "./runtime";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
-import { buildNativeTools } from "./tools/native";
+import { buildNativeTools, handoffAnsweredTheTurn } from "./tools/native";
 
 // agentNudge consumption: an inbound domain event (correlated to a conversation thread) is
 // injected into that thread as a NORMALIZED system turn (never the raw external JSON — injection
@@ -442,7 +442,7 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
 
-  const handoffState = { customerMessageSent: false };
+  const handoffState = { customerMessageSent: false, completed: false };
   const tools = await buildToolset(
     cfg,
     {
@@ -653,13 +653,6 @@ export async function runAgentNudge(
   } finally {
     if (claimedGraphThread) clearTurnInFlight(graphThreadId);
   }
-  // handoff_to_human already delivered customerMessage. That delivery is the proactive message;
-  // never let a lagging mirror turn the model's final text into a second customer-facing post, and
-  // do not apply follow-up labels/resolve after the conversation was handed to a human.
-  if (handoffState.customerMessageSent) {
-    markFollowUp("messaged");
-    return "messaged";
-  }
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
   const replyRaw = lastAssistantText(result.messages);
@@ -744,8 +737,11 @@ export async function runAgentNudge(
 
   // Agent stayed silent: no message, but the deterministic actions still fire (covers "no reply on
   // the final follow-up: label + resolve").
+  const handedOff = handoffAnsweredTheTurn(handoffState);
   if (silent || !reply) {
-    await applyPostActions();
+    // A conversation the human queue now owns is not ours to close, even on the branch where the
+    // agent said nothing.
+    await applyPostActions({ allowResolve: !handedOff });
     return "silent";
   }
 
@@ -761,6 +757,21 @@ export async function runAgentNudge(
       { channelType: loaded.channelType, provider: loaded.provider },
     );
     if (mode === "freeform") {
+      // The handoff already answered, so this text is the second copy. Deliberately INSIDE the
+      // freeform branch: outside the 24h window the tool's own send is the one the provider
+      // refuses, so the operator still needs the note and the label the branches below leave, and
+      // a turn that returned earlier would leave a fenced handoff with no trace anywhere.
+      if (handedOff) {
+        logger.info(
+          "agentNudge handed off: conv=%s source=%s",
+          String(conversationId),
+          params.nudge.source,
+        );
+        markFollowUp("messaged");
+        // The label is how the operator triages what the bot left behind; the resolve is not ours.
+        await applyPostActions({ allowResolve: false });
+        return "messaged";
+      }
       await client.sendMessage(conversationId, reply);
       logger.info(
         "agentNudge messaged: conv=%s source=%s",

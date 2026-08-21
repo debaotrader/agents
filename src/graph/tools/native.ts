@@ -84,7 +84,26 @@ export interface TurnState {
 // Isolated from TurnState on purpose: reactive turns and proactive nudges share handoff delivery,
 // while resolve/image post-actions have different semantics on those two paths.
 export interface HandoffTurnState {
+  // The closing line reached the customer (best-effort send, so it can be false on a live handoff).
   customerMessageSent: boolean;
+  // The conversation left `pending`, so the human queue owns it and the bot is done talking.
+  completed: boolean;
+}
+
+// Whether the handoff already said everything this turn had to say, which is the ONE question both
+// runtimes ask. Two bits and not one, because the tool's first step is not the caller's question:
+// only a handoff that both gave the customer a closing line AND completed makes the model's final
+// text a second copy of something already read.
+//
+// A transfer that threw halfway answers false, and has to. sendPrivateNote and toggleStatus are not
+// best-effort, so either can throw after the customer was already told a human is coming; the
+// conversation then stays `pending`, i.e. still the bot's and queued to nobody, and the model gets
+// the tool error plus one more step. That recovery reply is the only thing standing between the
+// customer and a promise nobody is going to keep.
+export function handoffAnsweredTheTurn(
+  state: HandoffTurnState | undefined,
+): boolean {
+  return !!state && state.customerMessageSent && state.completed;
 }
 
 export interface PendingImage {
@@ -261,6 +280,10 @@ function handoffTool(ctx: ToolCtx) {
       // Set status `open` → the conversation leaves `pending`, so the attribution gate stops the
       // bot and the human queue picks it up.
       await ctx.client.toggleStatus(ctx.conversationId, "open");
+      // Only here: everything above can throw, and a handoff that did not reach this line has not
+      // happened. The optional assignment below is best-effort by design — the conversation is
+      // already out of `pending`, so a routing miss does not put it back.
+      if (ctx.handoffState) ctx.handoffState.completed = true;
 
       // Optional targeting (best-effort: the handoff already happened, so an assignment failure must
       // not break the turn). In `route` mode nothing is assigned (Chatwoot routes).

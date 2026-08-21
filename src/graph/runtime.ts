@@ -64,7 +64,11 @@ import { AgentStatusReporter } from "./status";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "./thread-state";
 import { ToolFlowLogger } from "./tool-flowlog";
 import type { McpLoadDeps } from "./tools/mcp";
-import { buildNativeTools, type TurnState } from "./tools/native";
+import {
+  buildNativeTools,
+  handoffAnsweredTheTurn,
+  type TurnState,
+} from "./tools/native";
 import type { UsagePersist } from "./usage";
 
 // The agent runtime: an incoming Chatwoot message (gate=act) → resolve the inbox's Agent config
@@ -268,7 +272,7 @@ export async function runLoadedTurn(
     imagesInFlight: 0,
     imagesSeq: 0,
   };
-  const handoffState = { customerMessageSent: false };
+  const handoffState = { customerMessageSent: false, completed: false };
   const tools = await buildToolset(
     loaded,
     {
@@ -628,14 +632,21 @@ export async function runLoadedTurn(
     );
     let reply = lastAssistantText(result.messages).trim();
 
-    // handoff_to_human already sent customerMessage from inside the tool. Treat that successful
-    // delivery as terminal even while Chatwoot's open/assignee event is still in flight: otherwise
-    // the mirror recheck can read the old bot-owned row and post this final text as a duplicate.
-    if (handoffState.customerMessageSent) {
-      turnState.pendingImages.length = 0;
-      turnState.resolveRequested = false;
+    // The handoff already answered, so this final text would be a second copy of a line the
+    // customer has read — and the mirror recheck below cannot catch it, because Chatwoot's
+    // open/assignee event may still be in flight and the row still reads bot-owned.
+    //
+    // Blanked rather than returned early, so every gate after this point still applies. An image
+    // queued earlier in the same turn is not a duplicate of anything and still belongs to the
+    // customer, and its caption is model-written customer-facing text the output guardrail screens.
+    // An early return would deliver that image unscreened, or not at all.
+    const handedOff = handoffAnsweredTheTurn(handoffState);
+    if (handedOff) {
+      reply = "";
+      // The tool posted exactly one balloon, on every exit reachable from here.
       deliveredBalloons = 1;
-      return "posted";
+      // A conversation the human queue now owns is not ours to close.
+      turnState.resolveRequested = false;
     }
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during
@@ -727,13 +738,16 @@ export async function runLoadedTurn(
       // not a silent one: returning "empty" here would let the deferred resolve close a conversation
       // nobody answered, and the callers only record a turn error (private note, lastError, alert)
       // when the turn THROWS. Best-effort per image still holds where a reply carries the turn.
-      if (queued > 0 && !sent) {
+      // NOTE: ...unless a handoff already answered. Then the images were NOT the turn, and a throw
+      // would record a turn error (private note, lastError, alert) on a conversation that was both
+      // answered and correctly handed to a human.
+      if (queued > 0 && !sent && !handedOff) {
         throw new Error(
           "send_image: nenhuma imagem foi entregue e o turno não tinha resposta em texto",
         );
       }
       await applyDeferredResolve(client, conversationId, turnState, flow);
-      return sent ? "posted" : "empty";
+      return sent || handedOff ? "posted" : "empty";
     }
 
     // The image lands before the text that talks about it, and before the TTS branch: an audio

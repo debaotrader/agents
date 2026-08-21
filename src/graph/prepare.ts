@@ -692,7 +692,9 @@ export interface ToolsetCtx {
     imagesInFlight: number;
     imagesSeq: number;
   };
-  handoffState?: { customerMessageSent: boolean };
+  // Structural mirror of HandoffTurnState in tools/native.ts, for the same reason as turnState.
+  // Two bits, not one: the closing line reached the customer, and the transfer itself completed.
+  handoffState?: { customerMessageSent: boolean; completed: boolean };
 }
 
 export interface ToolBuildDeps {
@@ -714,7 +716,7 @@ export interface ToolBuildDeps {
         imagesInFlight: number;
         imagesSeq: number;
       };
-      handoffState?: { customerMessageSent: boolean };
+      handoffState?: { customerMessageSent: boolean; completed: boolean };
       transferWithSummary?: boolean;
       handoff?: HandoffConfig;
       handoffTargets?: HandoffTargets;

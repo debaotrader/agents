@@ -167,6 +167,52 @@ export class SendImageThenReplyModel {
   }
 }
 
+// Queues an image and only then hands off. The image is not a duplicate of the handoff's closing
+// line, so it still belongs to the customer: this is the shape that tells a suppressed duplicate
+// apart from a dropped attachment.
+export class SendImageThenHandoffModel {
+  constructor(
+    private url: string,
+    private customerMessage: string,
+    private caption?: string,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage("");
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 1)
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "send_image",
+                args: { url: self.url, caption: self.caption },
+                id: "call_send_image",
+              },
+            ],
+          });
+        if (n === 2)
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "handoff_to_human",
+                args: { customerMessage: self.customerMessage },
+                id: "call_handoff",
+              },
+            ],
+          });
+        return new AIMessage("");
+      },
+    };
+  }
+}
+
 // Sends an image and then ends the turn with NO final text — the skip_reply shape, where the caption
 // is the only thing the customer reads.
 export class SendImageOnlyModel extends SendImageThenReplyModel {
