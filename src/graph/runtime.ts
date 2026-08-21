@@ -640,13 +640,15 @@ export async function runLoadedTurn(
     // queued earlier in the same turn is not a duplicate of anything and still belongs to the
     // customer, and its caption is model-written customer-facing text the output guardrail screens.
     // An early return would deliver that image unscreened, or not at all.
+    // Dropped on the TRANSFER, not on the suppression: a conversation the human queue now owns is
+    // not ours to close, and that holds even when the closing line failed to send. The two questions
+    // have different answers exactly there.
+    if (handoffState.completed) turnState.resolveRequested = false;
     const handedOff = handoffAnsweredTheTurn(handoffState);
     if (handedOff) {
       reply = "";
       // The tool posted exactly one balloon, on every exit reachable from here.
       deliveredBalloons = 1;
-      // A conversation the human queue now owns is not ours to close.
-      turnState.resolveRequested = false;
     }
 
     // Re-check the live assignee (mirror) before posting: a human may have taken over during
@@ -685,7 +687,11 @@ export async function runLoadedTurn(
       }
       return { ours, voiceReply };
     });
-    if (!recheck.ours) {
+    // A handoff WE completed this turn also reads as "not ours" here, and it is not a takeover: the
+    // row left `pending` because the tool put it there. Bailing on it would make everything below
+    // depend on Chatwoot's event losing a race — an image the model queued and the tool already
+    // promised the customer would arrive only while the mirror happened to lag.
+    if (!recheck.ours && !handoffState.completed) {
       emitFlowEvent(flow, {
         stage: "handoff",
         status: "ok",

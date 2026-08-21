@@ -739,9 +739,9 @@ export async function runAgentNudge(
   // the final follow-up: label + resolve").
   const handedOff = handoffAnsweredTheTurn(handoffState);
   if (silent || !reply) {
-    // A conversation the human queue now owns is not ours to close, even on the branch where the
-    // agent said nothing.
-    await applyPostActions({ allowResolve: !handedOff });
+    // Keyed on the TRANSFER, not on the suppression: a conversation the human queue now owns is not
+    // ours to close, even when the closing line never made it out.
+    await applyPostActions({ allowResolve: !handoffState.completed });
     return "silent";
   }
 

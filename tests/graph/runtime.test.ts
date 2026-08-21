@@ -882,6 +882,135 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
+  // The deferred resolve falls with the TRANSFER, not with the suppression of the final text. The
+  // two come apart exactly when the closing line fails to send: the customer never heard it, so the
+  // model's reply still has to go out, but the conversation is already a human's and resolving it
+  // would close an open request out from under them.
+  test("a handoff never lets the deferred resolve close the conversation", async () => {
+    await seedConversation(9977, null);
+    const calls: Array<[string, number, string]> = [];
+    let sends = 0;
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        // Only the tool's closing line fails; the fallback reply below must still be deliverable.
+        if (sends++ === 0) {
+          calls.push(["sendMessage-THREW", c, t]);
+          throw new Error("chatwoot 500");
+        }
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    class ResolveThenHandoffModel {
+      async invoke() {
+        return new AIMessage("Já resolvo para você.");
+      }
+      bindTools(_t: unknown) {
+        let n = 0;
+        return {
+          async invoke() {
+            n++;
+            if (n === 1)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  { name: "resolve_conversation", args: {}, id: "c1" },
+                ],
+              });
+            if (n === 2)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "handoff_to_human",
+                    args: { customerMessage: "Um humano já te atende." },
+                    id: "c2",
+                  },
+                ],
+              });
+            return new AIMessage("Já resolvo para você.");
+          },
+        };
+      }
+    }
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9977 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenHandoffModel() as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    // The only toggleStatus is the handoff's `open`. A "resolved" here would be the deferred intent
+    // closing a conversation the human queue had just been handed.
+    expect(calls).toEqual([
+      ["sendMessage-THREW", 9977, "Um humano já te atende."],
+      ["toggleStatus", 9977, "open"],
+      ["sendMessage", 9977, "Já resolvo para você."],
+    ]);
+  });
+
+  // The premise of the duplicate is a mirror that lags. When it does NOT lag, the recheck below
+  // reads the row the tool just opened and would call our own handoff a human takeover, dropping
+  // the attachment the closing line promised. Delivery cannot depend on which side wins that race.
+  test("a handoff delivers its queued image even when the mirror already caught up", async () => {
+    await allowImageHost();
+    await seedConversation(9988, null);
+    const calls: Array<[string, number, string]> = [];
+    const base = makeImageClient(calls);
+    const client = await base();
+    const mirrored = {
+      ...client,
+      // The webhook lands DURING generation: by the recheck the row is no longer bot-owned.
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        await suDb.conversation.updateMany({
+          where: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: c,
+          },
+          data: { status },
+        });
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9988 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: async () => mirrored,
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 9988, "Segue a foto. Vou te passar para um humano."],
+      ["toggleStatus", 9988, "open"],
+      ["sendFileAttachment", 9988, "imagem.png"],
+    ]);
+  });
+
   // An image-only turn that delivers nothing throws, because the images WERE the turn and a silent
   // failure would let the deferred resolve close a conversation nobody answered. After a handoff
   // that rule does not hold: the closing line answered the customer and a human owns the thread, so

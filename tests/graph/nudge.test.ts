@@ -750,6 +750,55 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
   // the one the provider refuses, so suppressing the follow-up's own output here would leave a
   // fenced handoff with no trace anywhere: no customer message, no note, no label. The suppression
   // belongs strictly to the branch where a free-form send would actually have happened.
+  // An inactivity follow-up runs with requireLiveBotOwnership (followups/handlers.ts), so the check
+  // before delivery is a live GET, not the mirror — and the tool's toggleStatus already reached
+  // Chatwoot, so that GET reports the conversation as no longer the bot's. `stale` is the right
+  // word for it: the episode is moot because the conversation left the bot, and the caller ends the
+  // ladder with no watermark and no next step. What must NOT happen is the shortcut answering
+  // before the probe: that reports `messaged`, which stamps the watermark and schedules another
+  // step against a conversation a human just took.
+  test("an inactivity follow-up that hands off ends the episode instead of stamping it", async () => {
+    await seedConv(9907, null);
+    const s = stub();
+    let liveStatus = "pending";
+    const client = {
+      ...(await s.makeClient()),
+      getConversation: async (c: number) => ({
+        id: c,
+        status: liveStatus,
+        meta: {},
+      }),
+      toggleStatus: async (c: number, status: string) => {
+        liveStatus = status;
+        s.resolved.push(c);
+        s.order.push("resolve");
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9907`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      requireLiveBotOwnership: true,
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            "Vou te encaminhar para o time!",
+            "Um humano vai te atender.",
+          ) as never,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("stale");
+    // Only the tool's closing line: the model's final text is never a second customer-facing post.
+    expect(s.messages).toEqual([[9907, "Um humano vai te atender."]]);
+    expect(s.notes).toEqual([]);
+  });
+
   // The model can hand off and then say nothing of its own, which lands on the silent branch. The
   // label still applies there; the resolve must not, or the follow-up closes a conversation it just
   // handed to a human.
