@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { failableTool, toolFailure } from "@/graph/tools/failure";
+import type { TurnControl } from "@/graph/turn-control";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
@@ -69,6 +70,9 @@ function sysCtx(tenantId: bigint): TenantContext {
 // immediate toggle makes the post-generation recheck read the mirrored "resolved" as a human
 // takeover and discard the reply — and the reply would reopen the conversation anyway).
 export interface TurnState {
+  // Shared terminal state for the whole reactive turn. Optional only for nudge/playground and
+  // hand-built unit-test contexts that do not own a reactive runtime turn.
+  control?: TurnControl;
   resolveRequested: boolean;
   // Images the agent asked to send this turn, fetched and validated but NOT yet delivered. They ride
   // the same post-time pipeline as the reply (ownership recheck, supersede gate, output guardrail),
@@ -1066,9 +1070,10 @@ function reactToMessageTool(ctx: ToolCtx) {
 // Deliberately produce NO reply this turn. The agent calls this, then ends without any customer-facing
 // text, so the runtime posts nothing (it already skips an empty reply). The call is recorded in the
 // conversation timeline (via the tool flow log) as a "decided not to respond" marker.
-function skipReplyTool(_ctx: ToolCtx) {
+function skipReplyTool(ctx: ToolCtx) {
   return tool(
     async ({ reason }: { reason?: string }) => {
+      ctx.turnState?.control?.terminate("skip_reply");
       return reason
         ? `Acknowledged: not replying this turn (${reason}). Produce no message now.`
         : "Acknowledged: not replying this turn. Produce no message now.";

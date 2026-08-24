@@ -82,6 +82,13 @@ import {
   handoffAnsweredTheTurn,
   type TurnState,
 } from "./tools/native";
+import {
+  guardChatwootClient,
+  isTurnTerminatedError,
+  registerTurn,
+  releaseTurn,
+  type TurnControl,
+} from "./turn-control";
 import type { UsagePersist } from "./usage";
 
 // The agent runtime: an incoming Chatwoot message (gate=act) → resolve the inbox's Agent config
@@ -105,7 +112,8 @@ export type RunAgentTurnOutcome =
   | "empty"
   | "taken-over"
   | "superseded"
-  | "blocked";
+  | "blocked"
+  | "cancelled";
 
 export interface RuntimeDeps {
   makeModel?: (cfg: ResolvedModelConfig) => BaseChatModel;
@@ -292,6 +300,19 @@ async function deliverPendingImages(
 export async function runLoadedTurn(
   params: RunLoadedTurnParams,
 ): Promise<RunAgentTurnOutcome> {
+  const control = registerTurn(params.threadId, params.messageId);
+  try {
+    if (control.reason === "human_intervention") return "cancelled";
+    return await runControlledTurn(params, control);
+  } finally {
+    releaseTurn(params.threadId, control);
+  }
+}
+
+async function runControlledTurn(
+  params: RunLoadedTurnParams,
+  control: TurnControl,
+): Promise<RunAgentTurnOutcome> {
   // Applied HERE, before anything reads the config, so the prompt the model is built on, the one
   // the output guardrail judges adherence against, and the one the audited row records are the same
   // prompt. Appending it later, at the graph build, would leave the other two describing a turn
@@ -316,13 +337,15 @@ export async function runLoadedTurn(
 
   // Load the client + tools (network, outside the tx). The bot token is the PERSONA's, so replies are
   // attributed to this persona's Agent Bot in Chatwoot.
-  const client = await loadChatwootClient(tenantId, instanceId, {
+  const rawClient = await loadChatwootClient(tenantId, instanceId, {
     base,
     makeClient: params.deps?.makeClient,
     botToken: loaded.agentBotToken ?? undefined,
   });
+  const client = guardChatwootClient(rawClient, control);
   // Per-turn mutable state shared with the native tools (deferred resolve intent).
   const turnState: TurnState = {
+    control,
     resolveRequested: false,
     pendingImages: [],
     imagesInFlight: 0,
@@ -562,6 +585,7 @@ export async function runLoadedTurn(
   };
 
   const deliverHandoffPromise = async (): Promise<void> => {
+    if (control.reason !== null) return;
     if (!handoffAnsweredTheTurn(handoffState)) return;
     const line = handoffState.customerMessage;
     try {
@@ -832,12 +856,19 @@ export async function runLoadedTurn(
           {
             configurable: { thread_id: graphThreadId },
             callbacks: [...callbacks, status, toolLogger],
+            signal: control.signal,
           },
         ),
     ).catch(async (e) => {
       await deliverHandoffPromise();
       throw e;
     });
+    if (control.reason === "skip_reply") {
+      turnState.pendingImages.length = 0;
+      turnState.resolveRequested = false;
+      return "empty";
+    }
+    if (control.reason === "human_intervention") return "cancelled";
     let reply = lastAssistantText(result.messages).trim();
 
     // The deferred resolve falls with the TRANSFER, not with the suppression of the final text: a
@@ -992,6 +1023,14 @@ export async function runLoadedTurn(
       observed: recheck.observed,
     });
     return "posted";
+  } catch (e) {
+    if (control.reason === "human_intervention") return "cancelled";
+    if (control.reason === "skip_reply" || isTurnTerminatedError(e)) {
+      turnState.pendingImages.length = 0;
+      turnState.resolveRequested = false;
+      return "empty";
+    }
+    throw e;
   } finally {
     clearTurnInFlight(threadId);
     // Only what this turn actually took: releasing a claim we never made would release a CONCURRENT

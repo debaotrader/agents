@@ -10,6 +10,7 @@ import {
   firstAudioAttachment,
   firstLocationAttachment,
   isHumanAgentMessage,
+  isHumanIntervention,
   isIncomingMessage,
   isNewHumanAgentMessage,
   isNewIncomingMessage,
@@ -482,6 +483,52 @@ describe("isNewHumanAgentMessage (issue #187)", () => {
   test("false when the payload carries no sender", () => {
     const n = message({ sender: null });
     expect(n && isNewHumanAgentMessage(n)).toBe(false);
+  });
+});
+
+describe("isHumanIntervention", () => {
+  const event = (over: Record<string, unknown>) =>
+    normalizeChatwootEvent({
+      event: "message_created",
+      id: 2001,
+      content: "",
+      message_type: "outgoing",
+      private: false,
+      sender: { id: 5, name: "Ana", type: "user" },
+      conversation: { id: 42, inbox_id: 7, status: "pending" },
+      ...over,
+    });
+
+  test.each(["audio", "image", "file", "sticker"])(
+    "a human %s attachment cancels even with empty text",
+    (fileType) => {
+      const n = event({
+        attachments: [
+          { id: 9, file_type: fileType, data_url: `https://x/${fileType}` },
+        ],
+      });
+      expect(n && isHumanIntervention(n)).toBe(true);
+    },
+  );
+
+  test("plain text and reactions cancel; private notes, edits and bot messages do not", () => {
+    const intervention = (over: Record<string, unknown>) => {
+      const normalized = event(over);
+      if (!normalized) throw new Error("fixture did not normalize");
+      return isHumanIntervention(normalized);
+    };
+    expect(intervention({ content: "eu respondo" })).toBe(true);
+    expect(
+      intervention({
+        content: "👍",
+        content_attributes: { is_reaction: true },
+      }),
+    ).toBe(true);
+    expect(intervention({ private: true })).toBe(false);
+    expect(intervention({ event: "message_updated" })).toBe(false);
+    expect(
+      intervention({ sender: { id: 9, name: "Bot", type: "agent_bot" } }),
+    ).toBe(false);
   });
 });
 

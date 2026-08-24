@@ -16,6 +16,7 @@ import {
 import type { IngestRole } from "@/graph/ingest";
 import { armIngest } from "@/graph/ingest-job";
 import { type RuntimeDeps, runAgentTurn } from "@/graph/runtime";
+import { cancelConversationTurns } from "@/graph/turn-control";
 import { AppError, UnauthorizedError } from "@/lib/errors";
 import { withEntityLock } from "@/lib/locks";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
@@ -64,7 +65,11 @@ import {
   announceFailedTurn,
   readDirectFence,
 } from "@/modules/conversations/failure-note";
-import { armDebounce, resolveDebounceConfig } from "@/modules/debounce/service";
+import {
+  armDebounce,
+  debounceDedupeKey,
+  resolveDebounceConfig,
+} from "@/modules/debounce/service";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import { armCompaction } from "@/modules/memory/compact";
@@ -96,6 +101,7 @@ import {
   firstAudioAttachment,
   firstLocationAttachment,
   firstVisualAttachment,
+  isHumanIntervention,
   isIncomingMessage,
   isNewHumanAgentMessage,
   isNewIncomingMessage,
@@ -1629,6 +1635,32 @@ export async function processChatwootDelivery(
   if (claimed.count === 0) return "skipped";
 
   const n = params.normalized;
+
+  // A public human reply owns the turn immediately, regardless of content. Cancel both a live
+  // in-process generation and a not-yet-claimed debounce flush before doing slower mirror/media
+  // work. Attachment-only messages, stickers, reactions and empty text deliberately reach here.
+  if (n.conversationId !== null && isHumanIntervention(n)) {
+    const threadId = chatwootThreadId(
+      params.tenantId,
+      params.instanceId,
+      n.conversationId,
+    );
+    cancelConversationTurns(threadId, n.message?.id ?? undefined);
+    try {
+      await cancelPendingJob(
+        params.tenantId,
+        "DEBOUNCE",
+        debounceDedupeKey(threadId),
+        base,
+      );
+    } catch (err) {
+      logger.warn(
+        "chatwoot: human intervention debounce cancel failed (conv=%s): %s",
+        String(n.conversationId),
+        errMsg(err),
+      );
+    }
+  }
 
   // Only message_created drives commands, debounce and the agent turn. A message_updated can still
   // carry an audio attachment that was absent at creation time; it is eligible for STT only.

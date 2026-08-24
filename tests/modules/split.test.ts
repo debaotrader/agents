@@ -91,18 +91,19 @@ describe("deliverReply", () => {
     expect(rec.typing).toEqual([]);
   });
 
-  test("enabled → one send per balloon, with typing toggles", async () => {
+  test("enabled preserves the complete reply byte-for-byte in one public message", async () => {
     const rec = { sent: [] as string[], typing: [] as boolean[] };
+    const canonical =
+      "Antes de fazer qualquer coisa ja clica no link abaixo.\n\nLINK DA COMUNIDADE:\nhttps://chat.whatsapp.com/GCNh1iuxl9c87vFMbhEqjV";
     const n = await deliverReply(
       stub(rec),
       1,
-      "Olá!\n\nComo vai?",
+      canonical,
       { ...SPLIT_DEFAULTS, enabled: true },
       noSleep,
     );
-    expect(n).toBe(2);
-    expect(rec.sent).toEqual(["Olá!", "Como vai?"]);
-    // typing on before each balloon + a final off
-    expect(rec.typing).toEqual([true, true, false]);
+    expect(n).toBe(1);
+    expect(rec.sent).toEqual([canonical]);
+    expect(rec.typing).toEqual([true, false]);
   });
 });

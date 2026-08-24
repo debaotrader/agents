@@ -6,7 +6,9 @@ import {
   type HandoffTurnState,
   handoffAnsweredTheTurn,
   NATIVE_TOOL_NAMES,
+  type TurnState,
 } from "@/graph/tools/native";
+import { TurnControl } from "@/graph/turn-control";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 
 function recordingClient() {
@@ -47,6 +49,23 @@ describe("native tools", () => {
       "private_note",
     ]);
     expect(only.map((t) => t.name)).toEqual(["private_note"]);
+  });
+
+  test("skip_reply makes the shared turn terminal", async () => {
+    const { client } = recordingClient();
+    const control = new TurnControl();
+    const turnState: TurnState = {
+      control,
+      resolveRequested: false,
+      pendingImages: [],
+      imagesInFlight: 0,
+      imagesSeq: 0,
+    };
+    const tools = buildNativeTools({ client, conversationId: 42, turnState });
+
+    await byName(tools, "skip_reply").invoke({ reason: "já atendido" });
+
+    expect(control.reason).toBe("skip_reply");
   });
 
   test("react_to_message reacts to the customer's last message when it is not a reaction", async () => {

@@ -287,6 +287,19 @@ export function isNewHumanAgentMessage(e: NormalizedChatwootEvent): boolean {
   return e.event === "message_created" && isHumanAgentMessage(e);
 }
 
+// Any new public message authored by a human agent takes ownership of the conversation turn. This
+// predicate is intentionally broader than the memory-ingestion predicate above: an attachment-only
+// message, empty text, sticker or reaction must cancel the bot even when it contributes no useful
+// transcript text. Private notes and edits do not represent a new customer-facing intervention.
+export function isHumanIntervention(e: NormalizedChatwootEvent): boolean {
+  return (
+    e.event === "message_created" &&
+    e.message?.messageType === "outgoing" &&
+    e.message.private !== true &&
+    e.message.sender?.type === "user"
+  );
+}
+
 // The control commands an operator types into the conversation to drive the agent (matched on the
 // trimmed, case-insensitive text content — text-only by design). `/teste` activates a test agent for
 // THIS conversation; `/reset` clears its memory/state. Both are handled by the webhook gate.

@@ -38,6 +38,7 @@ import {
   SendImageThenHandoffModel,
   SendImageThenReplyModel,
   SetVoiceThenHandoffModel,
+  SkipThenReplyModel,
 } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -1664,6 +1665,28 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(outcome).toBe("empty");
     expect(calls).toEqual([["toggleStatus", 912, "resolved"]]);
+  });
+
+  test("skip_reply is terminal even when the model writes a final reply afterwards", async () => {
+    await seedConversation(913, null);
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 913 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SkipThenReplyModel(
+            "Esta mensagem jamais pode chegar ao cliente.",
+          ) as unknown as BaseChatModel,
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("empty");
+    expect(calls).toEqual([]);
   });
 
   // The audio-delivery apply point: TTS on (mirror) + the customer sent audio. The stub carries a

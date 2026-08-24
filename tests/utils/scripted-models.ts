@@ -128,6 +128,37 @@ export class ResolveThenReplyModel {
   }
 }
 
+// Calls skip_reply and then deliberately produces customer-facing text. A terminal tool must make
+// the second model step unreachable; even if a provider/runtime still returns it, delivery must
+// ignore it and every deferred post-action from the turn.
+export class SkipThenReplyModel {
+  constructor(private reply: string) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(this.reply);
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        return n === 1
+          ? new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "skip_reply",
+                  args: { reason: "a human already answered" },
+                  id: "call_skip",
+                },
+              ],
+            })
+          : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
 // Calls handoff_to_human with a customer-facing closing line, then also returns a final reply.
 // Reproduces the double-send when the handoff's mirror event lands after generation.
 export class HandoffThenReplyModel {

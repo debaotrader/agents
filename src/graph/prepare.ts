@@ -118,6 +118,7 @@ import {
   type McpSelection,
 } from "./tools/mcp";
 import { buildRagTools } from "./tools/rag";
+import { guardTools, type TurnControl } from "./turn-control";
 import { UsageCapture, type UsagePersist, type UsageSource } from "./usage";
 
 // Shared agent-invocation plumbing used by BOTH entry points: runAgentTurn (incoming customer
@@ -743,6 +744,7 @@ export interface ToolsetCtx {
   // same convention as ToolpackCtx.assertSafe.
   imageDeps?: ImageFetchDeps;
   turnState?: {
+    control?: TurnControl;
     resolveRequested: boolean;
     // Mirror of TurnState.pendingImages: send_image queues here and the runtime delivers after the
     // turn's gates.
@@ -767,6 +769,7 @@ export interface ToolBuildDeps {
       client: ChatwootClient;
       conversationId: number;
       turnState?: {
+        control?: TurnControl;
         resolveRequested: boolean;
         // Mirror of TurnState.pendingImages: send_image queues here and the runtime delivers after the
         // turn's gates.
@@ -918,25 +921,6 @@ export async function buildToolset(
         }
       }
     : undefined;
-  // Slow-tool ack emitter: posts the per-tool "I'll look into that…" message (with a typing
-  // indicator) before the tool runs. Wired ONLY on a real conversation (conversationId > 0) — the
-  // playground builds its toolset with conversationId 0 and a dummy client, so acks never fire
-  // there. Best-effort: any failure is swallowed so it can never block the actual tool call.
-  const emitAck =
-    ctx.conversationId > 0
-      ? async (message: string) => {
-          try {
-            await ctx.client.sendMessage(ctx.conversationId, message);
-            await ctx.client.toggleTyping(ctx.conversationId, true);
-          } catch (e) {
-            logger.warn(
-              "tool ack failed (conv=%s): %s",
-              String(ctx.conversationId),
-              e instanceof Error ? e.message : String(e),
-            );
-          }
-        }
-      : undefined;
   const mcpTools = await loadMcpToolsForAgent(ctx.tenantId, cfg.mcpSelections, {
     // Default google_oauth refresh (overridable by tests via deps.mcp). Resolves the entry id from
     // the `vault:<id>` ref and returns a fresh access token, refreshing via Google when stale.
@@ -973,8 +957,8 @@ export async function buildToolset(
     scheduleAppointmentReminders,
     cancelAppointmentReminders: cancelAppointmentRemindersFn,
     onSideEffectError,
-    // Only a real conversation gets the live handle (mirrors the emitAck gate); the playground
-    // builds with conversationId 0 + a stub client, so customer-delivery tools degrade.
+    // Only a real conversation gets the live handle; the playground builds with conversationId 0 +
+    // a stub client, so customer-delivery tools degrade.
     ...(ctx.conversationId > 0
       ? {
           chatwoot: { client: ctx.client, conversationId: ctx.conversationId },
@@ -1070,7 +1054,7 @@ export async function buildToolset(
   if (cfg.kanbanConfig.instructions) {
     toolInstructions.kanban_move_card = cfg.kanbanConfig.instructions;
   }
-  return [
+  const tools = [
     ...deps.buildNativeTools(
       {
         client: ctx.client,
@@ -1099,7 +1083,9 @@ export async function buildToolset(
     ),
     ...buildHttpTools(cfg.httpToolDefs, {
       resolveCredential,
-      emitAck,
+      // Reactive turns have exactly one public-message owner: the final delivery path. A slow-tool
+      // acknowledgement would consume a second public balloon before that reply, so it is
+      // deliberately not wired here. buildHttpTool keeps emitAck injectable for non-reactive hosts.
       // HTTP tools are https-only unless allowHttp. In dev (where SSRF_ALLOW_PRIVATE_TARGETS is on by
       // default) operators legitimately point tools at local http services (see .env.example); prod
       // keeps the flag false → https-only. Ties the two so a local HTTP tool works without extra config.
@@ -1128,6 +1114,9 @@ export async function buildToolset(
       cfg.ragConfig?.tools,
     ),
   ];
+  return ctx.turnState?.control
+    ? guardTools(tools, ctx.turnState.control)
+    : tools;
 }
 
 export interface CallbacksArgs {

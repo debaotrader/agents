@@ -1,10 +1,9 @@
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { type FlowContext, withFlowStage } from "@/modules/flowlog/service";
 
-// Humanized delivery: split the agent's reply into several balloons and pace them with a typing
-// indicator + a proportional delay, instead of dumping one wall of text (the n8n "Quebrar e enviar
-// mensagens" behavior). Pure helpers (splitReply / typingDelayMs) + a deliverReply loop that the
-// runtime calls for TEXT replies (audio replies are a single voice note). Config is per-agent.
+// Humanized delivery: preserve the reply as one exact public message and pace it with a typing
+// indicator + a proportional delay. The legacy pure splitReply helper remains for config/editor
+// compatibility, but customer delivery has a single writer and never fragments canonical content.
 
 export interface SplitConfig {
   enabled: boolean;
@@ -104,8 +103,8 @@ export function typingDelayMs(chunk: string, cfg: SplitConfig): number {
 const realSleep = (ms: number): Promise<void> =>
   new Promise((r) => setTimeout(r, ms));
 
-// Sends the reply, split + paced when enabled. Typing toggles are best-effort (admin-token, may be
-// unsupported on a channel) and never block the send. The sleep is injectable for tests.
+// Sends exactly one reply. Typing toggles are best-effort (admin-token, may be unsupported on a
+// channel) and never block the send. The sleep is injectable for tests.
 export async function deliverReply(
   client: ChatwootClient,
   conversationId: number,
@@ -123,14 +122,11 @@ export async function deliverReply(
         await client.sendMessage(conversationId, reply);
         return 1;
       }
-      const chunks = splitReply(reply, cfg);
-      for (const chunk of chunks) {
-        await client.toggleTyping(conversationId, true).catch(() => undefined);
-        await sleep(typingDelayMs(chunk, cfg));
-        await client.sendMessage(conversationId, chunk);
-      }
+      await client.toggleTyping(conversationId, true).catch(() => undefined);
+      await sleep(typingDelayMs(reply, cfg));
+      await client.sendMessage(conversationId, reply);
       await client.toggleTyping(conversationId, false).catch(() => undefined);
-      return chunks.length;
+      return 1;
     },
   );
 }

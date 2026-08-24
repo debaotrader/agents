@@ -3,10 +3,16 @@ import type { BaseMessage } from "@langchain/core/messages";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
-import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
+import {
+  chatwootThreadId,
+  contactInboxThreadId,
+  getCheckpointer,
+} from "@/graph/checkpointer";
 import { isHumanAgentTurn } from "@/graph/markers";
+import { registerTurn, releaseTurn } from "@/graph/turn-control";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import { armDebounce, debounceDedupeKey } from "@/modules/debounce/service";
 import { renderTranscript } from "@/modules/memory/summarize";
 import { claimDueTrafficJobs } from "@/modules/scheduler/service";
 import { runClaimed } from "@/modules/scheduler/worker";
@@ -247,6 +253,54 @@ describe.skipIf(!dbUp)(
       return ((state?.channel_values as { messages?: BaseMessage[] })
         ?.messages ?? []) as BaseMessage[];
     }
+
+    test("an attachment-only human reply cancels the live turn and pending debounce", async () => {
+      const convId = 500;
+      const threadId = chatwootThreadId(tenantId, instanceId, convId);
+      const control = registerTurn(threadId);
+      try {
+        await armDebounce({
+          tenantId,
+          threadId,
+          agentBotId: 9,
+          cfg: {
+            enabled: true,
+            windowSeconds: 15,
+            maxMessagesPerBurst: 20,
+            maxWindowSeconds: 60,
+          },
+          base: appDb,
+        });
+
+        await deliver(convId, {
+          content: "",
+          message_type: "outgoing",
+          sender: { id: 5, name: "Ana", type: "user" },
+          attachments: [
+            {
+              id: 9001,
+              file_type: "image",
+              data_url: "https://chat.example.com/human.jpg",
+            },
+          ],
+        });
+
+        expect(control.reason).toBe("human_intervention");
+        const job = await suDb.schedulerJob.findUnique({
+          where: {
+            tenantId_kind_dedupeKey: {
+              tenantId,
+              kind: "DEBOUNCE",
+              dedupeKey: debounceDedupeKey(threadId),
+            },
+          },
+          select: { status: true },
+        });
+        expect(job?.status).toBe("DONE");
+      } finally {
+        releaseTurn(threadId, control);
+      }
+    });
 
     test("the transcript of a handed-off attendance carries BOTH voices", async () => {
       const convId = 501;
