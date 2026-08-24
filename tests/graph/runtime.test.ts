@@ -1668,13 +1668,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   });
 
   test("skip_reply is terminal even when the model writes a final reply afterwards", async () => {
-    await seedConversation(913, null);
+    await seedConversation(977, null);
     const calls: Array<[string, number, string]> = [];
     const outcome = await runAgentTurn({
       tenantId,
       instanceId,
       agentBotId: 9,
-      event: incoming({ conversationId: 913 }),
+      event: incoming({ conversationId: 977 }),
       base: appDb,
       deps: {
         makeModel: () =>
