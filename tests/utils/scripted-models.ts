@@ -97,6 +97,74 @@ export class EmptyThenReplyModel extends BaseChatModel {
   }
 }
 
+// A provider that always fails the same way. The error is handed in rather than built here, because
+// what the fallback policy reads off it (the numeric `status`, the class name) is the whole subject
+// of the test — a model that invented its own error would be testing the fixture.
+export class FailingModel extends BaseChatModel {
+  calls = 0;
+  constructor(private readonly error: unknown) {
+    super({});
+  }
+  _llmType() {
+    return "fake-failing";
+  }
+  // The graph binds tools before invoking; returning `this` keeps the bound and bare paths on the
+  // same counter, so "the primary was actually asked" is provable.
+  override bindTools(_tools: BindToolsInput[]) {
+    return this;
+  }
+  async _generate(): Promise<ChatResult> {
+    this.calls += 1;
+    throw this.error;
+  }
+}
+
+// Records the toolset it was BOUND to, which is the only way to see the difference between a model
+// asked the agent's question and one asked a stripped version of it. A reply arrives either way.
+export class ToolRecordingModel extends BaseChatModel {
+  boundToolNames: string[] | null = null;
+  constructor(private readonly reply: string) {
+    super({});
+  }
+  _llmType() {
+    return "fake-tool-recording";
+  }
+  override bindTools(tools: BindToolsInput[]) {
+    this.boundToolNames = tools.map((t) =>
+      typeof t === "object" && t !== null && "name" in t
+        ? String((t as { name: unknown }).name)
+        : "?",
+    );
+    return this;
+  }
+  async _generate(): Promise<ChatResult> {
+    return {
+      generations: [{ text: this.reply, message: new AIMessage(this.reply) }],
+    };
+  }
+}
+
+// Runs a side effect INSIDE the generate call, then answers. The point is the window: a fence that
+// only exists before the model and after it cannot be told apart from a correct one unless something
+// happens while the model is running, and the model call is the widest wait on the turn.
+export class SideEffectModel extends BaseChatModel {
+  constructor(
+    private readonly during: () => Promise<void>,
+    private readonly reply = "olá!",
+  ) {
+    super({});
+  }
+  _llmType() {
+    return "fake-side-effect";
+  }
+  async _generate(): Promise<ChatResult> {
+    await this.during();
+    return {
+      generations: [{ text: this.reply, message: new AIMessage(this.reply) }],
+    };
+  }
+}
+
 // Answers from a queue and REPORTS token usage on every call. Reporting is the point: UsageCapture
 // drops a call whose counts are all zero, so a model that reports nothing looks exactly like a call
 // that never happened, and a test for "this call is billed" would pass with the billing broken.
@@ -658,3 +726,101 @@ export const guardrailModel = (
       },
     }),
   }) as unknown as BaseChatModel;
+
+// Issues a document, then answers. The reply does not repeat the prices, which is what the tool's
+// own description asks for — so the assertion is about ORDER: the customer receives the PDF and then
+// the sentence about it, never the other way round.
+export class SendDocumentThenReplyModel {
+  constructor(
+    private reply: string,
+    private toolName: string,
+    private args: Record<string, unknown>,
+    // Runs between the tool call and the final message — the window in which a document has been
+    // issued and queued but not yet delivered. Lets a test act inside it.
+    private betweenTurns?: () => Promise<void>,
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(this.reply);
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 2) await self.betweenTurns?.();
+        return n === 1
+          ? new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: self.toolName,
+                  args: self.args,
+                  id: "call_send_document",
+                },
+              ],
+            })
+          : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
+// Asks for the same tool N times, then answers. The point is the tool LOOP: `toolsCondition` routes
+// a tool call back through the agent node, so a model that calls a tool twice makes that node run
+// three times, which is the only way to observe what the node does on a round that is not the first.
+export class ToolLoopModel extends BaseChatModel {
+  calls = 0;
+  constructor(
+    private readonly toolName: string,
+    private readonly rounds: number,
+    private readonly reply = "pronto",
+  ) {
+    super({});
+  }
+  _llmType() {
+    return "fake-tool-loop";
+  }
+  override bindTools(_tools: BindToolsInput[]) {
+    return this;
+  }
+  async _generate(): Promise<ChatResult> {
+    this.calls += 1;
+    if (this.calls <= this.rounds) {
+      const message = new AIMessage({
+        content: "",
+        tool_calls: [
+          { name: this.toolName, args: {}, id: `call-${this.calls}` },
+        ],
+      });
+      return { generations: [{ text: "", message }] };
+    }
+    return {
+      generations: [{ text: this.reply, message: new AIMessage(this.reply) }],
+    };
+  }
+}
+
+// A provider that always fails the same way, after a measurable wait. `FailingModel` fails
+// instantly, which cannot separate "the primary was asked again" from "the turn cost nothing" — and
+// the cost is the whole subject when the failure being modelled is a timeout.
+export class SlowFailingModel extends BaseChatModel {
+  calls = 0;
+  constructor(
+    private readonly error: unknown,
+    private readonly delayMs: number,
+  ) {
+    super({});
+  }
+  _llmType() {
+    return "fake-slow-failing";
+  }
+  override bindTools(_tools: BindToolsInput[]) {
+    return this;
+  }
+  async _generate(): Promise<ChatResult> {
+    this.calls += 1;
+    await new Promise((r) => setTimeout(r, this.delayMs));
+    throw this.error;
+  }
+}

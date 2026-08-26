@@ -12,7 +12,7 @@ import { runScopedOn } from "@/lib/tenancy";
 import {
   type ClaimedJob,
   claimDueTrafficJobs,
-  failJob,
+  reapStaleJobs,
   rescheduleJob,
   revokeJobsByKeyPrefixOn,
 } from "@/modules/scheduler/service";
@@ -392,6 +392,71 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
   // own thread first, and the subtle half is that the drain ignores `run_at` — a job DEFERRED for a
   // previous turn sits a minute in the future, and those are exactly the messages a starting turn is
   // missing. A drain that only took due rows would skip them and look correct doing it.
+  // Issue #203, and the failure the in-process registry cannot see. The turn runs on whichever
+  // replica the Chatwoot webhook landed on and this job runs on the leader, so the Map that used to
+  // answer "is a turn reading this thread" is empty here and the append went in anyway, erased by
+  // that turn's save, and recorded as ingested, which is the loss #194 exists to close.
+  //
+  // The other replica is personified by what it actually leaves behind: the row, and nothing else.
+  // Marking through the module instead would mark THIS process's Map and the test would pass on the
+  // registry that is being replaced.
+  test("a turn held on another replica defers the append", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 12561;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const job = await armAndClaim(contactInboxId, 981, 305, "ficou pronto?");
+    await suDb.$executeRawUnsafe(
+      `INSERT INTO agent_threads
+         (tenant_id, chatwoot_instance_id, contact_inbox_id, thread_id,
+          turn_holders, turn_held_until, created_at, updated_at)
+       VALUES (${tenantId}, ${instanceId}, ${contactInboxId}, '${graphThreadId}',
+          1, now() + interval '5 minutes', now(), now())`,
+    );
+
+    const deferred = await ingestHandler(job, appDb, saver);
+    expect(deferred.outcome).toBe("reschedule");
+
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    expect(
+      ((cp?.channel_values as { messages?: BaseMessage[] })?.messages ??
+        []) as BaseMessage[],
+    ).toEqual([]);
+    // And the thread does not claim the message was handled, so it is still OWED. That pairing is
+    // the whole difference between a late message and a lost one.
+    const owed = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      select: { recentSyncedMessageIds: true },
+    });
+    expect(owed.recentSyncedMessageIds).toEqual([]);
+
+    // The remote turn ends. Nothing in this process ever knew about it, and the retry ingests.
+    await suDb.$executeRawUnsafe(
+      `UPDATE agent_threads SET turn_holders = 0, turn_held_until = NULL
+        WHERE tenant_id = ${tenantId} AND contact_inbox_id = ${contactInboxId}`,
+    );
+    const done = await ingestHandler(job, appDb, saver);
+    expect(done.outcome).toBe("done");
+    const after = await saver.get({
+      configurable: { thread_id: graphThreadId },
+    });
+    expect(
+      (
+        ((after?.channel_values as { messages?: BaseMessage[] })?.messages ??
+          []) as BaseMessage[]
+      ).map((m) => String(m.content)),
+    ).toContain("ficou pronto?");
+  });
+
   test("a turn drains its thread first, deferred rows included", async () => {
     const contactInboxId = 12504;
     const graphThreadId = contactInboxThreadId(
@@ -704,12 +769,19 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
 
   // Round-16 review finding (P2), and the other half of the one above. The barrier has to tell a row
   // that is BACKING OFF from one that merely STOOD DOWN, and the first version asked `attempts`,
-  // which answers a different question: `rescheduleJob` preserves the attempt count, so a job that
-  // failed once and later deferred for a turn read as backing off and the barrier skipped it — a
-  // turn then answering without the message the barrier exists to fold in.
+  // which answers a different question — a row can carry a spent budget while carrying no error, and
+  // reading the budget made the barrier skip the very message it exists to fold in.
   //
   // `last_error` is the state itself, and a reschedule clears it because the row has left it.
-  test("a job that failed once and then deferred is still drained", async () => {
+  //
+  // The state is built with the REAPER, and that is a consequence of issue #287 rather than a
+  // preference: a reschedule now clears the budget too, so fail-then-defer (what this test used to
+  // do) leaves `attempts` at zero and no longer constructs the divergence at all. A crashed claim
+  // still does, and more honestly — `reapStaleJobs` increments `attempts` and never writes
+  // `last_error`, because a claim that died has no message to record. Rebuilt rather than deleted:
+  // the guarantee is the barrier's, not the reschedule's, and a test that stopped being able to
+  // build its own offending state would have gone on passing while guarding nothing.
+  test("a job whose claim died and then deferred is still drained", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12514;
     const graphThreadId = contactInboxThreadId(
@@ -723,35 +795,16 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
       860,
       "falhou uma vez, depois esperou um turno",
     );
-    // One real failure: attempts goes to 1, a backoff is set, and the error is recorded.
-    await failJob(tenantId, job.id, job.claimSeq, job.attempts, "blip", appDb);
-    const failed = await suDb.schedulerJob.findFirstOrThrow({
-      where: { id: job.id },
-      select: { attempts: true, lastError: true },
-    });
-    expect(failed.attempts).toBe(1);
-    expect(failed.lastError).not.toBeNull();
-
-    // The tick picks it up after the backoff, finds a turn in flight, and stands down. The attempt
-    // count survives that — which is exactly why it cannot be the thing the barrier reads.
-    const retried = (
-      await claimDueTrafficJobs(
-        50,
-        appDb,
-        new Date(Date.now() + 600_000),
-        tenantId,
-      )
-    ).find((j) => j.id === job.id);
-    if (!retried) throw new Error("the backed-off row was not re-claimed");
+    // It stands down for a turn first: the row goes to a future run_at carrying no error.
     markTurnInFlight(graphThreadId);
     try {
-      expect((await ingestHandler(retried, appDb, saver)).outcome).toBe(
+      expect((await ingestHandler(job, appDb, saver)).outcome).toBe(
         "reschedule",
       );
       await rescheduleJob(
         tenantId,
-        retried.id,
-        retried.claimSeq,
+        job.id,
+        job.claimSeq,
         new Date(Date.now() + 60_000),
         undefined,
         appDb,
@@ -759,10 +812,32 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     } finally {
       clearTurnInFlight(graphThreadId);
     }
+
+    // Then a claim on it dies. The reaper re-pends the row and charges the crash, leaving the
+    // future run_at alone and writing no error: a spent budget on a row that merely stood down.
+    const claimed = (
+      await claimDueTrafficJobs(
+        50,
+        appDb,
+        new Date(Date.now() + 600_000),
+        tenantId,
+      )
+    ).find((j) => j.id === job.id);
+    if (!claimed) throw new Error("the deferred row was not re-claimed");
+    await suDb.schedulerJob.update({
+      where: { id: job.id },
+      data: {
+        claimedAt: new Date(Date.now() - 3_600_000),
+        runAt: new Date(Date.now() + 60_000),
+      },
+    });
+    await reapStaleJobs(60_000, appDb, new Date(), tenantId, "INGEST_MESSAGE");
+
     const deferred = await suDb.schedulerJob.findFirstOrThrow({
       where: { id: job.id },
-      select: { attempts: true, lastError: true, runAt: true },
+      select: { attempts: true, lastError: true, runAt: true, status: true },
     });
+    expect(deferred.status).toBe("PENDING");
     expect(deferred.attempts).toBe(1);
     expect(deferred.lastError).toBeNull();
     expect(deferred.runAt.getTime()).toBeGreaterThan(Date.now());

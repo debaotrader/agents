@@ -13,6 +13,14 @@ import {
 import { updateEmbeddingSettings } from "@/modules/tenant-settings/service";
 import { createVaultEntry } from "@/modules/vault/service";
 
+// The context these calls take: the tenant id came from a row this test created, so it carries
+// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+const ctxOf = (tenantId: bigint): TenantContext => ({
+  tenantId,
+  userId: null,
+  role: "TENANT_ADMIN",
+});
+
 // Integration tests for the KnowledgeDocument CRUD layer. Skipped when the DB is unavailable.
 // These tests do NOT exercise the RAG_INGEST job handler (that requires a real embedding
 // credential); they validate the document lifecycle (create, list, get, delete, retry).
@@ -99,7 +107,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
 
   test("createDocument creates a PENDING document and enqueues RAG_INGEST", async () => {
     const result = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Test Doc",
       text: "Hello world",
@@ -136,7 +144,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
 
   test("listDocuments returns documents for the KB with contentChars", async () => {
     const doc = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "List Test",
       text: "Content",
@@ -144,7 +152,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
       base: appDb,
     });
 
-    const docs = await listDocuments(t1, kb1, appDb);
+    const docs = await listDocuments(ctxOf(t1), kb1, appDb);
     const found = docs.find((d) => d.id === doc.id);
     expect(found).toBeDefined();
     expect(found?.title).toBe("List Test");
@@ -155,7 +163,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
 
   test("getDocument returns the document with content", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Get Test",
       text: "Get content here",
@@ -163,21 +171,21 @@ describe.skipIf(!dbUp)("rag documents", () => {
       base: appDb,
     });
 
-    const doc = await getDocument(t1, created.id, appDb);
+    const doc = await getDocument(ctxOf(t1), created.id, appDb);
     expect(doc.id).toBe(created.id);
     expect(doc.content).toBe("Get content here");
     expect(doc.knowledgeBaseId).toBe(kb1);
   });
 
   test("getDocument throws NotFoundError for unknown id", async () => {
-    await expect(getDocument(t1, 999999999n, appDb)).rejects.toThrow(
+    await expect(getDocument(ctxOf(t1), 999999999n, appDb)).rejects.toThrow(
       "document not found",
     );
   });
 
   test("deleteDocument removes the document", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Delete Test",
       text: "To be deleted",
@@ -185,22 +193,22 @@ describe.skipIf(!dbUp)("rag documents", () => {
       base: appDb,
     });
 
-    await deleteDocument(t1, created.id, appDb);
+    await deleteDocument(ctxOf(t1), created.id, appDb);
 
-    await expect(getDocument(t1, created.id, appDb)).rejects.toThrow(
+    await expect(getDocument(ctxOf(t1), created.id, appDb)).rejects.toThrow(
       "document not found",
     );
   });
 
   test("deleteDocument throws NotFoundError for unknown id", async () => {
-    await expect(deleteDocument(t1, 999999999n, appDb)).rejects.toThrow(
+    await expect(deleteDocument(ctxOf(t1), 999999999n, appDb)).rejects.toThrow(
       "document not found",
     );
   });
 
   test("retryDocument re-queues a FAILED document", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Retry Test",
       text: "Will fail",
@@ -216,16 +224,50 @@ describe.skipIf(!dbUp)("rag documents", () => {
       }),
     );
 
-    await retryDocument(t1, created.id, appDb);
+    await retryDocument(ctxOf(t1), created.id, appDb);
 
-    const doc = await getDocument(t1, created.id, appDb);
+    const doc = await getDocument(ctxOf(t1), created.id, appDb);
     expect(doc.status).toBe("PENDING");
     expect(doc.error).toBeNull();
   });
 
+  // Issue #339. A document's ingest job is keyed `doc:<id>`, so one row serves the document for as
+  // long as it exists. FAILED is reached by EXHAUSTING the budget, which is precisely the state the
+  // retry button is for: without a fresh budget the retry is worth one attempt, and every press
+  // after the first dead-letters again on the first blip.
+  test("retryDocument gives the ingest its whole budget back", async () => {
+    const created = await createDocument({
+      ctx: ctxOf(t1),
+      knowledgeBaseId: kb1,
+      title: "Retry Budget Test",
+      text: "Failed five times",
+      sourceType: "text",
+      base: appDb,
+    });
+    await suDb.schedulerJob.updateMany({
+      where: { kind: "RAG_INGEST", dedupeKey: `doc:${created.id}` },
+      data: { status: "DEAD", attempts: 5 },
+    });
+    await runScopedOn(appDb, ctx(t1), (db) =>
+      db.knowledgeDocument.updateMany({
+        where: { id: created.id },
+        data: { status: "FAILED", error: "embeddings unavailable" },
+      }),
+    );
+
+    await retryDocument(ctxOf(t1), created.id, appDb);
+
+    const job = await suDb.schedulerJob.findFirstOrThrow({
+      where: { kind: "RAG_INGEST", dedupeKey: `doc:${created.id}` },
+      select: { status: true, attempts: true },
+    });
+    expect(job.status).toBe("PENDING");
+    expect(job.attempts).toBe(0);
+  });
+
   test("retryDocument re-queues an UNINDEXED document", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Unindexed Retry Test",
       text: "Imported, not indexed",
@@ -242,15 +284,15 @@ describe.skipIf(!dbUp)("rag documents", () => {
       }),
     );
 
-    await retryDocument(t1, created.id, appDb);
+    await retryDocument(ctxOf(t1), created.id, appDb);
 
-    const doc = await getDocument(t1, created.id, appDb);
+    const doc = await getDocument(ctxOf(t1), created.id, appDb);
     expect(doc.status).toBe("PENDING");
   });
 
   test("retryDocument throws for a non-FAILED, non-UNINDEXED document", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "Retry Guard Test",
       text: "Still pending",
@@ -259,7 +301,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
     });
 
     // Document is PENDING (neither FAILED nor UNINDEXED) — re-index should reject.
-    await expect(retryDocument(t1, created.id, appDb)).rejects.toThrow(
+    await expect(retryDocument(ctxOf(t1), created.id, appDb)).rejects.toThrow(
       "only FAILED or UNINDEXED documents can be re-indexed",
     );
   });
@@ -293,7 +335,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
       select: { id: true },
     });
 
-    const result = await reindexKnowledgeBase(t1, kb.id, appDb);
+    const result = await reindexKnowledgeBase(ctxOf(t1), kb.id, appDb);
     expect(result.queued).toBe(2);
 
     const docs = await suDb.knowledgeDocument.findMany({
@@ -328,7 +370,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
         status: "UNINDEXED",
       },
     });
-    const result = await reindexKnowledgeBase(t2, kb.id, appDb);
+    const result = await reindexKnowledgeBase(ctxOf(t2), kb.id, appDb);
     expect(result.queued).toBe(0);
     expect(result.blocked?.reason).toBe("embedding_not_configured");
     // The doc must stay UNINDEXED — a missing prerequisite is not a document failure.
@@ -361,10 +403,10 @@ describe.skipIf(!dbUp)("rag documents", () => {
       select: { id: true },
     });
     // The default sweep skips FAILED docs (they keep their own retry path).
-    const skip = await reindexKnowledgeBase(t1, kb.id, appDb);
+    const skip = await reindexKnowledgeBase(ctxOf(t1), kb.id, appDb);
     expect(skip.queued).toBe(0);
     // include_failed re-queues them in one call, clearing the error.
-    const recover = await reindexKnowledgeBase(t1, kb.id, appDb, {
+    const recover = await reindexKnowledgeBase(ctxOf(t1), kb.id, appDb, {
       includeFailed: true,
     });
     expect(recover.queued).toBe(1);
@@ -378,7 +420,7 @@ describe.skipIf(!dbUp)("rag documents", () => {
 
   test("RLS fences: tenant 2 cannot see tenant 1 documents", async () => {
     const created = await createDocument({
-      tenantId: t1,
+      ctx: ctxOf(t1),
       knowledgeBaseId: kb1,
       title: "RLS Test",
       text: "Cross-tenant attempt",
@@ -387,13 +429,13 @@ describe.skipIf(!dbUp)("rag documents", () => {
     });
 
     // t2 should not find t1's document.
-    await expect(getDocument(t2, created.id, appDb)).rejects.toThrow(
+    await expect(getDocument(ctxOf(t2), created.id, appDb)).rejects.toThrow(
       "document not found",
     );
   });
 
   test("listDocuments throws NotFoundError for unknown KB", async () => {
-    await expect(listDocuments(t1, 999999999n, appDb)).rejects.toThrow(
+    await expect(listDocuments(ctxOf(t1), 999999999n, appDb)).rejects.toThrow(
       "knowledge base not found",
     );
   });

@@ -12,8 +12,22 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import logger from "@/api/lib/logger";
 import { selectHistoryWindow } from "@/graph/history-window";
 import { contentToText } from "@/graph/message-text";
-import { runModelCall } from "@/graph/model-limit";
+import {
+  type ModelLabels,
+  type ModelRetryInfo,
+  runModelCall,
+} from "@/graph/model-limit";
 import { countMessageTokens } from "@/graph/token-count";
+import { USAGE_MODEL_METADATA_KEY } from "@/graph/usage";
+
+// The second provider as the graph needs it: the built model plus the two labels that name it on
+// the usage row and the flow trail. Built and bounded by `prepare.buildModelAndGraph`; the node only
+// ever calls it.
+export interface FallbackModel {
+  model: BaseChatModel;
+  provider: string;
+  modelId: string;
+}
 
 // Minimal functional supervisor: an agent node over the persisted message history, with an
 // optional tool-calling loop (agent ⇄ tools until the model stops calling tools). The
@@ -37,7 +51,24 @@ export interface BuildAgentGraphParams {
   // Fired when a model call is retried after the provider answered with no completion (see
   // model-limit). Same purpose as onToolLimit: without it a recovered turn looks like a clean one
   // and the fault rate stays invisible.
-  onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  // The second provider, already built and already bounded (see ./model-fallback). Absent for every
+  // agent that configured none, which is every agent today, and absent means the node behaves
+  // exactly as it did.
+  fallback?: FallbackModel;
+  // What the agent's OWN model is, for the lines this node's callbacks carry. Not read to dial
+  // anything — `model` above is what dials.
+  primary: ModelLabels;
+  onModelFallback?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackFailed?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
   // Ceiling on the history tokens handed to the model (agent.settings.limits.maxHistoryTokens).
   // null/undefined = send the whole thread, which is the historical behavior.
   maxHistoryTokens?: number | null;
@@ -102,12 +133,38 @@ export function buildAgentGraph({
   maxToolCalls,
   onToolLimit,
   onModelRetry,
+  primary,
+  fallback,
+  onModelFallback,
+  onModelFallbackFailed,
   maxHistoryTokens,
   onHistoryTrim,
 }: BuildAgentGraphParams) {
   const hasTools = !!tools && tools.length > 0;
   const llm = hasTools ? (model.bindTools?.(tools) ?? model) : model;
+  // Bound to the SAME toolset, or the fallback would answer a question the primary was asked with
+  // tools it cannot call — and the tool-call budget below counts calls, not models.
+  const fallbackLlm =
+    fallback && hasTools
+      ? (fallback.model.bindTools?.(tools) ?? fallback.model)
+      : fallback?.model;
   const max = maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
+
+  // ONCE THE FALLBACK HAS THE TURN, IT KEEPS IT.
+  //
+  // A tool call routes back through this node, and without this the node asks the primary again on
+  // every round. Measured on a three-round turn (two tool calls, then the answer) with the primary
+  // failing: the primary was asked 3 times, the trail got 3 "fallback took the turn" warns for one
+  // failover, and at 200ms per failure the turn cost 609.3ms of which ~600 was the primary. At the
+  // ceiling instead of 200ms that is 45s PER ROUND — worse than the 77-99s this whole change exists
+  // to remove, which is what makes it a defeat of the goal rather than an inefficiency.
+  //
+  // A closure and not a state channel, and the lifetime is the argument: `buildModelAndGraph` builds
+  // this graph inside the turn and invokes it once (webhook, nudge and playground alike), so this
+  // variable IS "this invocation". Putting it in graph state would persist it through the
+  // checkpointer and demote the primary for every later turn on the same conversation, which is the
+  // opposite of what a transient outage should cost.
+  let fallbackHasTheTurn = false;
 
   const agentNode = async (state: typeof MessagesAnnotation.State) => {
     // Exactly one system message, and it must be first: prepend the configured prompt and drop any
@@ -137,13 +194,63 @@ export function buildAgentGraph({
       onToolLimit?.({ maxToolCalls: max, toolCalls });
     }
 
+    const messages = [new SystemMessage(prompt), ...history];
+    // The SAME question, to the other provider, when there is one. Same messages and same prompt:
+    // this is not a second, cheaper attempt, it is the attempt the customer is waiting for.
+    const second =
+      fallback && fallbackLlm
+        ? {
+            labels: { provider: fallback.provider, model: fallback.modelId },
+            run: () =>
+              (hardLimit ? fallback.model : fallbackLlm).invoke(messages, {
+                // Metadata rather than callbacks, and measured: metadata MERGES with the turn's and
+                // reaches the handlers it already had, while `callbacks` replaces them — which
+                // would have billed this call to the primary's name or dropped the Langfuse trace.
+                metadata: { [USAGE_MODEL_METADATA_KEY]: fallback.modelId },
+              }),
+          }
+        : null;
+
+    // Already demoted this invocation: the fallback IS the model now, so it gets the
+    // empty-completion retry under its own name, and a failure of its own is reported as that
+    // rather than as a second failover the operator never caused.
+    if (second && fallbackHasTheTurn) {
+      try {
+        return {
+          messages: [
+            await runModelCall(second.run, {
+              primary: second.labels,
+              onRetry: onModelRetry,
+            }),
+          ],
+        };
+      } catch (err) {
+        onModelFallbackFailed?.({
+          ...second.labels,
+          reason: err instanceof Error ? err.message : "provider error",
+        });
+        throw err;
+      }
+    }
+
     const response = await runModelCall(
-      () =>
-        (hardLimit ? model : llm).invoke([
-          new SystemMessage(prompt),
-          ...history,
-        ]),
-      onModelRetry,
+      () => (hardLimit ? model : llm).invoke(messages),
+      {
+        primary,
+        onRetry: onModelRetry,
+        fallback: second
+          ? {
+              labels: second.labels,
+              run: second.run,
+              onFallback: ({ reason }) => {
+                fallbackHasTheTurn = true;
+                onModelFallback?.({ ...second.labels, reason });
+              },
+              onFallbackFailed: ({ reason }) =>
+                onModelFallbackFailed?.({ ...second.labels, reason }),
+            }
+          : undefined,
+      },
     );
     return { messages: [response] };
   };

@@ -55,6 +55,15 @@ let convHandedOffMidSequence = 0n;
 let convDisabledAgentArmed = 0n;
 let convFollowUpOffArmed = 0n;
 let convFinishedByResolve = 0n;
+let convForeignBotArmed = 0n;
+let convOurBotArmed = 0n;
+let convForeignBotEstimate = 0n;
+let convOurBotEstimate = 0n;
+let convUnidentifiedBotArmed = 0n;
+let convStepOptOutEstimate = 0n;
+let convStepOptOutArmedStep1 = 0n;
+let convStepOptOutStepGone = 0n;
+let convNoBotRowArmed = 0n;
 
 // The redirect follow-up job's run time, asserted verbatim as the widget conversation's redirectNext.
 const REDIRECT_JOB_RUN_AT = new Date("2026-06-18T23:30:00Z");
@@ -78,6 +87,12 @@ const BH_WINDOWS = Array.from({ length: 7 }, (_, day) => ({
 }));
 const BH_LAST_EVENT_AT = new Date("2026-06-15T20:00:00Z"); // dueAt = +2min = 20:02 UTC (closed)
 const BH_EXPECTED_RUN_AT = "2026-06-16T09:00:00.000Z";
+
+// One Chatwoot account can front several Agent Bots, so "an AgentBot holds this" and "OUR bot
+// holds this" are different questions. The armed persona owns OUR_BOT_ID; FOREIGN_BOT_ID is
+// another persona's bot on the same account.
+const OUR_BOT_ID = 4001;
+const FOREIGN_BOT_ID = 4002;
 
 // A step-1 job armed two days out — the window in which the ground can shift under it.
 const ARMED_STEP1_RUN_AT = new Date("2026-06-20T23:18:45Z");
@@ -471,6 +486,87 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
       startISO: new Date(Date.now() + 2 * 3_600_000).toISOString(),
     });
 
+    // A third persona whose opt-out is PER STEP (issue #103): step 0 fires through an appointment
+    // (a payment-deadline chase), step 1 does not (ordinary re-engagement). The agent-wide
+    // `pauseWhileAppointment` stays ON, which is the whole point.
+    const stepOptOutAgent = await suDb.agent.create({
+      data: {
+        tenantId: tenant,
+        name: "FU Step Opt-Out",
+        systemPrompt: "x",
+        followUpArmedAt: new Date("2026-01-01T00:00:00Z"),
+        mode: "production",
+        modelConfig: { provider: "openai", model: "gpt-4o-mini" },
+        settings: {
+          followUp: {
+            enabled: true,
+            pauseWhileAppointment: true,
+            steps: [
+              {
+                delayValue: 2,
+                delayUnit: "minutes",
+                instructions: "",
+                ignoreAppointmentPause: true,
+              },
+              { delayValue: 2, delayUnit: "days", instructions: "" },
+            ],
+          },
+        },
+      },
+    });
+    const stepOptOutInbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: inst,
+        chatwootInboxId: 94,
+        name: "Sup pausa por etapa",
+        agentId: stepOptOutAgent.id,
+      },
+    });
+    convStepOptOutEstimate = await seedAppointmentConv(
+      330,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+    );
+    convStepOptOutArmedStep1 = await seedAppointmentConv(
+      331,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+      { lastFollowUpAt: FOLLOW_UP_AT },
+    );
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId: tenant,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${tenant}:${inst}:331`,
+        status: "PENDING",
+        runAt: ARMED_STEP1_RUN_AT,
+        payload: { threadId: `${tenant}:${inst}:331`, stepIndex: 1 },
+      },
+    });
+
+    // Review round 2: an operator who SHORTENS a sequence leaves a pending job for a step that no
+    // longer exists. The handler answers `done` on its first look, so the console has to reach the
+    // same terminal answer — before this it counted down to a step that will never fire and, once
+    // the step decides the pause, reported the conversation as appointment-paused over a job that
+    // is about to end. stepIndex 4 on a two-step sequence.
+    convStepOptOutStepGone = await seedAppointmentConv(
+      332,
+      stepOptOutInbox.id,
+      { startISO: new Date(Date.now() + 2 * 3_600_000).toISOString() },
+      { lastFollowUpAt: FOLLOW_UP_AT },
+    );
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId: tenant,
+        kind: "FOLLOWUP",
+        dedupeKey: `followup:${tenant}:${inst}:332`,
+        status: "PENDING",
+        runAt: ARMED_STEP1_RUN_AT,
+        payload: { threadId: `${tenant}:${inst}:332`, stepIndex: 4 },
+      },
+    });
+
     // ── A PENDING job the handler will drop at claim time (issue #72). A multi-step sequence leaves
     //    one armed between steps with runAt days out, and nothing cancels it when the ground shifts.
     const twoStepSettings = {
@@ -603,6 +699,93 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
       },
     });
     convFinishedByResolve = finished.id;
+
+    // A persona with the same follow-up settings and NO Agent Bot row of its own.
+    const noBotAgent = await suDb.agent.create({
+      data: {
+        tenantId: tenant,
+        name: "FU No Bot",
+        systemPrompt: "x",
+        followUpArmedAt: new Date("2026-01-01T00:00:00Z"),
+        mode: "production",
+        settings: twoStepSettings,
+      },
+    });
+    const noBotInbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: inst,
+        chatwootInboxId: 93,
+        name: "Sup sem bot",
+        agentId: noBotAgent.id,
+      },
+    });
+
+    // ── The armed persona's own Agent Bot on this account, which is what makes "another bot is
+    //    holding this" answerable at all: without the row every AgentBot assignee looks like ours.
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: inst,
+        agentId: armedAgent.id,
+        chatwootAgentBotId: OUR_BOT_ID,
+        accessToken: "enc",
+        webhookSecret: "enc",
+        webhookRouteTokenHash: `fu-estimate-${process.pid}`,
+        name: "FU Armed bot",
+      },
+    });
+    convForeignBotArmed = await seedArmedConv(324, armedInbox.id, {
+      assigneeType: "AgentBot",
+      assigneeId: FOREIGN_BOT_ID,
+    });
+    convOurBotArmed = await seedArmedConv(325, armedInbox.id, {
+      assigneeType: "AgentBot",
+      assigneeId: OUR_BOT_ID,
+    });
+    // The same two holders on the OTHER branch — no job armed yet, so the indicator estimates step 1
+    // itself. A gate placed on the armed-job branch alone leaves this one promising the countdown.
+    async function seedEstimateConv(
+      chatwootId: number,
+      conv: { assigneeType: string; assigneeId: number },
+    ): Promise<bigint> {
+      const c = await suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: inst,
+          chatwootConversationId: chatwootId,
+          inboxId: armedInbox.id,
+          status: "pending",
+          assigneeType: conv.assigneeType,
+          assigneeId: conv.assigneeId,
+          threadId: `${tenant}:${inst}:${chatwootId}`,
+          lastEventAt: LAST_EVENT_AT,
+          lastInboundAt: REPLY_AT,
+          lastFollowUpAt: FOLLOW_UP_AT,
+        },
+      });
+      return c.id;
+    }
+    // The mirror knows A bot has it and not WHICH: `meta.assignee_type` arrives without a readable
+    // `meta.assignee.id`, and the webhook normalizer stores exactly that. Nothing here can rule out
+    // the foreign bot, and the live payload's own parser refuses this same shape.
+    convUnidentifiedBotArmed = await seedArmedConv(328, armedInbox.id, {
+      assigneeType: "AgentBot",
+    });
+    // The other way to have no id to compare with: a persona with no ChatwootAgentBot row of its own
+    // (never provisioned, or not yet synced) — every AgentBot assignee is then unidentifiable.
+    convNoBotRowArmed = await seedArmedConv(329, noBotInbox.id, {
+      assigneeType: "AgentBot",
+      assigneeId: FOREIGN_BOT_ID,
+    });
+    convForeignBotEstimate = await seedEstimateConv(326, {
+      assigneeType: "AgentBot",
+      assigneeId: FOREIGN_BOT_ID,
+    });
+    convOurBotEstimate = await seedEstimateConv(327, {
+      assigneeType: "AgentBot",
+      assigneeId: OUR_BOT_ID,
+    });
   });
 
   // A live appointment is the sweep's own fence (followUp.pauseWhileAppointment, on by default): it
@@ -878,6 +1061,51 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
     expect(d.followUp?.nextStep).toBe(1);
   });
 
+  // ISSUE #103. The indicator changes no behaviour, only what the operator reads — which is exactly
+  // why it is the site that gets left behind: the suite stays green and the symptom shows up on the
+  // screen. Left out, the console says "paused by appointment" over a step that fires in two minutes.
+  //
+  // The pair is what proves it reads the RIGHT step rather than any step: same agent, same live
+  // appointment, and the answer flips with which step comes next.
+  test("(#103) the step about to fire opted out → the console does not claim it is paused", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutEstimate,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBe(1);
+    expect(d.followUp?.pausedByAppointment).toBe(false);
+    expect(d.followUp?.nextRunAt).not.toBeNull();
+  });
+
+  test("(#103) the NEXT step did not opt out → still paused, on the same agent", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutArmedStep1,
+      appDb,
+    );
+    expect(d.followUp?.pausedByAppointment).toBe(true);
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+  });
+
+  // Review round 2, and it is a regression THIS PR introduced. Before the per-step read, the pause
+  // did not consult a step at all and the console's "paused" was accurate here, because the handler
+  // used to meet the appointment BEFORE it noticed the step was gone and rescheduled. Moving the
+  // gate below the step resolution made the handler end the sequence instead, so the same word on
+  // the screen became false. The console has to model the handler's terminal case, not just its
+  // pause.
+  test("(#103) a job past the end of a shrunk sequence reports no next step, and no pause", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convStepOptOutStepGone,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+    expect(d.followUp?.pausedByAppointment).toBe(false);
+  });
+
   // Issue #72: the pending-job branch reported whatever the row said, while the handler re-checks all
   // of this at claim time and drops the job. The countdown told the operator the customer would be
   // re-engaged when nobody was going to be.
@@ -925,9 +1153,158 @@ describe.skipIf(!dbUp)("getConversationDetail — follow-up estimate", () => {
     expect(d.followUp?.nextStep).toBe(1);
   });
 
+  // Issue #214: with a second Agent Bot on the same Chatwoot account holding the conversation, the
+  // handler still reaches its live probe (`requireLiveBotOwnership`) and refuses to send there. The
+  // indicator has nothing after it, so a countdown here promises a re-engagement that is refused —
+  // the shape of #72, on the axis #72 left out.
+  test("another persona's bot holds it, job armed → no countdown", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convForeignBotArmed,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+    expect(d.followUp?.abandoned).toBe(true);
+  });
+
+  test("another persona's bot holds it, no job armed → no estimate", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convForeignBotEstimate,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.nextRunAt).toBeNull();
+  });
+
+  // Unverifiable ownership is not ours: with no id to compare, a conversation another bot owns reads
+  // as ours, and the countdown would promise a send the live probe refuses. Same call
+  // `parseLiveConversation` makes when it drops an "AgentBot" with no numeric id.
+  test("the mirror cannot say WHICH bot holds it → no countdown", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convUnidentifiedBotArmed,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.abandoned).toBe(true);
+  });
+
+  test("a persona with no Agent Bot row of its own → no countdown", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convNoBotRowArmed,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBeNull();
+    expect(d.followUp?.abandoned).toBe(true);
+  });
+
+  // The other direction, and the reason the gate is the bot IDENTITY rather than "an AgentBot holds
+  // it": the conversation assigned to the inbox's OWN bot is the normal state of every bot-owned
+  // conversation, and suppressing the countdown there would silence the indicator for everyone.
+  test("our own bot holds it, job armed → the countdown stands", async () => {
+    const d = await getConversationDetail(ctx(tenant), convOurBotArmed, appDb);
+    expect(d.followUp?.nextStep).toBe(2);
+    expect(d.followUp?.nextRunAt).toBe(ARMED_STEP1_RUN_AT.toISOString());
+    expect(d.followUp?.abandoned).toBe(false);
+  });
+
+  test("our own bot holds it, no job armed → the estimate stands", async () => {
+    const d = await getConversationDetail(
+      ctx(tenant),
+      convOurBotEstimate,
+      appDb,
+    );
+    expect(d.followUp?.nextStep).toBe(1);
+    expect(d.followUp?.nextRunAt).not.toBeNull();
+  });
+
   // The distinction the flag exists for: a sequence whose last step is configured to resolve the
   // conversation ends with the bot no longer owning it. That is a COMPLETED sequence, and the console
   // still has to draw its completion marker — liveness alone cannot tell it from an abandoned one.
+  // Issue #261, at the reader the OPERATOR looks at. The gates in `webhook.ts` answer the episode's
+  // question, so on the unstamped half of an activated episode the agent replies — and this endpoint,
+  // asking the row, would still hand the console "awaiting /teste". A badge that contradicts what the
+  // operator can read in the conversation is worse than no badge.
+  test("the detail of an episode's unstamped half reports the activation", async () => {
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId: tenant,
+        name: "FU Episode",
+        systemPrompt: "x",
+        mode: "test",
+        modelConfig: { provider: "openai", model: "gpt-4o-mini" },
+        settings: {
+          channelRedirect: {
+            enabled: true,
+            entryInboxId: 96,
+            widgetInboxId: 97,
+          },
+        },
+      },
+    });
+    const mk = (chatwootInboxId: number, name: string) =>
+      suDb.inbox.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: inst,
+          chatwootInboxId,
+          name,
+          agentId: agent.id,
+        },
+      });
+    const entryInbox = await mk(96, "WhatsApp");
+    const widgetInbox = await mk(97, "Site");
+    const contact = await suDb.contact.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: inst,
+        chatwootContactId: 9601,
+        name: "Cliente",
+      },
+    });
+    const at = new Date("2026-06-19T10:00:00Z");
+    const mkConv = (
+      chatwootConversationId: number,
+      inboxId: bigint,
+      stamp: Date | null,
+    ) =>
+      suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: inst,
+          chatwootConversationId,
+          inboxId,
+          contactId: contact.id,
+          status: "pending",
+          threadId: `${tenant}:${inst}:${chatwootConversationId}`,
+          lastEventAt: at,
+          testActivatedAt: stamp,
+        },
+      });
+    // `/teste` typed on WhatsApp after the link: the entry row carries it, the widget row does not.
+    await mkConv(9602, entryInbox.id, at);
+    const widget = await mkConv(9603, widgetInbox.id, null);
+    try {
+      const d = await getConversationDetail(ctx(tenant), widget.id, appDb);
+      expect(d.testActivatedAt).toBe(at.toISOString());
+    } finally {
+      await suDb.conversation.deleteMany({
+        where: {
+          tenantId: tenant,
+          chatwootConversationId: { in: [9602, 9603] },
+        },
+      });
+      await suDb.contact.delete({ where: { id: contact.id } });
+      await suDb.inbox.deleteMany({
+        where: { id: { in: [entryInbox.id, widgetInbox.id] } },
+      });
+      await suDb.agent.delete({ where: { id: agent.id } });
+    }
+  });
+
   test("a sequence that finished by resolving the conversation is complete, not abandoned", async () => {
     const d = await getConversationDetail(
       ctx(tenant),

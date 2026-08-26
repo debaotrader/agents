@@ -5,6 +5,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
+import { NUDGE_RETRY_LIMIT } from "@/graph/nudge-retry";
 import { hasLiveAppointment } from "@/modules/appointments/reminders";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import {
@@ -189,6 +190,7 @@ type StepFixture = {
   instructions: string;
   assignLabel?: string;
   resolve?: boolean;
+  ignoreAppointmentPause?: boolean;
 };
 
 // A two-step sequence: step 0 (1 min) then a last step (1 day) that assigns a label and resolves.
@@ -261,6 +263,34 @@ async function seedConversation(
       assigneeId: over.assigneeId ?? null,
     },
   });
+}
+
+// Points the agent's model at a vault entry that does not exist, which is the state issue #281 is
+// about: the agent is live and expected to answer, and nothing it needs to author with resolves.
+// Restored on the way out, because every other test in this file reads the same agent row.
+async function withUnresolvableCredential<T>(fn: () => Promise<T>): Promise<T> {
+  const before = await suDb.agent.findUniqueOrThrow({
+    where: { id: agentId },
+    select: { modelConfig: true },
+  });
+  await suDb.agent.update({
+    where: { id: agentId },
+    data: {
+      modelConfig: {
+        provider: "openai",
+        model: "gpt-4o-mini",
+        credentialRef: "vault:999999999",
+      },
+    },
+  });
+  try {
+    return await fn();
+  } finally {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { modelConfig: before.modelConfig ?? {} },
+    });
+  }
 }
 
 async function lastFollowUpOf(convId: number): Promise<Date | null> {
@@ -1020,6 +1050,106 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     expect(s.sent.length).toBeGreaterThan(0);
   });
 
+  // ISSUE #103. `pauseWhileAppointment` is one boolean for the whole agent, and it conflates two
+  // opposite things: a re-engagement nudge wants to be suppressed while a booking stands, and a
+  // payment-deadline step wants exactly the reverse — it only means anything WHILE the booking is
+  // unconfirmed, and it is the step that later frees the slot. An operator who needs both in one
+  // sequence has no way to say so today.
+  //
+  // A live reminder in every one of these, so the only thing under test is which step is next.
+  async function withReminder(convId: number, tag: string) {
+    await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "APPOINTMENT_REMINDER",
+        dedupeKey: `reminder:${tag}:1`,
+        status: "PENDING",
+        runAt: new Date(Date.now() + 60 * 60_000),
+        payload: { threadId: threadOf(convId), eventId: tag },
+      },
+    });
+  }
+
+  test("(#103) a step that opts out of the pause fires despite a live appointment", async () => {
+    await setAgentSteps([
+      {
+        delayValue: 1,
+        delayUnit: "minutes",
+        instructions: "cobrança de prazo",
+        ignoreAppointmentPause: true,
+      },
+    ]);
+    await seedConversation(1103, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1103, "ev_103a");
+    const s = stubClient();
+    const result = await followUpHandler(jobFor(1103), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent.length).toBeGreaterThan(0);
+  });
+
+  // The counter-assertion that makes the one above mean something: the opt-out is PER STEP, not a
+  // second way to spell `pauseWhileAppointment: false`. Step 0 opts out and step 1 does not, so the
+  // same agent, same conversation and same reminder must answer differently depending on which step
+  // the job is for.
+  test("(#103) the step WITHOUT the opt-out still pauses, on the same agent", async () => {
+    await setAgentSteps([
+      {
+        delayValue: 1,
+        delayUnit: "minutes",
+        instructions: "cobrança de prazo",
+        ignoreAppointmentPause: true,
+      },
+      { delayValue: 1, delayUnit: "days", instructions: "re-engajamento" },
+    ]);
+    await seedConversation(1104, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: new Date(Date.now() - 2 * 60_000),
+    });
+    await withReminder(1104, "ev_103b");
+    const s = stubClient();
+    const result = await followUpHandler(jobFor(1104, 1), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(result.outcome).toBe("reschedule");
+    expect(s.sent).toEqual([]);
+  });
+
+  // The one behaviour the gate's move DOES change, measured rather than asserted away. The gate used
+  // to run above the step resolution, so a job whose stepIndex is past the end of a shrunk sequence
+  // met the appointment first and was rescheduled, again and again, until the appointment passed —
+  // only to end the sequence the moment it finally got through. Below the resolution it ends the
+  // sequence straight away. Nothing is lost, because there was no step left to send.
+  test("(#103) a job past the end of a shrunk sequence ends it, instead of waiting out the appointment", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "única etapa" },
+    ]);
+    await seedConversation(1107, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: new Date(Date.now() - 2 * 60_000),
+    });
+    await withReminder(1107, "ev_103e");
+    const s = stubClient();
+    const result = await followUpHandler(jobFor(1107, 3), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent).toEqual([]);
+  });
+
   // NOTE: Chatwoot ≥ 4.16.2 auto-assigns the connected Agent Bot at conversation creation, so
   // `assignee_type = 'AgentBot'` is the NORMAL bot-owned state — the sweep must treat it exactly
   // like unassigned (shouldBotHandle's `!== 'User'`), or follow-up never fires in ordinary
@@ -1118,6 +1248,518 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
       persistUsage: async () => {},
     });
     expect(ours.sent).toEqual([[1031, REPLY]]);
+  });
+
+  // The SWEEP is the other half of the same question, and it answers it in SQL rather than in
+  // TypeScript (issue #103). Without it the opt-out is unreachable: a conversation with a live
+  // appointment never gets enqueued, so the handler gate that now honours the flag never runs.
+  // The sweep only ever enqueues STEP 0, so step 0 is the step whose flag it has to read.
+  test("(#103) the sweep enqueues when step 0 opts out of the pause", async () => {
+    await setAgentSteps([
+      {
+        delayValue: 1,
+        delayUnit: "minutes",
+        instructions: "cobrança",
+        ignoreAppointmentPause: true,
+      },
+    ]);
+    await seedConversation(1105, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1105, "ev_103c");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 998n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1105)}`,
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  // The counter-assertion, and it is the one that proves the SQL reads the flag rather than
+  // dropping the whole appointment fence: same sweep, same reminder, step 0 without the opt-out.
+  test("(#103) the sweep still skips when step 0 does NOT opt out", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "re-engajamento" },
+    ]);
+    await seedConversation(1106, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1106, "ev_103d");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 997n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1106)}`,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  // Review round 2. The predicate above used to read the step at RAW index 0, which is not the step
+  // the runtime reads: `readFollowUpConfig` drops every non-object entry BEFORE numbering, so its
+  // step 0 is the first OBJECT in the array. Measured live against the dev server, because the
+  // reachability was the whole question: `PATCH /api/v1/agents/:id` types `settings` as an opaque
+  // record (`z.record(z.string(), z.unknown())`), NOT as the MCP behaviour schema, so this bag is
+  // stored exactly as written and answers HTTP 200.
+  //
+  // The predicate is existential now, so there is no index left to disagree about — and this test
+  // is the one that would have caught the positional version.
+  test("(#103) the sweep enqueues when a non-object entry shifts the opted-out step off index 0", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [
+              7,
+              {
+                delayValue: 1,
+                delayUnit: "minutes",
+                instructions: "cobrança",
+                ignoreAppointmentPause: true,
+              },
+            ],
+          },
+        },
+      },
+    });
+    await seedConversation(1108, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1108, "ev_103f");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 996n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1108)}`,
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  // And the same shape with the flag NOWHERE: a malformed entry does not by itself lift the fence.
+  // Without this the test above would pass on a predicate that simply gave up on any array holding
+  // something it did not understand.
+  test("(#103) a non-object entry alone does not lift the appointment fence", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [
+              7,
+              {
+                delayValue: 1,
+                delayUnit: "minutes",
+                instructions: "re-engajamento",
+              },
+            ],
+          },
+        },
+      },
+    });
+    await seedConversation(1109, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1109, "ev_103g");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 995n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1109)}`,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  // Review round 3, and the boundary of the feature, pinned so it cannot drift into a surprise.
+  // The sweep gates the START of a sequence, and the only step it can start is step 0, so a LATER
+  // step's opt-out does NOT lift the fence. It could not usefully: round 2 let it, and the cost was
+  // that an appointment-blocked conversation was re-armed every minute for as long as the booking
+  // stood, eating a slot of the sweep's LIMIT 500 and delaying conversations that would actually
+  // send. Once the sequence IS running the handler carries it, and each step's own gate honours its
+  // own opt-out — which is the reported case, where the payment chase is what fires while the
+  // booking stands and is therefore step 0.
+  test("(#103) a LATER step opting out does NOT lift the sweep's fence for step 0", async () => {
+    await setAgentSteps([
+      { delayValue: 1, delayUnit: "minutes", instructions: "re-engajamento" },
+      {
+        delayValue: 1,
+        delayUnit: "days",
+        instructions: "cobrança",
+        ignoreAppointmentPause: true,
+      },
+    ]);
+    await seedConversation(1110, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1110, "ev_103h");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 994n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1110)}`,
+        },
+      }),
+    ).toBeNull();
+    // And the step that DID opt out still fires once the sequence reaches it, which is what makes
+    // the fence above a cost decision rather than the opt-out failing to work. Its own conversation
+    // because the two states are mutually exclusive by construction: the sweep only looks at a
+    // conversation whose last inbound is NEWER than its last follow-up, and a sequence that reached
+    // step 1 is exactly the opposite.
+    // Step 1's own cadence is 1 day, so the last follow-up has to be far enough back for it to be
+    // due at all — otherwise the reschedule under test would be the delay, not the fence.
+    await seedConversation(1111, {
+      assigneeType: "AgentBot",
+      lastEventAt: new Date(Date.now() - 3 * 86_400_000),
+      lastInboundAt: new Date(Date.now() - 3 * 86_400_000),
+      lastFollowUpAt: new Date(Date.now() - 2 * 86_400_000),
+    });
+    await withReminder(1111, "ev_103i");
+    const s = stubClient();
+    const result = await followUpHandler(jobFor(1111, 1), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+    // `done` and not `reschedule` is the whole assertion: `reschedule` is what the appointment
+    // gate returns, and it is what the counter-test above gets on the step WITHOUT the opt-out.
+    // The nudge lands as a private note here rather than a message, because this conversation is
+    // days past its last inbound and the WhatsApp 24h window governs a proactive send. That is
+    // unrelated to the pause, and asserting on `sent` would have measured the window, not this gate.
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.notes.length).toBeGreaterThan(0);
+    expect(s.sent).toEqual([]);
+  });
+
+  // Review round 3, from a mutation that SURVIVED: narrowing the SQL to jsonb_typeof = 'object'
+  // broke nothing, which meant the array half of the rule was untested. It is not decoration —
+  // `readStep` rejects on `!raw || typeof raw !== "object"`, and `typeof [] === "object"`, so the
+  // reader turns a bare array into a DEFAULT step that carries no opt-out and occupies position 0.
+  // Measured, not assumed: readFollowUpConfig on `[[], {opted out}]` answers two steps, the first
+  // being the default. So the fence must stay UP here, and an SQL that skipped the array would pick
+  // the opted-out object as step 0 and lift it.
+  test("(#103) a bare ARRAY entry counts as step 0, exactly as the reader counts it", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [
+              [],
+              {
+                delayValue: 1,
+                delayUnit: "minutes",
+                instructions: "cobrança",
+                ignoreAppointmentPause: true,
+              },
+            ],
+          },
+        },
+      },
+    });
+    // NOTE: 90 minutes, not the usual 5. The sweep's cutoff is the minimum FIRST-step delay across
+    // enabled agents, and here the reader's step 0 is the DEFAULT step the bare array becomes,
+    // whose delay is 60 minutes. Seeded any fresher, the conversation is filtered out before the
+    // predicate under test is ever reached, and the assertion below would pass on nothing.
+    await seedConversation(1113, {
+      assigneeType: "AgentBot",
+      lastEventAt: new Date(Date.now() - 90 * 60_000),
+      lastInboundAt: new Date(Date.now() - 90 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1113, "ev_103k");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 992n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1113)}`,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  // Review round 4, from a mutation that SURVIVED: dropping `!cfg.pauseWhileAppointment` from the
+  // exempt set broke no test. The agent-wide opt-out is the OLDER half of this predicate and it had
+  // no sweep coverage at all — every existing test exercised the fence staying up. Its positive
+  // case is what the boolean is for, and it is now the pair of the string test below.
+  test("(#103) pauseWhileAppointment false lets the sweep enqueue despite a live appointment", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            pauseWhileAppointment: false,
+            steps: [
+              {
+                delayValue: 1,
+                delayUnit: "minutes",
+                instructions: "re-engajamento",
+              },
+            ],
+          },
+        },
+      },
+    });
+    await seedConversation(1114, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1114, "ev_103l");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 991n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1114)}`,
+        },
+      }),
+    ).not.toBeNull();
+  });
+
+  // Review round 5. `unfencedAgentIds` answered for an agent whose follow-up is OFF, because
+  // `appointmentPauseApplies` is only asked about the pause and a retained step-0 exemption is
+  // still an exemption. Nothing downstream caught it: the sweep's SQL tests `follow_up_armed_at`,
+  // which is stamped on the OFF→ON transition and never cleared on the way back, so a disabled
+  // agent keeps passing that gate.
+  //
+  // The cost is the one the LIMIT 500 imposes. The handler discards these jobs on its first look,
+  // but the sweep re-enqueues them every minute, and each one occupies a slot that belongs to an
+  // agent that would actually send. Asking about a config whose follow-up is off is a question with
+  // no answer, so the filter is at the call site — NOT inside `appointmentPauseApplies`, which
+  // decides one thing and must keep deciding only that.
+  //
+  // The second agent is what makes this reachable: the sweep returns early when NO enabled agent
+  // has follow-up on, so a tenant with only the disabled one never runs the query at all.
+  test("(#103) an agent with follow-up OFF is not exempted from the fence by a retained opt-out", async () => {
+    const other = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Outra",
+        systemPrompt: "x",
+        followUpArmedAt: new Date(Date.now() - 30 * 86_400_000),
+        modelConfig: { provider: "openai", model: "gpt-4o-mini" },
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [{ delayValue: 1, delayUnit: "minutes", instructions: "" }],
+          },
+        },
+      },
+    });
+    try {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: {
+            followUp: {
+              enabled: false,
+              pauseWhileAppointment: true,
+              steps: [
+                {
+                  delayValue: 1,
+                  delayUnit: "minutes",
+                  instructions: "cobranca",
+                  ignoreAppointmentPause: true,
+                },
+              ],
+            },
+          },
+        },
+      });
+      await seedConversation(1115, {
+        assigneeType: "AgentBot",
+        lastInboundAt: new Date(Date.now() - 5 * 60_000),
+        lastFollowUpAt: null,
+      });
+      await withReminder(1115, "ev_103m");
+      registerFollowUpHandlers();
+      await getJobHandler("FOLLOWUP_SWEEP")?.(
+        {
+          id: 992n,
+          tenantId,
+          kind: "FOLLOWUP_SWEEP",
+          payload: {},
+          attempts: 0,
+          claimSeq: 0,
+        },
+        appDb,
+      );
+      expect(
+        await suDb.schedulerJob.findFirst({
+          where: {
+            tenantId,
+            kind: "FOLLOWUP",
+            dedupeKey: `followup:${threadOf(1115)}`,
+          },
+        }),
+      ).toBeNull();
+    } finally {
+      await suDb.agent.delete({ where: { id: other.id } });
+    }
+  });
+
+  // Review round 3. The SIBLING half of the same predicate, found by asking where else the sweep
+  // states something the reader also states. `->>` renders a JSON string and a JSON boolean to the
+  // same characters, and the reader does not: `bag.pauseWhileAppointment !== false` keeps the pause
+  // ON for a stored "false", while the text comparison read it as OFF and lifted the fence. All
+  // seven spellings were measured against the reader; the string was the only disagreement, and it
+  // is reachable through the same REST hole as the malformed step above. Predates #103 — the
+  // comparison is jsonb on both halves now.
+  test("(#103) a pauseWhileAppointment stored as the STRING false still pauses, like the reader", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          followUp: {
+            enabled: true,
+            pauseWhileAppointment: "false",
+            steps: [
+              {
+                delayValue: 1,
+                delayUnit: "minutes",
+                instructions: "re-engajamento",
+              },
+            ],
+          },
+        },
+      },
+    });
+    await seedConversation(1112, {
+      assigneeType: "AgentBot",
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    await withReminder(1112, "ev_103j");
+    registerFollowUpHandlers();
+    await getJobHandler("FOLLOWUP_SWEEP")?.(
+      {
+        id: 993n,
+        tenantId,
+        kind: "FOLLOWUP_SWEEP",
+        payload: {},
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+    );
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "FOLLOWUP",
+          dedupeKey: `followup:${threadOf(1112)}`,
+        },
+      }),
+    ).toBeNull();
   });
 
   // NOTE: Firing a reminder marks its row DONE. Suppression anchored on PENDING rows alone goes
@@ -1474,6 +2116,61 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
         },
       }),
     ).toBeNull();
+  });
+
+  // Issue #281. An agent whose model credentialRef does not resolve cannot author anything, and the
+  // step used to be spent anyway: the watermark was stamped and the sequence advanced, so a broken
+  // credential silently consumed the whole episode and the customer got nothing once it was fixed.
+  test("(y) a step whose agent cannot author is retried, not stamped", async () => {
+    await setAgentSteps(TWO_STEPS);
+    await seedConversation(1090, { lastFollowUpAt: null });
+    const s = stubClient();
+    const result = await withUnresolvableCredential(() =>
+      followUpHandler(jobFor(1090, 0), appDb, {
+        makeModel: fakeModel,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      }),
+    );
+    expect(result.outcome).toBe("reschedule");
+    if (result.outcome === "reschedule") {
+      // The SAME step, with the attempt counter, not stepIndex 1, which is what advancing looks like.
+      expect(result.payload).toEqual({
+        threadId: threadOf(1090),
+        stepIndex: 0,
+        nudgeRetries: 1,
+      });
+    }
+    expect(s.sent).toEqual([]);
+    expect(await lastFollowUpOf(1090)).toBeNull();
+  });
+
+  test("(z) the retry is bounded: the episode is abandoned with a stamp once the attempts run out", async () => {
+    await setAgentSteps(TWO_STEPS);
+    await seedConversation(1091, { lastFollowUpAt: null });
+    const s = stubClient();
+    const job: ClaimedJob = {
+      ...jobFor(1091, 0),
+      payload: {
+        threadId: threadOf(1091),
+        stepIndex: 0,
+        nudgeRetries: NUDGE_RETRY_LIMIT - 1,
+      },
+    };
+    const result = await withUnresolvableCredential(() =>
+      followUpHandler(job, appDb, {
+        makeModel: fakeModel,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      }),
+    );
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent).toEqual([]);
+    // Stamped WITHOUT posting: the sweep re-enqueues any conversation with no stamp, so giving up
+    // without one would loop instead of ending.
+    expect(await lastFollowUpOf(1091)).not.toBeNull();
   });
 
   test("(x) an impossible calendar date never suppresses (no Date.parse roll-over on either side)", async () => {

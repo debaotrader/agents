@@ -2,7 +2,11 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { loadAgentConfig } from "@/graph/prepare";
 import type { RunAgentTurnOutcome, RuntimeDeps } from "@/graph/runtime";
-import { AppError, NotFoundError } from "@/lib/errors";
+import {
+  AppError,
+  NotFoundError,
+  TenantTargetRequiredError,
+} from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
   type ChatwootMessageRow,
@@ -33,7 +37,7 @@ function sysCtx(tenantId: bigint): TenantContext {
 
 function requireTenant(ctx: TenantContext): bigint {
   if (ctx.tenantId === null) {
-    throw new AppError("tenant required", 400, "errors.tenantTargetRequired");
+    throw new TenantTargetRequiredError();
   }
   return ctx.tenantId;
 }
@@ -228,6 +232,9 @@ export async function reengageConversation(
 
   const outcome = await coalesceAndRunTurn(
     {
+      // An operator pressing "re-engage" in the console: the turn IS the action, there is no queued
+      // job behind it and nothing that could call it off while it runs.
+      stillWanted: null,
       tenantId,
       instanceId: resolved.instanceId,
       conversationId: resolved.conversationId,

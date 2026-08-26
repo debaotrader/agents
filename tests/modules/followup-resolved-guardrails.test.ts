@@ -16,7 +16,10 @@ import {
   followUpHandler,
   registerFollowUpHandlers,
 } from "@/modules/followups/handlers";
-import type { ClaimedJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  retireJobsByDedupeKey,
+} from "@/modules/scheduler/service";
 import { getJobHandler } from "@/modules/scheduler/worker";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { NudgeReplyModel } from "../utils/scripted-models";
@@ -133,6 +136,7 @@ async function mirroredConv(convId: number) {
     select: {
       status: true,
       assigneeType: true,
+      assigneeId: true,
       lastInboundAt: true,
       lastFollowUpAt: true,
     },
@@ -187,6 +191,9 @@ async function seedConversation(
     lastEventAt: Date;
     lastInboundAt: Date;
     lastFollowUpAt?: Date | null;
+    // O que o ESPELHO diz sobre quem detém a conversa. Default: ninguém.
+    assigneeType?: string | null;
+    assigneeId?: number | null;
   },
 ) {
   await suDb.conversation.create({
@@ -196,7 +203,8 @@ async function seedConversation(
       chatwootConversationId: convId,
       inboxId: inboxDbId,
       status: over.status ?? "pending",
-      assigneeType: null,
+      assigneeType: over.assigneeType ?? null,
+      ...(over.assigneeId != null ? { assigneeId: over.assigneeId } : {}),
       threadId: threadOf(convId),
       lastEventAt: over.lastEventAt,
       lastInboundAt: over.lastInboundAt,
@@ -463,6 +471,105 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
     expect(after.lastFollowUpAt).toBeNull();
   });
 
+  // (7) O reset que chega DEPOIS da última checagem do nudge. O handler ainda escreve na conversa por
+  // conta própria — `lastFollowUpAt` é exatamente a coluna que o comando limpa —, e essa escrita
+  // também arma o passo seguinte, ressuscitando a sequência que o comando encerrou. O encontro é o
+  // envio ao cliente: nada dentro do runAgentNudge pergunta de novo depois dele.
+  test("(7) um reset depois do envio não recarimba o watermark nem arma o próximo passo", async () => {
+    const CONV = 4341;
+    // O Agente B, porque ele tem DOIS passos: com um só, "encerrou" e "seguiu" terminam iguais e o
+    // teste não distingue pular o carimbo de parar a sequência.
+    await seedConversation(CONV, inboxBId, {
+      lastEventAt: new Date(Date.now() - 2 * HOUR),
+      lastInboundAt: new Date(Date.now() - 2 * HOUR),
+    });
+    const dedupeKey = `followup:${threadOf(CONV)}`;
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey,
+        runAt: new Date(),
+        status: "CLAIMED",
+        payload: { threadId: threadOf(CONV) },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    const s = stubClient(
+      () => ({ id: CONV, status: "pending", meta: {} }),
+      INBOX_B,
+    );
+    const inner = s.makeClient;
+    let retired = false;
+    const client = await inner();
+    const sendMessage = client.sendMessage.bind(client);
+    (client as { sendMessage: unknown }).sendMessage = async (
+      c: number,
+      t: string,
+    ) => {
+      const out = await sendMessage(c, t);
+      // O comando chega com a mensagem já entregue: tarde demais para segurá-la, e cedo demais para
+      // o carimbo.
+      if (!retired) {
+        retired = true;
+        await retireJobsByDedupeKey(tenantId, "FOLLOWUP", dedupeKey, suDb);
+      }
+      return out;
+    };
+
+    const result = await followUpHandler(
+      { ...jobFor(CONV), id: row.id, claimSeq: row.claimSeq },
+      appDb,
+      { ...handlerDeps(s), makeClient: async () => client },
+    );
+
+    expect(retired).toBe(true);
+    // A mensagem saiu — o fecho não a desfaz, e não é isso que ele guarda.
+    expect(s.sent.length).toBe(1);
+    // O episódio termina aqui: sem carimbo e sem próximo passo.
+    expect(result).toEqual({ outcome: "done" });
+    expect((await mirroredConv(CONV)).lastFollowUpAt).toBeNull();
+  });
+
+  // (6) O portão ao vivo pergunta POSSE, e /reset devolve a posse. Um follow-up já reivindicado
+  // passou pela primeira sondagem e está dentro da chamada do modelo; o operador reseta, a conversa
+  // volta para a IA, e a segunda sondagem encontra tudo em ordem — postando um nudge do episódio que
+  // acabou de ser apagado. A lápide é a pergunta que a devolução não consegue responder que sim.
+  test("(6) um follow-up aposentado enquanto rodava não posta, mesmo com a posse devolvida", async () => {
+    const CONV = 4340;
+    await seedConversation(CONV, inboxAId, {
+      lastEventAt: new Date(Date.now() - 2 * HOUR),
+      lastInboundAt: new Date(Date.now() - 2 * HOUR),
+    });
+    const dedupeKey = `followup:${threadOf(CONV)}`;
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: "FOLLOWUP",
+        dedupeKey,
+        runAt: new Date(),
+        // Reivindicado: o estado em que um cancel não alcança a linha.
+        status: "CLAIMED",
+        payload: { threadId: threadOf(CONV) },
+      },
+      select: { id: true, claimSeq: true },
+    });
+    // O que o /reset faz com ela, e o que a execução em voo segura.
+    await retireJobsByDedupeKey(tenantId, "FOLLOWUP", dedupeKey, suDb);
+    // Chatwoot diz que a conversa é da IA — que é exatamente o que a devolução deixa para trás.
+    const s = stubClient(() => ({ id: CONV, status: "pending", meta: {} }));
+
+    const result = await followUpHandler(
+      { ...jobFor(CONV), id: row.id, claimSeq: row.claimSeq },
+      appDb,
+      handlerDeps(s),
+    );
+
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent).toEqual([]);
+    expect(s.notes).toEqual([]);
+  });
+
   // O reconcile escreve status e assignee a partir de um snapshot REST que também traz a versão da
   // conversa (`updated_at.to_f`, o mesmo campo do webhook). Sem gravá-la, a linha fica à frente das
   // próprias marcas e o próximo evento atrasado parece mais novo que um estado que ele antecede.
@@ -584,6 +691,35 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
     expect(s.sent).toEqual([]);
     expect(s.notes).toEqual([]);
     expect((await mirroredConv(CONV)).assigneeType).toBe("User");
+  });
+
+  // Issue #214: o espelho dizendo que OUTRO Agent Bot detém a conversa NÃO derruba o job antes da
+  // sonda. O assignee é justamente o campo que o `syncConversationState` conserta a partir do live
+  // (uma atribuição perdida ou entregue fora de ordem deixa o espelho apontando para o bot errado),
+  // então decidir posse pelo espelho aqui trocaria um countdown errado na tela por uma mensagem que
+  // o cliente nunca recebe. Quem decide é a sonda, e ela diz que o bot da inbox continua com ela.
+  test("(2h) live gate: espelho stale em OUTRO bot + live diz que é nosso → envia", async () => {
+    const CONV = 4311;
+    await seedConversation(CONV, inboxAId, {
+      lastEventAt: new Date(Date.now() - 2 * HOUR),
+      lastInboundAt: new Date(Date.now() - 2 * HOUR),
+      assigneeType: "AgentBot",
+      assigneeId: 999,
+    });
+    const s = stubClient(() => ({
+      id: CONV,
+      status: "pending",
+      meta: {
+        assignee_type: "AgentBot",
+        assignee: { id: INBOX_A, name: "Guard" },
+      },
+    }));
+    const result = await followUpHandler(jobFor(CONV), appDb, handlerDeps(s));
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent.length).toBe(1);
+    expect(s.notes).toEqual([]);
+    // E o espelho sai consertado, que é como o countdown volta a ser verdade na tela.
+    expect((await mirroredConv(CONV)).assigneeId).toBe(INBOX_A);
   });
 
   test("(2c) live gate pós-invoke: resolve DURANTE o turno do modelo → nada postado, espelho reconciliado", async () => {

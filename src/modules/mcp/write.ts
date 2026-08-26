@@ -13,6 +13,7 @@ import {
 import basePrisma from "@/api/lib/prisma";
 import { updateTenant } from "@/api/v1/tenants.admin.service";
 import { getTenant } from "@/api/v1/tenants.service";
+import { parseDbId } from "@/lib/db-id";
 import { AppError } from "@/lib/errors";
 import {
   asSuperAdminOn,
@@ -20,7 +21,7 @@ import {
   type ScopedDb,
   type TenantContext,
 } from "@/lib/tenancy";
-import { clipText, replaceLoneSurrogates } from "@/lib/text";
+import { clipText, makeStorable } from "@/lib/text";
 import {
   type BehaviorSettingsPatch,
   mergeBehaviorSettings,
@@ -32,12 +33,18 @@ import {
 } from "@/modules/agents/credential-paths";
 import {
   assertPromptSize,
+  assertSettingsDebugWindow,
+  assertSettingsModelFallback,
   assertSettingsTextSizes,
   getAgent,
   listAgents,
   updateAgent,
 } from "@/modules/agents/service";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { type AuditEntry, recordAudit } from "@/modules/audit/service";
+import type { LoadChatwootClientDeps } from "@/modules/chatwoot/instance";
+import { readDebugModes } from "@/modules/flowlog/debug-mode";
+import { getTenantSettings } from "@/modules/tenant-settings/service";
 import {
   createPendingVaultEntry,
   isVaultIdRef,
@@ -70,6 +77,27 @@ export const err = (error: string): WriteResult => ({ ok: false, error });
 
 export interface WriteDeps {
   base?: PrismaClient;
+  // NOTE: injectable Chatwoot client factory, for the writes whose PREVIEW calls Chatwoot rather
+  // than answering from its arguments (`inbox_remove`: the write refuses a live inbox, so a preview
+  // that cannot ask would approve what the apply rejects). Defaults to the real SSRF-validated one.
+  makeClient?: LoadChatwootClientDeps["makeClient"];
+}
+
+// The one id parser for every MCP surface, read and write alike.
+//
+// The pattern, not just the throw. `BigInt("")` is 0n and `BigInt(" 17 ")` is 17n, so an id a caller
+// typed wrong does not fail — it becomes a VALID id for some other row, and a write with dry_run
+// false then edits or deletes that one. An id is a run of digits or a mistake worth reporting.
+//
+// One function because it was eight, byte for byte, and a defect fixed in one of eight copies is a
+// defect fixed nowhere: the round that added this rule to the READ parser left the seven writes
+// exactly as they were.
+export function parseMcpId(raw: string, label: string): bigint | WriteResult {
+  // Range as well as spelling. `BigInt` is arbitrary precision, so an id past 2^63-1 parses here and
+  // is refused by POSTGRES when the query binds it — a tool call that answers with a database error
+  // instead of "invalid <label>". `parseDbId` holds both halves; see lib/db-id.ts.
+  const id = parseDbId(raw);
+  return id === null ? err(`invalid ${label}`) : id;
 }
 
 // Field-level diff: only keys whose JSON projection changed appear (before → after).
@@ -95,7 +123,8 @@ const AUDIT_STR_MAX = 4000;
 // the whole write. Here the cost is worse than a lost log line — the change has already committed by
 // the time this row is written, so it lands, the tool reports a failure, and the record of who made
 // it is the only thing missing. Hence both repairs: `clipText` so the cut cannot manufacture an
-// orphan, and `replaceLoneSurrogates` for one that arrived with the value — a projection carries some
+// orphan, and `makeStorable` for one that arrived with the value (or for a NUL, which the same
+// column refuses just as flatly): a projection carries some
 // arguments as the MCP client sent them (`args.name`, `args.title`, `args.content`), and that JSON
 // can spell one out.
 //
@@ -106,7 +135,7 @@ const AUDIT_STR_MAX = 4000;
 // walker repairs come from a model's tool-call arguments and from third parties' response bodies.
 export function truncForAudit(v: unknown): unknown {
   if (typeof v === "string") {
-    return replaceLoneSurrogates(
+    return makeStorable(
       v.length > AUDIT_STR_MAX
         ? `${clipText(v, AUDIT_STR_MAX)}…[truncated]`
         : v,
@@ -115,7 +144,19 @@ export function truncForAudit(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(truncForAudit);
   if (v && typeof v === "object") {
     const o: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v)) o[k] = truncForAudit(val);
+    for (const [k, val] of Object.entries(v)) {
+      // NOTE: `defineProperty`, not assignment. `JSON.parse` yields `__proto__` as an ordinary own
+      // property, and assigning to that key invokes the legacy prototype setter instead; Prisma's
+      // serialization enumerates inherited properties, so its contents would be written as
+      // top-level fields of the audit row. Unlike the repair above, this one is not about what the
+      // column refuses: the write succeeds, carrying a field nobody wrote.
+      Object.defineProperty(o, k, {
+        value: truncForAudit(val),
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
     return o;
   }
   return v;
@@ -364,12 +405,8 @@ export async function promptSet(
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
   try {
     // NOTE: checked here (not only inside updateAgent) so the DRY-RUN path enforces the cap too —
@@ -449,12 +486,8 @@ export async function agentSettingsGet(
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
   try {
     const agent = await getAgent(ctx, agentId, base);
@@ -471,7 +504,23 @@ export async function agentSettingsGet(
         slot.holder[slot.key] = await vaultNameByRef(ctx, ref, base);
       }
     }
-    return ok({ agentId: agent.id, settings });
+    // The unified debug-mode warning (#58). An agent connected over MCP reads this surface to find
+    // out how this agent is configured, and "something is recording more than the default" is part
+    // of that answer — including the tenant-level switch, which lives on another surface entirely
+    // and is exactly what an operator forgets. One extra read on a non-hot path buys not having a
+    // second copy of the same condition here.
+    const debugModes = readDebugModes(
+      agent.settings,
+      await getTenantSettings(ctx, base),
+    );
+    return ok({
+      agentId: agent.id,
+      settings,
+      debugModes: {
+        ...debugModes,
+        fullDetailUntil: debugModes.fullDetailUntil?.toISOString() ?? null,
+      },
+    });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
     if (e instanceof ZodError) return err(zodIssuesMessage(e));
@@ -498,38 +547,37 @@ export async function agentSettingsSet(
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
 
-  let agentId: bigint;
-  try {
-    agentId = BigInt(args.agent_id);
-  } catch {
-    return err("invalid agent_id");
-  }
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
 
+  // FROM THE SCHEMA, not from a list beside it. This was seventeen `if (args.X !== undefined)` lines
+  // and the eighteenth block went in without one: `modelFallback` was published in this tool's
+  // schema, accepted by the parser, and then dropped here — a fallback-only call answered "no
+  // updatable fields" and a call that also touched some other block succeeded while silently
+  // ignoring the fallback. That is the seventh time in this change that a new block reached one
+  // registration point and not the next, so this one stops being a place a block can be forgotten:
+  // the keys ARE the schema's keys, and the refusal below names the same set.
+  //
+  // The cast is what a per-key copy costs, and it is safe for a reason worth stating: the keys come
+  // from `BEHAVIOR_PATCH_SHAPE` itself and `args` was parsed against that same shape, so every value
+  // reaching `patch[k]` has already been checked by the schema that defines `patch`'s own type.
   const patch: BehaviorSettingsPatch = {};
-  if (args.debounce !== undefined) patch.debounce = args.debounce;
-  if (args.stt !== undefined) patch.stt = args.stt;
-  if (args.tts !== undefined) patch.tts = args.tts;
-  if (args.vision !== undefined) patch.vision = args.vision;
-  if (args.split !== undefined) patch.split = args.split;
-  if (args.serviceWindow !== undefined)
-    patch.serviceWindow = args.serviceWindow;
-  if (args.grounding !== undefined) patch.grounding = args.grounding;
-  if (args.followUp !== undefined) patch.followUp = args.followUp;
-  if (args.handoff !== undefined) patch.handoff = args.handoff;
-  if (args.limits !== undefined) patch.limits = args.limits;
-  if (args.observability !== undefined)
-    patch.observability = args.observability;
-  if (args.availability !== undefined) patch.availability = args.availability;
-  if (args.contactAuth !== undefined) patch.contactAuth = args.contactAuth;
-  if (args.memory !== undefined) patch.memory = args.memory;
-  if (args.channelRedirect !== undefined)
-    patch.channelRedirect = args.channelRedirect;
-  if (args.attributeContext !== undefined)
-    patch.attributeContext = args.attributeContext;
-  if (args.sendImage !== undefined) patch.sendImage = args.sendImage;
+  const patchable = Object.keys(
+    BEHAVIOR_PATCH_SHAPE,
+  ) as (keyof BehaviorSettingsPatch)[];
+  for (const key of patchable) {
+    const value = (args as unknown as Record<string, unknown>)[key];
+    if (value !== undefined) {
+      (patch as Record<string, unknown>)[key] = value;
+    }
+  }
   if (Object.keys(patch).length === 0) {
+    // `filter`, not `slice`: the astral-cap sweep reads every bare `.slice(` in src/ as a possible
+    // surrogate cut, and a list of keys is not worth an entry in that registry.
+    const last = patchable.at(-1);
+    const rest = patchable.filter((k) => k !== last);
     return err(
-      "no updatable fields provided (debounce, stt, tts, vision, split, serviceWindow, followUp, handoff, limits, availability, contactAuth, channelRedirect, attributeContext, sendImage, observability, memory and/or grounding)",
+      `no updatable fields provided (${rest.join(", ")} and/or ${last})`,
     );
   }
 
@@ -580,6 +628,8 @@ export async function agentSettingsSet(
     // preview that promises a write the apply would refuse is worse than no preview. Against the
     // stored bag, so re-sending a legacy value untouched is not a refusal.
     assertSettingsTextSizes(patch, current.settings);
+    assertSettingsDebugWindow(patch, current.settings);
+    assertSettingsModelFallback(patch, current.settings, "merge");
     const nextBag = mergeBehaviorSettings(
       (current.settings ?? {}) as Record<string, unknown>,
       patch,

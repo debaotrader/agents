@@ -28,11 +28,71 @@ function float(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+// A Chatwoot timestamp field that is NOT one of the push_timestamps trio, read off the conversation
+// payload. Two spellings reach us for the same column and both are Chatwoot's own: the jbuilder
+// partials render `created_at` as epoch seconds (`.to_i`), while `first_reply_created_at` is a
+// plain ActiveRecord attribute and serializes as an ISO-8601 string. Accept either, reject anything
+// that does not parse — a field we cannot read must read as absent, never as the epoch.
+function ts(v: unknown): Date | null {
+  // NOTE: every branch exits through here. `Number.isFinite` and `> 0` both pass for an epoch far
+  // outside the range a Date can hold (1e20, or a digit string of the same size), and what comes
+  // back is an Invalid Date, which Prisma refuses — failing the WHOLE delivery over an optional
+  // field, and failing it again on every retry because the payload never changes. A reading this
+  // cannot use has to read as absent, on the same terms as a field the payload never carried.
+  const held = (d: Date): Date | null => (Number.isNaN(d.getTime()) ? null : d);
+  if (typeof v === "number" && Number.isFinite(v))
+    return v > 0 ? held(new Date(v * 1000)) : null;
+  if (typeof v === "string") {
+    if (/^\d+$/.test(v)) {
+      const sec = Number(v);
+      return sec > 0 ? held(new Date(sec * 1000)) : null;
+    }
+    return held(new Date(v));
+  }
+  return null;
+}
+
 // NOTE: undefined means "this payload said nothing", so the mirror keeps the stored bag instead of
 // wiping it; `{}` is a real "no attributes" and DOES clear it.
 function attrs(v: unknown): Record<string, unknown> | undefined {
   return isRecord(v) ? v : undefined;
 }
+
+// Chatwoot serializes each event's own SUBJECT, and every subject renders its own table id under the
+// same `id` key: `Conversations::EventDataPresenter#push_data` puts the conversation's DISPLAY id
+// there, while `Message`, `Contact`, `ContactInbox`, `Inbox` and the Kanban card all put a primary
+// key. So the body only says which id it holds if you already know which object it is, and the event
+// name is the only thing that says so.
+//
+// Treating "not a message event" as "the body IS the conversation" put a foreign row id on
+// `conversationId`, and the mirror keys `chatwoot_conversation_id` off exactly that — which opened a
+// SECOND row for a conversation that already had one (issue #257; measured against the fork, 7 of 19
+// event shapes). Hence two allowlists and no fallback: an unknown event identifies no conversation,
+// the mirror writes nothing for it, and the next real event refreshes the row. Failing the other way
+// is what creates the duplicate, and a duplicate does not heal.
+
+// Bodies that ARE a conversation (`conversation.webhook_data`). conversation_created reaches only an
+// account webhook, never an agent bot, but its body is the same one and it costs nothing to name.
+const CONVERSATION_BODY_EVENTS = new Set([
+  "conversation_created",
+  "conversation_opened",
+  "conversation_resolved",
+  "conversation_status_changed",
+  "conversation_updated",
+]);
+
+// Bodies that are a MESSAGE (`Message#webhook_data`), carrying the conversation nested under
+// `conversation`. Deliberately NOT the account webhook's message_incoming/message_outgoing: they are
+// the same body redelivered under a second name, so accepting them would mirror each message twice
+// and hand `isNewIncomingMessage` a class of event it has never seen.
+const MESSAGE_BODY_EVENTS = new Set(["message_created", "message_updated"]);
+
+// The ONE event name that can owe a customer an answer, named because two very different readers
+// need the same answer and must not drift: `isNewIncomingMessage` below, which decides whether a
+// live event drives a turn, and ./stranded-delivery.ts, which asks of a ledger row whether anything
+// was ever owed on it. A `message_updated` is our own write-back coming around and drives nothing,
+// which is why the two questions have one answer.
+export const TURN_BEARING_EVENT = "message_created";
 
 export function normalizeChatwootEvent(
   payload: unknown,
@@ -41,12 +101,16 @@ export function normalizeChatwootEvent(
   const event = str(payload.event);
   if (!event) return null;
 
-  const isMessage = event === "message_created" || event === "message_updated";
+  const isMessage = MESSAGE_BODY_EVENTS.has(event);
+  // WHICH OBJECT the body is, decided by the event name and never by looking at the body. See
+  // CONVERSATION_BODY_EVENTS: an event we do not know is an event whose `id` we cannot name.
   const conv = isMessage
     ? isRecord(payload.conversation)
       ? payload.conversation
       : null
-    : payload;
+    : CONVERSATION_BODY_EVENTS.has(event)
+      ? payload
+      : null;
   const meta = conv && isRecord(conv.meta) ? conv.meta : null;
   const assignee = meta && isRecord(meta.assignee) ? meta.assignee : null;
   const sender = meta && isRecord(meta.sender) ? meta.sender : null;
@@ -54,6 +118,10 @@ export function normalizeChatwootEvent(
   // tolerate a flat contact_inbox_id scalar too. Same on both shapes (conv = payload | payload.conversation).
   const contactInbox =
     conv && isRecord(conv.contact_inbox) ? conv.contact_inbox : null;
+
+  // NOTE: The message's own inbox object (Message#webhook_data → inbox: {id, name}); conversation events
+  // do not carry it. Read for both halves: the name, and the id when the conversation scalar is gone.
+  const inboxObj = isMessage && isRecord(payload.inbox) ? payload.inbox : null;
 
   const normalized: NormalizedChatwootEvent = {
     event,
@@ -63,7 +131,13 @@ export function normalizeChatwootEvent(
       : conv
         ? num(conv.contact_inbox_id)
         : null,
-    inboxId: conv ? num(conv.inbox_id) : null,
+    // NOTE: `conversation.inbox_id` first, then the message's own top-level `inbox` object. They name the
+    // same inbox and the fork sends both, but only the second survives a payload that carries the
+    // message without the conversation's scalar — and an inbox the payload named at either spot is
+    // an answer, so nothing downstream should go looking for an older one (issue #270).
+    inboxId:
+      (conv ? num(conv.inbox_id) : null) ??
+      (inboxObj ? num(inboxObj.id) : null),
     status: conv ? str(conv.status) : null,
     // NOTE: No meta ⇒ undefined ("said nothing", the mirror preserves); meta without an assignee ⇒
     // explicit null (a real unassign). Mirrors the attrs() sentinel above.
@@ -145,8 +219,18 @@ export function normalizeChatwootEvent(
     ? attrs(kanbanTask.custom_attributes)
     : undefined;
   if (taskAttrs) normalized.kanbanAttributes = taskAttrs;
-  // Inbox name only ships on message events (Message#webhook_data → inbox: {id, name}).
-  const inboxObj = isMessage && isRecord(payload.inbox) ? payload.inbox : null;
+  // The redirect episode's other half, when the fork wrote one. Absent rather than null on everything
+  // that is not the widget side of an episode, so a payload that says nothing never clears a pairing
+  // an earlier one established (issue #222).
+  // PRESENCE of the key is the statement, not the value: the fork always ships it (nil included) and
+  // a Chatwoot without it never does, so `in` is what separates "there is no pairing" from "this
+  // instance does not speak about pairings". A present-but-unusable value (0, a string, a negative)
+  // reads as none rather than as silence — the sender did speak, it just said nothing usable.
+  if (conv && "redirect_origin_display_id" in conv) {
+    const redirectOrigin = num(conv.redirect_origin_display_id);
+    normalized.redirectOriginDisplayId =
+      redirectOrigin !== null && redirectOrigin > 0 ? redirectOrigin : null;
+  }
   normalized.inboxName = inboxObj ? str(inboxObj.name) : null;
   // `channel` (channel_type) is exposed by EventDataPresenter on conversation events.
   normalized.channel = conv ? str(conv.channel) : null;
@@ -154,6 +238,12 @@ export function normalizeChatwootEvent(
   // NOTE: float() and not num() — `updated_at` ships as `to_f`, so it carries a fraction, and num()
   // parses ids (its string branch is integers only).
   normalized.conversationUpdatedAt = conv ? float(conv.updated_at) : null;
+  // The service level of the human half of an attendance, as CHATWOOT computes it — see the field
+  // notes in types.ts for why these two are read instead of derived from the events we receive.
+  normalized.conversationCreatedAt = conv ? ts(conv.created_at) : null;
+  normalized.firstReplyCreatedAt = conv
+    ? ts(conv.first_reply_created_at)
+    : null;
   return normalized;
 }
 
@@ -218,6 +308,28 @@ export function parseLiveConversation(
 // events for a conversation OWNED by a DIFFERENT bot. When `ourAgentBotId` is provided we act
 // only if the conversation is unassigned (assignee_type null) or assigned to OUR bot, never to
 // another AgentBot. Omitting the option preserves the loose attribution-only gate.
+// The ASSIGNEE half of the question below, on its own because two different questions are built from
+// it and only one of them is about status. "Somebody else is holding this" is a human, or a bot that
+// is not ours — Chatwoot keeps User and AgentBot in separate id namespaces, so the comparison is the
+// whole identity and never the number alone.
+//
+// Split out rather than restated: the console asks it to decide which ownership action to offer, and
+// a conversation held by ANOTHER persona's bot is the case a "is the assignee a User?" test reads
+// backwards — the inbox's own agent cannot answer there either, so it needs the same hand-back the
+// human case needs. A second copy is how that case came to be missing in the first place.
+export function heldByAnotherParty(
+  e: { assigneeType: string | null; assigneeId?: number | null },
+  opts: { ourAgentBotId?: number | null } = {},
+): boolean {
+  if (e.assigneeType === "User") return true;
+  return (
+    e.assigneeType === "AgentBot" &&
+    opts.ourAgentBotId != null &&
+    e.assigneeId != null &&
+    e.assigneeId !== opts.ourAgentBotId
+  );
+}
+
 export function shouldBotHandle(
   e: {
     assigneeType: string | null;
@@ -227,16 +339,7 @@ export function shouldBotHandle(
   opts: { ourAgentBotId?: number | null } = {},
 ): boolean {
   if (e.status !== "pending") return false;
-  if (e.assigneeType === "User") return false;
-  if (
-    e.assigneeType === "AgentBot" &&
-    opts.ourAgentBotId != null &&
-    e.assigneeId != null &&
-    e.assigneeId !== opts.ourAgentBotId
-  ) {
-    return false;
-  }
-  return true;
+  return !heldByAnotherParty(e, opts);
 }
 
 export function isIncomingMessage(e: NormalizedChatwootEvent): boolean {
@@ -251,7 +354,7 @@ export function isIncomingMessage(e: NormalizedChatwootEvent): boolean {
 // loop forever (the voice-note infinite loop). The media is present at creation (baileys attaches
 // it before the single `save!`), so gating on message_created loses nothing.
 export function isNewIncomingMessage(e: NormalizedChatwootEvent): boolean {
-  return e.event === "message_created" && isIncomingMessage(e);
+  return e.event === TURN_BEARING_EVENT && isIncomingMessage(e);
 }
 
 // A message the BUSINESS sent to the customer, typed by a HUMAN agent rather than produced by a bot.

@@ -27,7 +27,10 @@ import {
   replyToConversation,
   returnConversationToAgent,
 } from "@/modules/conversations/service";
-import { listQuotes, revokeQuote } from "@/modules/quotes/service";
+import {
+  listIssuedDocuments,
+  revokeIssuedDocument,
+} from "@/modules/documents/issue";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -58,7 +61,34 @@ function ctx(t: bigint): TenantContext {
 }
 
 // Stub ChatwootClient recording the calls the ops make (no network).
-function makeStub() {
+// `live` is what GET /conversations/:id answers — the hand-back reads it before unassigning, so a
+// stub without it is a Chatwoot that cannot be asked who is holding the conversation. Defaults to
+// nobody, which is the shape that lets the unassign proceed.
+function makeStub(
+  live: { assigneeType?: string | null; assigneeId?: number | null } = {},
+  // A holder that appears only from the SECOND live read on. The hand-back reads the conversation
+  // twice — once to decide whether the unassign is aimed at somebody who is still there, once inside
+  // the mirror write — and a takeover landing between them is visible only to the second. It carries
+  // `updated_at` because that is what makes the mirror write take the versioned path and return a
+  // stored row at all. Omitting it is a case in its own right rather than a broken fixture: the write
+  // then goes unversioned, and what the caller has left is the OBSERVATION, which is the half that
+  // must survive not being versionable.
+  lateLive: {
+    assigneeType: string;
+    // Null renders the payload shape Chatwoot can send and `parseLiveConversation` accepts: a type
+    // naming a person, with no assignee object to identify them.
+    assigneeId: number | null;
+    updatedAt?: number;
+    // Which live read it first appears on. The hand-back reads the conversation three times — the
+    // baseline before the status call, the check after it, and the mirror write's own — and the
+    // three windows between them are different defects.
+    fromRead?: number;
+  } | null = null,
+) {
+  let liveReads = 0;
+  // Set by the unassign below, and overridden by a `lateLive` holder whose read has come round:
+  // somebody who claims the conversation AFTER the clear is holding it again.
+  let cleared = false;
   const calls = {
     getMessages: 0,
     sendMessage: [] as { content: string; isPrivate: boolean }[],
@@ -117,11 +147,53 @@ function makeStub() {
     },
     unassignConversation: async (_cid: number) => {
       calls.unassignConversation += 1;
+      // The endpoint REMOVES whoever is holding the conversation, so the double has to as well. An
+      // inert unassign models a Chatwoot that never takes anybody away, which is the one thing this
+      // call does — and it hid a hand-back that swept away a human who had arrived in the round trip,
+      // because every read after the write still reported them.
+      cleared = true;
       return {};
     },
     toggleStatus: async (_cid: number, status: string) => {
       calls.toggleStatus.push(status);
       return {};
+    },
+    getConversation: async (cid: number) => {
+      liveReads += 1;
+      const late =
+        lateLive !== null && liveReads >= (lateLive.fromRead ?? 2)
+          ? lateLive
+          : null;
+      return late
+        ? {
+            id: cid,
+            status: "pending",
+            ...(late.updatedAt != null ? { updated_at: late.updatedAt } : {}),
+            meta: {
+              assignee_type: late.assigneeType,
+              assignee:
+                late.assigneeId === null
+                  ? null
+                  : { id: late.assigneeId, name: "Bea" },
+            },
+          }
+        : cleared
+          ? {
+              id: cid,
+              status: "pending",
+              meta: { assignee_type: null, assignee: null },
+            }
+          : {
+              id: cid,
+              status: "pending",
+              meta: {
+                assignee_type: live.assigneeType ?? null,
+                assignee:
+                  live.assigneeId != null
+                    ? { id: live.assigneeId, name: "Ana" }
+                    : null,
+              },
+            };
     },
   };
   return {
@@ -521,6 +593,177 @@ describe.skipIf(!dbUp)("tier-3 conversation ops (stub client)", () => {
     expect(detail).not.toHaveProperty("messages");
   });
 
+  // The hand-back's own success state, which the type-only test called a takeover. `toggle_status ->
+  // pending` (or a concurrent assignment) can leave the conversation on the INBOX'S OWN agent bot,
+  // and that is precisely what the caller asked for — the gate reads it as the AI holding it. Reported
+  // as "taken-over", the console warns that somebody claimed a conversation the intended agent owns
+  // and takes the re-engage offer away with it.
+  test("landing on the inbox's own bot is a return, not a takeover", async () => {
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: 4343,
+        name: "Own",
+      },
+    });
+    const ours = await suDb.agent.create({
+      data: { tenantId: tenant, name: "OursBack", systemPrompt: "x" },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: instanceId,
+        agentId: ours.id,
+        chatwootAgentBotId: 950,
+        accessToken: encryptJson("t"),
+        webhookSecret: encryptJson("s"),
+        webhookRouteTokenHash: `own-${process.pid}`,
+        name: "OursBack",
+      },
+    });
+    await suDb.inbox.update({
+      where: { id: inbox.id },
+      data: { agentId: ours.id },
+    });
+    // Its OWN row, not the shared `convId`. `reconcileMirrorFromLive` stores the version it wrote, so
+    // a test that leaves a future timestamp behind makes the next test's older read lose on version
+    // and its assertion fail for a reason that has nothing to do with the code.
+    const ownConv = (
+      await suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: 561,
+          status: "pending",
+          inboxId: inbox.id,
+          threadId: `${tenant}:${instanceId}:561`,
+        },
+      })
+    ).id;
+    try {
+      // Chatwoot answers with our own bot on the read the mirror write makes, which is the shape a
+      // successful hand-back leaves behind.
+      const stub = makeStub(
+        {},
+        {
+          assigneeType: "AgentBot",
+          assigneeId: 950,
+          updatedAt: Math.floor(Date.now() / 1000) + 60,
+          fromRead: 3,
+        },
+      );
+      const outcome = await returnConversationToAgent(
+        ctx(tenant),
+        ownConv,
+        { makeClient: stub.makeClient },
+        appDb,
+      );
+      expect(outcome).toBe("returned");
+
+      // And a DIFFERENT bot on the same shape is still a takeover, so the rule above is the id
+      // comparison rather than "any AgentBot is fine".
+      const other = makeStub(
+        {},
+        {
+          assigneeType: "AgentBot",
+          assigneeId: 951,
+          updatedAt: Math.floor(Date.now() / 1000) + 120,
+          fromRead: 3,
+        },
+      );
+      expect(
+        await returnConversationToAgent(
+          ctx(tenant),
+          ownConv,
+          { makeClient: other.makeClient },
+          appDb,
+        ),
+      ).toBe("taken-over");
+    } finally {
+      await suDb.conversation.delete({ where: { id: ownConv } });
+      await suDb.chatwootAgentBot.deleteMany({
+        where: { tenantId: tenant, agentId: ours.id },
+      });
+      await suDb.inbox.delete({ where: { id: inbox.id } });
+      await suDb.agent.delete({ where: { id: ours.id } });
+    }
+  });
+
+  // The wiring behind that flag, which is the half a pure test cannot reach: the console gets one
+  // boolean, and it is only worth anything if the server actually resolved the bound persona's bot id
+  // to compare against. Driven with a DIFFERENT bot holding the conversation, because that is the
+  // case the browser cannot decide for itself and the one an `assigneeType === "User"` test calls
+  // "the AI has it".
+  test("detail names another persona's bot as an external holder", async () => {
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: 4242,
+        name: "Held",
+      },
+    });
+    const ours = await suDb.agent.create({
+      data: { tenantId: tenant, name: "Ours", systemPrompt: "x" },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId: tenant,
+        chatwootInstanceId: instanceId,
+        agentId: ours.id,
+        chatwootAgentBotId: 900,
+        accessToken: encryptJson("t"),
+        webhookSecret: encryptJson("s"),
+        webhookRouteTokenHash: `held-${process.pid}`,
+        name: "Ours",
+      },
+    });
+    await suDb.inbox.update({
+      where: { id: inbox.id },
+      data: { agentId: ours.id },
+    });
+    try {
+      await suDb.conversation.update({
+        where: { id: convId },
+        // Another persona's bot, and the status the AI's own conversations sit in — so status alone
+        // says "the AI has this" and only the id comparison disagrees.
+        data: {
+          inboxId: inbox.id,
+          status: "pending",
+          assigneeType: "AgentBot",
+          assigneeId: 901,
+        },
+      });
+      const held = await getConversationDetail(ctx(tenant), convId, appDb);
+      expect(held.heldByAnotherParty).toBe(true);
+
+      // And our own bot on the same row is not: without this the flag could be true for every
+      // AgentBot, which is the same wrong answer pointing the other way.
+      await suDb.conversation.update({
+        where: { id: convId },
+        data: { assigneeId: 900 },
+      });
+      const mine = await getConversationDetail(ctx(tenant), convId, appDb);
+      expect(mine.heldByAnotherParty).toBe(false);
+    } finally {
+      await suDb.conversation.update({
+        where: { id: convId },
+        data: {
+          inboxId: null,
+          assigneeType: null,
+          assigneeId: null,
+          status: "pending",
+        },
+      });
+      await suDb.chatwootAgentBot.deleteMany({
+        where: { tenantId: tenant, agentId: ours.id },
+      });
+      await suDb.inbox.delete({ where: { id: inbox.id } });
+      await suDb.agent.delete({ where: { id: ours.id } });
+    }
+  });
+
   test("messages fetches + normalizes the thread on demand", async () => {
     const stub = makeStub();
     const thread = await getConversationMessages(
@@ -654,13 +897,17 @@ describe.skipIf(!dbUp)("tier-3 conversation ops (stub client)", () => {
   });
 
   test("return sets pending + clears assignee in the mirror", async () => {
-    const stub = makeStub();
-    await returnConversationToAgent(
+    // A human is holding it, which is what makes this a hand-back with a write to perform. The
+    // unassign is aimed at somebody, so it is sent, and the mirror read afterwards sees it land.
+    const stub = makeStub({ assigneeType: "User", assigneeId: 7 });
+    const outcome = await returnConversationToAgent(
       ctx(tenant),
       convId,
       { makeClient: stub.makeClient },
       appDb,
     );
+    // The control the takeover test needs: an outcome that were always "taken-over" would pass it.
+    expect(outcome).toBe("returned");
     expect(stub.calls.unassignConversation).toBe(1);
     expect(stub.calls.toggleStatus).toEqual(["pending"]);
     const row = await suDb.conversation.findUnique({
@@ -670,10 +917,330 @@ describe.skipIf(!dbUp)("tier-3 conversation ops (stub client)", () => {
     expect(row?.status).toBe("pending");
     expect(row?.assigneeType).toBeNull();
   });
+
+  // Putting the status call first opened a window the other order did not have: a human claiming the
+  // conversation while the hand-back runs would be removed by an unassign aimed at somebody else.
+  // The live read closes it, and it fails toward LEAVING the human in place — a takeover always wins.
+  test("a human who claimed it mid-hand-back is not unassigned", async () => {
+    await suDb.conversation.update({
+      where: { id: convId },
+      data: { assigneeType: "User", assigneeId: 7 },
+    });
+    // Nobody is holding it when the request starts, and Chatwoot says somebody arrived by the read
+    // after the status call — which is the window this compare exists for.
+    const stub = makeStub({}, { assigneeType: "User", assigneeId: 42 });
+    const outcome = await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    // Said out loud, because nothing throws here: the status was set and the mirror corrected, so a
+    // caller that only watched for an exception would report the agent as having it back.
+    expect(outcome).toBe("taken-over");
+    expect(stub.calls.toggleStatus).toEqual(["pending"]);
+    expect(stub.calls.unassignConversation).toBe(0);
+    const row = await suDb.conversation.findUnique({
+      where: { id: convId },
+      select: { assigneeType: true, assigneeId: true },
+    });
+    expect(row?.assigneeType).toBe("User");
+    expect(row?.assigneeId).toBe(42);
+  });
+
+  // And the window one step further in: the unassign was correctly aimed — the person it names was
+  // still there when it was decided — it lands, and a DIFFERENT human arrives before the mirror write
+  // reads the conversation back. That read is what the row and the console event are built from, so
+  // an outcome derived from the FIRST read reports the agent as having it back while everything else
+  // this call produced names a person.
+  test("a takeover found by the mirror read is reported, not the earlier snapshot", async () => {
+    const stub = makeStub(
+      { assigneeType: "User", assigneeId: 7 },
+      {
+        assigneeType: "User",
+        assigneeId: 4321,
+        updatedAt: Math.floor(Date.now() / 1000) + 60,
+        fromRead: 3,
+      },
+    );
+    const outcome = await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    // It DID unassign: at the moment that was decided, the holder it was aimed at was still there.
+    expect(stub.calls.unassignConversation).toBe(1);
+    expect(outcome).toBe("taken-over");
+    // And the row the same call wrote agrees, which is the disagreement being closed.
+    const row = await suDb.conversation.findUnique({
+      where: { id: convId },
+      select: { assigneeType: true, assigneeId: true },
+    });
+    expect([row?.assigneeType, row?.assigneeId]).toEqual(["User", 4321]);
+  });
+
+  // The same column, the other direction, and the one the primitive answers on its own: a hand-back
+  // that SUCCEEDS empties the holder, and a name left behind reads as the person still having the
+  // conversation on the very screen that just said it went back to the agent.
+  test("a successful hand-back clears the name with the holder", async () => {
+    const namedConv = (
+      await suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: 564,
+          status: "pending",
+          threadId: `${tenant}:${instanceId}:564`,
+          assigneeType: "User",
+          assigneeId: 7,
+          assigneeName: "Ana",
+        },
+      })
+    ).id;
+    try {
+      // No `lateLive`, so the read after the unassign reports the conversation as free — the shape a
+      // hand-back that worked leaves behind.
+      const stub = makeStub({ assigneeType: "User", assigneeId: 7 });
+      expect(
+        await returnConversationToAgent(
+          ctx(tenant),
+          namedConv,
+          { makeClient: stub.makeClient },
+          appDb,
+        ),
+      ).toBe("returned");
+      const row = await suDb.conversation.findUnique({
+        where: { id: namedConv },
+        select: { assigneeType: true, assigneeName: true },
+      });
+      expect([row?.assigneeType, row?.assigneeName]).toEqual([null, null]);
+    } finally {
+      await suDb.conversation.delete({ where: { id: namedConv } });
+    }
+  });
+
+  // The NAME is a column of its own, and the takeover write above moves the id without it. The
+  // console renders the two together, so a row carrying the new holder's id under the previous
+  // holder's name tells an operator, on the screen they use to decide who is handling a
+  // conversation, that the wrong person has it — and it stays that way until some later webhook
+  // happens to repair the row.
+  test("the takeover's name lands with the takeover, not the name it replaced", async () => {
+    const namedConv = (
+      await suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: 563,
+          status: "pending",
+          threadId: `${tenant}:${instanceId}:563`,
+          assigneeType: "User",
+          assigneeId: 7,
+          assigneeName: "Ana",
+        },
+      })
+    ).id;
+    try {
+      // Versionless on purpose: that is the path that writes the fallback by hand instead of letting
+      // the reconcile carry the whole live snapshot, and it is the one that moved the id alone.
+      const stub = makeStub(
+        { assigneeType: "User", assigneeId: 7 },
+        { assigneeType: "User", assigneeId: 4321, fromRead: 3 },
+      );
+      expect(
+        await returnConversationToAgent(
+          ctx(tenant),
+          namedConv,
+          { makeClient: stub.makeClient },
+          appDb,
+        ),
+      ).toBe("taken-over");
+      const row = await suDb.conversation.findUnique({
+        where: { id: namedConv },
+        select: { assigneeId: true, assigneeName: true },
+      });
+      // Bea is who the stub's late read names. Ana is who the row said before, and reading Ana next
+      // to 4321 is the defect.
+      expect([row?.assigneeId, row?.assigneeName]).toEqual([4321, "Bea"]);
+    } finally {
+      await suDb.conversation.delete({ where: { id: namedConv } });
+    }
+  });
+
+  // The window the compare above cannot see, because the write it guards is what destroys the
+  // evidence. The read after the status call says nobody is holding the conversation, so the unassign
+  // is aimed at NOBODY — and a human who claims it in the round trip that follows is removed by a
+  // request that had no work to do in the first place. Every read afterwards then agrees the
+  // conversation is free, so the call reports a clean return and the mirror stores one.
+  //
+  // Chatwoot has no conditional assignment to aim with: assignments#create writes whatever it is
+  // handed, with no holder or version to compare against. What closes the window is not spending the
+  // write at all when the read says there is nothing to remove.
+  //
+  // Its own double, because the shared one models arrival by READ NUMBER and this is about arriving
+  // between a read and a write. Here the unassign removes whoever holds the conversation when it
+  // lands, which is what the endpoint does.
+  test("a human who arrives while the unassign is in flight is not swept away", async () => {
+    // Its OWN row: the reads below carry a future `updated_at`, and leaving that version on the
+    // shared conversation makes the next test's older read lose and fail for an unrelated reason.
+    const raceConv = (
+      await suDb.conversation.create({
+        data: {
+          tenantId: tenant,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: 562,
+          status: "pending",
+          threadId: `${tenant}:${instanceId}:562`,
+        },
+      })
+    ).id;
+    let holder: number | null = null;
+    let reads = 0;
+    const calls = { unassign: 0 };
+    const client = {
+      getConversation: async (cid: number) => {
+        reads += 1;
+        const seen = holder;
+        // Claimed the instant the guard read answered: the decision is already made, and the
+        // unassign, if one is sent, is on the wire while this person arrives.
+        if (reads === 2) holder = 88;
+        return {
+          id: cid,
+          status: "pending",
+          updated_at: Math.floor(Date.now() / 1000) + 60,
+          meta: {
+            assignee_type: seen === null ? null : "User",
+            assignee: seen === null ? null : { id: seen, name: "Bea" },
+          },
+        };
+      },
+      unassignConversation: async () => {
+        calls.unassign += 1;
+        holder = null;
+        return {};
+      },
+      toggleStatus: async () => ({}),
+    };
+    try {
+      const outcome = await returnConversationToAgent(
+        ctx(tenant),
+        raceConv,
+        { makeClient: async () => client as unknown as ChatwootClient },
+        appDb,
+      );
+      // The person is still there, and the caller is told so.
+      expect(outcome).toBe("taken-over");
+      const row = await suDb.conversation.findUnique({
+        where: { id: raceConv },
+        select: { assigneeType: true, assigneeId: true },
+      });
+      expect([row?.assigneeType, row?.assigneeId]).toEqual(["User", 88]);
+      // And the reason it survived: no request was spent on a conversation that had nobody to remove.
+      expect(calls.unassign).toBe(0);
+    } finally {
+      await suDb.conversation.delete({ where: { id: raceConv } });
+    }
+  });
+
+  // The same takeover, seen through a Chatwoot that sends no `updated_at` (anything older than
+  // 4.0.2). The mirror write cannot version that read, so it writes the unversioned fallback and has
+  // no stored row to hand back — and the holder read BEFORE the unassign names the person it was
+  // aimed at, who is gone. Falling straight to it treats "I could not decide" as "nobody is there"
+  // and answers "returned" while a person holds the conversation, which is the one answer every
+  // caller acts on. The observation survives the failure to version it.
+  test("a takeover seen on a versionless read is still reported", async () => {
+    const stub = makeStub(
+      { assigneeType: "User", assigneeId: 7 },
+      { assigneeType: "User", assigneeId: 4321, fromRead: 3 },
+    );
+    const outcome = await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    expect(stub.calls.unassignConversation).toBe(1);
+    expect(outcome).toBe("taken-over");
+    // And the ROW, which no return value reaches. The unversioned write already stored what this call
+    // ASKED for — pending, unassigned — so correcting only the answer leaves the durable copy saying
+    // the conversation is the bot's. That is the copy `shouldBotHandle` reads, so the agent would
+    // answer over the human until an assignment webhook happened to arrive.
+    const row = await suDb.conversation.findUnique({
+      where: { id: convId },
+      select: { assigneeType: true, assigneeId: true },
+    });
+    expect([row?.assigneeType, row?.assigneeId]).toEqual(["User", 4321]);
+  });
+
+  // The baseline is the LIVE holder, not the mirrored row. An assignment webhook that was late or
+  // lost leaves the mirror naming somebody else, and against that a human who was already there
+  // before the request reads as a takeover — the hand-back refuses and the caller is told the
+  // conversation stayed with a person who never arrived. /reset never saw this because it reconciles
+  // from live first; the console and MCP callers do not.
+  test("a stale mirror does not turn the sitting holder into a takeover", async () => {
+    await suDb.conversation.update({
+      where: { id: convId },
+      // What the mirror believes, and it is wrong: nobody told us about this assignment.
+      data: { assigneeType: "User", assigneeId: 31 },
+    });
+    // What Chatwoot says, before and after the status call alike.
+    const stub = makeStub({ assigneeType: "User", assigneeId: 99 });
+    const outcome = await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    expect(outcome).toBe("returned");
+    expect(stub.calls.unassignConversation).toBe(1);
+  });
+
+  // A payload that names a person and does not identify them. `parseLiveConversation` accepts that
+  // shape for "User" on purpose, so the compare has to read the TYPE: against a null id it answered
+  // "nobody moved" and unassigned the human who had just arrived.
+  test("a human whose live id never arrived is still left holding it", async () => {
+    const stub = makeStub({}, { assigneeType: "User", assigneeId: null });
+    const outcome = await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    expect(stub.calls.unassignConversation).toBe(0);
+    // And reported as such: "returned" would be the same disagreement one step later.
+    expect(outcome).toBe("taken-over");
+  });
+
+  // "User" and "AgentBot" are separate id namespaces in Chatwoot, so the comparison is the whole
+  // identity and not the number. Against the number alone, a human claiming a conversation a BOT of
+  // the same id was holding reads as nobody having moved — and the hand-back removes them.
+  test("a human with the same id as the bot that held it is not unassigned", async () => {
+    await suDb.conversation.update({
+      where: { id: convId },
+      data: { assigneeType: "AgentBot", assigneeId: 7 },
+    });
+    const stub = makeStub(
+      { assigneeType: "AgentBot", assigneeId: 7 },
+      { assigneeType: "User", assigneeId: 7 },
+    );
+    await returnConversationToAgent(
+      ctx(tenant),
+      convId,
+      { makeClient: stub.makeClient },
+      appDb,
+    );
+    expect(stub.calls.unassignConversation).toBe(0);
+    const row = await suDb.conversation.findUnique({
+      where: { id: convId },
+      select: { assigneeType: true, assigneeId: true },
+    });
+    expect(row?.assigneeType).toBe("User");
+    expect(row?.assigneeId).toBe(7);
+  });
 });
 
 describe.skipIf(!dbUp)(
-  "tier-3 analytics KPIs/timeseries + quotes + audit",
+  "tier-3 analytics KPIs/timeseries + documents + audit",
   () => {
     let tenant = 0n;
     let instanceId = 0n;
@@ -716,12 +1283,14 @@ describe.skipIf(!dbUp)(
           completionTokens: 5,
         },
       });
-      await suDb.quote.create({
+      await suDb.issuedDocument.create({
         data: {
           tenantId: tenant,
+          title: "Orçamento",
+          number: 1,
           idempotencyKey: "k1",
           status: "READY",
-          snapshot: { title: "Orçamento", currency: "BRL" },
+          snapshot: {},
         },
       });
     });
@@ -732,7 +1301,8 @@ describe.skipIf(!dbUp)(
         "llm_usage",
         "conversations",
         "chatwoot_instances",
-        "quotes",
+        "issued_documents",
+        "document_templates",
         "audit_logs",
       ]) {
         await suDb.$executeRawUnsafe(
@@ -765,12 +1335,18 @@ describe.skipIf(!dbUp)(
       expect(convs).toBe(1);
     });
 
-    test("quotes list + revoke", async () => {
-      const list = await listQuotes(ctx(tenant), {}, appDb);
+    test("issued documents list + revoke", async () => {
+      const list = await listIssuedDocuments(ctx(tenant), {}, appDb);
       expect(list).toHaveLength(1);
       expect(list[0]?.title).toBe("Orçamento");
-      await revokeQuote(ctx(tenant), BigInt(list[0]?.id as string), appDb);
-      const after = await listQuotes(ctx(tenant), {}, appDb);
+      // No template row behind it, so the prefix is absent and the number pads on its own.
+      expect(list[0]?.number).toBe("0001");
+      await revokeIssuedDocument(
+        ctx(tenant),
+        BigInt(list[0]?.id as string),
+        appDb,
+      );
+      const after = await listIssuedDocuments(ctx(tenant), {}, appDb);
       expect(after[0]?.revoked).toBe(true);
     });
 

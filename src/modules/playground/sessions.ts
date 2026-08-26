@@ -18,6 +18,7 @@ import {
 import { NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
+import { documentToolName } from "@/modules/documents/templates";
 import { listThreadMedia } from "./media";
 import { isValidPlaygroundThread } from "./thread";
 import { type LoadedTurnNote, listThreadTurnNotes } from "./turn-notes";
@@ -26,10 +27,6 @@ import { type LoadedTurnNote, listThreadTurnNotes } from "./turn-notes";
 // (threadId + title + timestamps, tenant-scoped + RLS); the conversation itself lives in the
 // LangGraph checkpointer keyed by threadId — the single source of truth. Reopening a session
 // reconstructs the transcript from the checkpointer (no conversation body duplicated in our DB).
-
-function sysCtx(tenantId: bigint): TenantContext {
-  return { tenantId, userId: null, role: "TENANT_ADMIN" };
-}
 
 // Conversation native tools are always simulated in the playground, so label their results as such
 // on reopen too (the mock config isn't persisted, so mocked results show unlabeled on replay).
@@ -145,7 +142,17 @@ export interface RebuiltTurn {
 // user turn + the agent reply) or a system message (an injected follow-up nudge → a proactive
 // assistant turn; silent follow-ups produce nothing and are skipped). Per-turn traces are rebuilt
 // from each slice. Intermediate tool/AI messages belong to the turn's trace, never a separate bubble.
-export function rebuildPlaygroundTurns(messages: BaseMessage[]): RebuiltTurn[] {
+export function rebuildPlaygroundTurns(
+  messages: BaseMessage[],
+  // Tool names simulated for THIS agent beyond the fixed conversation set — the document tools its
+  // granted templates produce. The live trace labels them; without them here the same result loses
+  // its badge on reopen and reads as a document that was really issued.
+  extraSimulated: Iterable<string> = [],
+): RebuiltTurn[] {
+  const simulated = new Set<string>([
+    ...SIMULATED_TOOL_NAMES,
+    ...extraSimulated,
+  ]);
   const turns: RebuiltTurn[] = [];
   const n = messages.length;
   let i = 0;
@@ -163,7 +170,7 @@ export function rebuildPlaygroundTurns(messages: BaseMessage[]): RebuiltTurn[] {
     }
     const slice = messages.slice(i, j);
     const trace = buildPlaygroundTrace(slice, {
-      simulatedNames: SIMULATED_TOOL_NAMES,
+      simulatedNames: simulated,
     });
     const sources = collectTraceSources(trace);
     const reply = lastAi(slice);
@@ -375,15 +382,16 @@ export function applyTurnNotes(
 // reply. The title is set once (on create, from the first turn) and only bumped afterwards.
 export async function upsertPlaygroundSession(
   base: PrismaClient,
-  tenantId: bigint,
+  ctx: TenantContext,
   agentId: bigint,
   threadId: string,
   titleHint: string,
 ): Promise<void> {
+  const tenantId = ctx.tenantId as bigint;
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) return;
   const title = clipText(titleHint.replace(/\s+/g, " ").trim(), TITLE_MAX);
   try {
-    await runScopedOn(base, sysCtx(tenantId), (db) =>
+    await runScopedOn(base, ctx, (db) =>
       db.playgroundSession.upsert({
         where: { tenantId_threadId: { tenantId, threadId } },
         create: { tenantId, agentId, threadId, title },
@@ -405,11 +413,11 @@ export interface PlaygroundSessionMeta {
 }
 
 export async function listPlaygroundSessions(
-  tenantId: bigint,
+  ctx: TenantContext,
   agentId: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<PlaygroundSessionMeta[]> {
-  const rows = await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const rows = await runScopedOn(base, ctx, (db) =>
     db.playgroundSession.findMany({
       where: { agentId },
       orderBy: { updatedAt: "desc" },
@@ -428,15 +436,16 @@ export async function listPlaygroundSessions(
 // the authorization that this thread belongs to the tenant; the thread shape is re-validated too,
 // since the checkpointer is not under RLS (the thread prefix is its fence).
 export async function getPlaygroundSessionTurns(
-  tenantId: bigint,
+  ctx: TenantContext,
   agentId: bigint,
   threadId: string,
   base: PrismaClient = basePrisma,
 ): Promise<RebuiltTurn[]> {
+  const tenantId = ctx.tenantId as bigint;
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) {
     throw new NotFoundError("session not found", "errors.sessionNotFound");
   }
-  const exists = await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const exists = await runScopedOn(base, ctx, (db) =>
     db.playgroundSession.findUnique({
       where: { tenantId_threadId: { tenantId, threadId } },
       select: { id: true },
@@ -455,14 +464,34 @@ export async function getPlaygroundSessionTurns(
   const messages = Array.isArray(channel?.messages)
     ? (channel.messages as BaseMessage[])
     : [];
+  // The agent's own document tools, so a simulated issuance keeps its badge on reopen.
+  //
+  // Derived from the grants as they stand NOW, which is a known limit rather than an oversight: a
+  // template whose grant was removed, renamed or deleted since the turn loses its badge when the
+  // session is reopened, and the call then reads as a live external action. Fixing it properly means
+  // persisting the simulated names WITH each turn — a column, a migration and a write on every
+  // playground turn, for a badge on a historical session whose tool no longer exists. The trade is
+  // not worth it; the limit is written here so the next reader knows it was weighed.
+  const documentTools = await runScopedOn(base, ctx, (db) =>
+    db.agentToolSelection.findMany({
+      where: { agentId, source: "DOCUMENT" },
+      select: { documentTemplate: { select: { slug: true } } },
+    }),
+  );
   const turns = applyTurnNotes(
-    rebuildPlaygroundTurns(messages),
-    await listThreadTurnNotes(base, tenantId, threadId),
+    rebuildPlaygroundTurns(
+      messages,
+      documentTools
+        .map((g) => g.documentTemplate?.slug)
+        .filter((slug): slug is string => !!slug)
+        .map(documentToolName),
+    ),
+    await listThreadTurnNotes(base, ctx, threadId),
   );
 
   // Join persisted media onto the turns by message id (best-effort replay — if the checkpointer
   // didn't round-trip the message id, the media simply isn't re-attached, never an error).
-  const media = await listThreadMedia(tenantId, threadId, base);
+  const media = await listThreadMedia(ctx, threadId, base);
   if (media.length > 0) {
     const byMessage = new Map<string, RebuiltMedia[]>();
     for (const m of media) {
@@ -487,21 +516,29 @@ export async function getPlaygroundSessionTurns(
 // it and get the old conversation back with the moderation deleted: the raw replies a guardrail
 // replaced, presented as the agent's own (issue #136).
 export async function deletePlaygroundSession(
-  tenantId: bigint,
+  ctx: TenantContext,
   agentId: bigint,
   threadId: string,
   base: PrismaClient = basePrisma,
 ): Promise<void> {
+  const tenantId = ctx.tenantId as bigint;
   // The fence is what makes the line below safe to run at all: `deleteThread` is scoped by nothing,
   // and every Chatwoot conversation is a thread in the same checkpointer.
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) {
     throw new NotFoundError("session not found", "errors.sessionNotFound");
   }
+  // Before the unscoped delete below, and NOT as a side effect of the scoped block after it. The
+  // checkpointer lives outside RLS and carries no foreign key to `tenants`, so a tenant's playground
+  // threads OUTLIVE the tenant row: a stale selector can still name a thread that exists, and
+  // refusing afterwards would erase a transcript on a request that then reports itself refused.
+  // This is the same gate called earlier, not a second one: `runScopedOn` is where an unknown tenant
+  // is verified, and it verifies nothing at all for a caller whose id came from a row (issue #268).
+  await runScopedOn(base, ctx, async () => undefined);
   // First, and not swallowed: a delete that dropped our rows and left the thread would leave
   // exactly the state described above. Failing here leaves the session whole instead.
   const checkpointer = await getCheckpointer();
   await checkpointer.deleteThread(threadId);
-  await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  await runScopedOn(base, ctx, async (db) => {
     // The transcript notes go with it. Left behind they would be orphans, and pruned separately
     // they would put a still-reloadable session back to the raw reply (issue #136).
     await db.playgroundTurnNote.deleteMany({ where: { agentId, threadId } });

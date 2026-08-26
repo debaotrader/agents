@@ -3,6 +3,10 @@ import {
   VAULT_REF_PREFIX,
 } from "@/client/lib/credentialRef";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import {
+  hasModelFallback,
+  readModelFallbackConfig,
+} from "@/graph/fallback-settings";
 import { resolveModelOverride } from "@/graph/model-override";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import { readAvailabilityConfig } from "@/modules/availability/away";
@@ -24,6 +28,7 @@ export type ConfigIssueKey =
   | "tts"
   | "ttsNormalize"
   | "memoryModel"
+  | "modelFallback"
   | "vision"
   | "guardrails"
   | "guardrailsFailing"
@@ -176,6 +181,7 @@ export interface ConfigHealthInput {
   // answers, and misses the opposite case — a credential endpoint on a vendor that never sends one.
   // Null until the vault list lands, which is what the deferral below is for.
   savedMemoryCredentialBaseURL?: string | null;
+  savedModelFallbackCredentialBaseURL?: string | null;
   sttEnabled: boolean;
   sttCredentialRef: string;
   // TTS has no boolean toggle — any mode other than "never" means audio replies are on.
@@ -298,6 +304,33 @@ function credIssue(
 // the referenced credential is not in the vault at all ("unresolved"). An OpenAI-compatible model
 // can authenticate via its base URL alone, so it is not flagged (mirrors the editor's
 // `required={provider !== "openai-compatible"}`).
+// WHETHER AN ENDPOINT THE VAULT HAS NOT ANSWERED FOR YET COULD STILL ARRIVE FOR THIS OVERRIDE, which
+// is what decides whether a refusal is a verdict or a paint too early. Three model overrides ask it
+// (the speech rewrite, the summariser and the fallback provider), and it was written out three times
+// as "either credential is unread", which is right about the override's own key and wrong about the
+// agent's.
+//
+// The agent's credential can only ever carry the endpoint for an override that INHERITS the agent's
+// destination. Once the operator names a different provider the request goes to a different vendor,
+// and nothing on the agent's key can supply that vendor's host — so waiting on it means the panel
+// stays silent about a configuration that is definitely unrunnable, for as long as the vault is
+// unavailable. Measured, on the fallback and on the summariser alike: an `openai-compatible`
+// override with no address, on an agent that has a credential, reported NOTHING while `knownRefs`
+// was null.
+//
+// An override that names no provider at all is the inheriting case by definition, which is how the
+// two blocks whose default is "run this on the agent's model" keep the wait they need.
+function endpointCouldStillArrive(
+  endpointsKnown: boolean,
+  override: { provider?: string | null; credentialRef?: string | null },
+  agent: { provider?: string | null; credentialRef?: string | null },
+): boolean {
+  if (endpointsKnown) return false;
+  if (override.credentialRef) return true;
+  const inherits = !override.provider || override.provider === agent.provider;
+  return inherits && Boolean(agent.credentialRef);
+}
+
 export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
   const pending = input.pendingRefs;
@@ -404,9 +437,17 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   // string with a working host. What settles it is having no credential to hear from, which is the
   // case in the reviewer's example — a keyless openai-compatible rewrite pointed at `llama:8080`.
   const endpointsKnown = known !== null;
-  const endpointStillOwed =
-    !endpointsKnown &&
-    Boolean(input.ttsNormalizeCredentialRef || input.savedModelCredentialRef);
+  const endpointStillOwed = endpointCouldStillArrive(
+    endpointsKnown,
+    {
+      provider: input.ttsNormalizeProvider,
+      credentialRef: input.ttsNormalizeCredentialRef,
+    },
+    {
+      provider: input.savedModelProvider,
+      credentialRef: input.savedModelCredentialRef,
+    },
+  );
   const refusalHolds =
     normalizeResolution !== null &&
     !normalizeResolution.runnable &&
@@ -473,9 +514,14 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   // The same wait as the rewrite's, for the same reason: an endpoint can still arrive on a
   // credential the vault has not answered for yet, and announcing a runnable summariser as broken is
   // the false alarm the null-until-loaded rule exists to prevent.
-  const compactionEndpointOwed =
-    !endpointsKnown &&
-    Boolean(compaction.credentialRef || input.savedModelCredentialRef);
+  const compactionEndpointOwed = endpointCouldStillArrive(
+    endpointsKnown,
+    { provider: compaction.provider, credentialRef: compaction.credentialRef },
+    {
+      provider: input.savedModelProvider,
+      credentialRef: input.savedModelCredentialRef,
+    },
+  );
   const compactionRefusalHolds =
     compactionResolution !== null &&
     !compactionResolution.runnable &&
@@ -491,6 +537,75 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
       credIssue(
         compactionResolution !== null && Boolean(compaction.credentialRef),
         compaction.credentialRef ?? "",
+        pending,
+        known,
+      ),
+    );
+  }
+  // The second provider behind the agent's own, judged exactly like the summariser above and for a
+  // sharper reason: it is the one override whose whole purpose is to work on the day the primary
+  // does not. A fallback that cannot be built is indistinguishable from having named none, and the
+  // day it is asked for is the day nobody is watching a console.
+  //
+  // What made it worth a line of its own is the credential: this path is one of the eight in
+  // `SETTINGS_CREDENTIAL_PATHS`, so an import or a transfer rewrites it to a PENDING ref that
+  // carries no secret, and a deleted vault entry leaves it UNRESOLVED. Without an entry here both
+  // read on screen as a configured fallback with no warning and no fill action, while the runtime
+  // refuses to build it.
+  //
+  // No `enabled` flag to consult, unlike the summariser: `hasModelFallback` is the flag, and the two
+  // halves of it are what the write boundary refuses to store apart.
+  const fallback = readModelFallbackConfig(input.settings);
+  const fallbackResolution = hasModelFallback(fallback)
+    ? resolveModelOverride(
+        {
+          provider: fallback.provider,
+          model: fallback.model,
+          credentialRef: fallback.credentialRef,
+          baseURL: fallback.baseURL,
+        },
+        {
+          provider: input.savedModelProvider,
+          model: "",
+          baseURL: input.savedModelBaseURL ?? null,
+        },
+        {
+          ownCredentialBaseURL:
+            input.savedModelFallbackCredentialBaseURL ?? null,
+          isUsableBaseURL: isValidHttpUrl,
+        },
+      )
+    : null;
+  const fallbackIssue: ConfigIssue = {
+    key: "modelFallback",
+    tab: "behavior",
+    sectionId: "modelFallback",
+  };
+  // The same wait the two overrides above take: an endpoint can still arrive on a credential the
+  // vault has not answered for yet, and calling a runnable fallback broken is the false alarm the
+  // null-until-loaded rule exists to prevent.
+  const fallbackEndpointOwed = endpointCouldStillArrive(
+    endpointsKnown,
+    { provider: fallback.provider, credentialRef: fallback.credentialRef },
+    {
+      provider: input.savedModelProvider,
+      credentialRef: input.savedModelCredentialRef,
+    },
+  );
+  const fallbackRefusalHolds =
+    fallbackResolution !== null &&
+    !fallbackResolution.runnable &&
+    !(
+      fallbackEndpointOwed && fallbackResolution.reason === "endpoint_unusable"
+    );
+  if (fallbackRefusalHolds) {
+    issues.push(fallbackIssue);
+  } else {
+    push(
+      fallbackIssue,
+      credIssue(
+        fallbackResolution !== null && Boolean(fallback.credentialRef),
+        fallback.credentialRef ?? "",
         pending,
         known,
       ),

@@ -8,21 +8,32 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import { mirrorChatwootEvent } from "@/modules/chatwoot/mirror";
 import {
+  heldByAnotherParty,
   normalizeChatwootEvent,
   shouldBotHandle,
 } from "@/modules/chatwoot/normalize";
 import { ensureAgentBot } from "@/modules/chatwoot/provisioning";
+import {
+  invalidateRouteTokenCache,
+  noteRouteTokenLookup,
+  ROUTE_TOKEN_CACHE_TTL_MS,
+  ROUTE_TOKEN_REFRESH_WAIT_MS,
+  writeRouteTokenCache,
+} from "@/modules/chatwoot/route-token-cache";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import {
   outOfHoursGate,
-  processChatwootDelivery,
   receiveChatwootWebhook,
+  recordAndProcessChatwootDelivery,
 } from "@/modules/chatwoot/webhook";
 import {
   CHATWOOT_WEBHOOK_MOUNT,
   chatwootOutgoingUrl,
 } from "@/modules/chatwoot/webhook-mount";
-import { generateRouteToken } from "@/modules/webhooks/inbound/route-token";
+import {
+  generateRouteToken,
+  hashRouteToken,
+} from "@/modules/webhooks/inbound/route-token";
 import { seedChatwootInstance, withRunNamespace } from "../utils/chatwoot";
 
 // ── mount constant + outgoing_url derivation (unit) ──
@@ -93,6 +104,53 @@ describe("outOfHoursGate", () => {
 });
 
 // ── attribution gate with bot identity (unit) ──
+// The assignee half on its own, because the console asks it WITHOUT the status clause: which
+// ownership action to offer is a question about who holds the conversation, and `pending` is both the
+// AI's own state and the state a takeover leaves behind.
+describe("heldByAnotherParty", () => {
+  test("nobody, or our own bot, is not another party", () => {
+    expect(
+      heldByAnotherParty({ assigneeType: null }, { ourAgentBotId: 9 }),
+    ).toBe(false);
+    expect(
+      heldByAnotherParty(
+        { assigneeType: "AgentBot", assigneeId: 9 },
+        { ourAgentBotId: 9 },
+      ),
+    ).toBe(false);
+  });
+  // The case a browser-side `assigneeType === "User"` test reads backwards, and the reason this is
+  // resolved server-side at all: the inbox's own agent cannot answer here either, so the console has
+  // to offer the hand-back rather than "handoff to human".
+  test("a DIFFERENT AgentBot is another party", () => {
+    expect(
+      heldByAnotherParty(
+        { assigneeType: "AgentBot", assigneeId: 7 },
+        { ourAgentBotId: 9 },
+      ),
+    ).toBe(true);
+  });
+  test("a human is another party, and an unknown bot id is not", () => {
+    expect(
+      heldByAnotherParty(
+        { assigneeType: "User", assigneeId: 1 },
+        { ourAgentBotId: 9 },
+      ),
+    ).toBe(true);
+    // Same direction shouldBotHandle takes: an id we cannot compare is not evidence of a stranger.
+    expect(
+      heldByAnotherParty(
+        { assigneeType: "AgentBot", assigneeId: null },
+        { ourAgentBotId: 9 },
+      ),
+    ).toBe(false);
+  });
+  // Status is deliberately absent: a resolved conversation nobody holds must not read as held.
+  test("a resolved conversation with no assignee is nobody's", () => {
+    expect(heldByAnotherParty({ assigneeType: null })).toBe(false);
+  });
+});
+
 describe("shouldBotHandle with ourAgentBotId", () => {
   test("acts when unassigned or assigned to our own bot", () => {
     expect(
@@ -343,18 +401,18 @@ describe.skipIf(!dbUp)("chatwoot webhook receiver", () => {
     expect(r.agentBotId).toBe(9);
     expect(r.normalized?.conversationId).toBe(42);
 
-    const proc = await processChatwootDelivery({
+    const proc = await recordAndProcessChatwootDelivery({
       tenantId,
       instanceId: r.instanceId as bigint,
-      deliveryRowId: r.deliveryRowId as bigint,
+      deliveryId: r.deliveryId as string,
       agentBotId: r.agentBotId ?? null,
       normalized: r.normalized as NonNullable<typeof r.normalized>,
       base: appDb,
     });
     expect(proc).toBe("processed");
 
-    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
-      where: { id: r.deliveryRowId as bigint },
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { chatwootInstanceId: instanceId, deliveryId: "uuid-ok" },
     });
     expect(row.status).toBe("PROCESSED");
     expect(row.processedAt).not.toBeNull();
@@ -393,33 +451,619 @@ describe.skipIf(!dbUp)("chatwoot webhook receiver", () => {
       nowSeconds: NOW,
       base: appDb,
     });
+    // The ack writes nothing now, so BOTH deliveries are simply "received". Idempotency is asserted
+    // where it actually lives: on the detached path, which every redelivery runs.
     expect(first.outcome).toBe("queued");
-    expect(second.outcome).toBe("duplicate");
-    expect(second.deliveryRowId).toBe(first.deliveryRowId as bigint);
+    expect(second.outcome).toBe("queued");
+    expect(second.deliveryId).toBe(first.deliveryId as string);
 
-    const count = await suDb.chatwootWebhookDelivery.count({
-      where: { chatwootInstanceId: instanceId, deliveryId: "uuid-dup" },
-    });
-    expect(count).toBe(1);
-
-    await processChatwootDelivery({
-      tenantId,
-      instanceId: first.instanceId as bigint,
-      deliveryRowId: first.deliveryRowId as bigint,
-      agentBotId: first.agentBotId ?? null,
-      normalized: first.normalized as NonNullable<typeof first.normalized>,
-      base: appDb,
-    });
     expect(
-      await processChatwootDelivery({
+      await recordAndProcessChatwootDelivery({
         tenantId,
         instanceId: first.instanceId as bigint,
-        deliveryRowId: first.deliveryRowId as bigint,
+        deliveryId: first.deliveryId as string,
         agentBotId: first.agentBotId ?? null,
         normalized: first.normalized as NonNullable<typeof first.normalized>,
         base: appDb,
       }),
+    ).toBe("processed");
+
+    // Second run of the SAME delivery: the unique keeps one row and the CAS refuses the reprocess.
+    expect(
+      await recordAndProcessChatwootDelivery({
+        tenantId,
+        instanceId: second.instanceId as bigint,
+        deliveryId: second.deliveryId as string,
+        agentBotId: second.agentBotId ?? null,
+        normalized: second.normalized as NonNullable<typeof second.normalized>,
+        base: appDb,
+      }),
     ).toBe("skipped");
+  });
+
+  // ── the ack's own budget (issue #225) ──
+
+  test("the ack asks Postgres nothing once the route token is resolved", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 47,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+    // Warm the resolution the way real traffic does.
+    await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-warm"),
+      nowSeconds: NOW,
+      base: appDb,
+    });
+
+    // Chatwoot escalates the conversation when the ack is slow, and every query on this path is an
+    // interactive transaction competing for a pool shared with turns, ingest and compaction. A base
+    // that refuses to open one is the only assertion that actually pins "the ack does not wait on
+    // the database": counting queries would still pass if they merely got faster.
+    const refuses = {
+      $transaction: () => {
+        throw new Error("the ack path opened a transaction");
+      },
+      $extends: () => refuses,
+    } as unknown as PrismaClient;
+
+    const r = await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-nodb"),
+      nowSeconds: NOW,
+      base: refuses,
+    });
+    expect(r.outcome).toBe("queued");
+    expect(r.deliveryId).toBe("uuid-nodb");
+    expect(r.normalized?.conversationId).toBe(47);
+  });
+
+  // The ack is already out when the detached half runs, so a throw in the ledger claim is not a
+  // delivery Chatwoot retries: the upstream ladder is spent and the event simply never existed. The
+  // failure it meets is the one this path is built around, a pool momentarily full, and that has to
+  // cost latency rather than the turn.
+  test("a pool blip on the ledger claim delays the delivery instead of losing it", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 52,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+    const r = await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-blip"),
+      nowSeconds: NOW,
+      base: appDb,
+    });
+
+    // Two transactions fail the way an exhausted pool fails, then the pool recovers.
+    let blips = 2;
+    const wrap = (client: unknown): unknown =>
+      new Proxy(client as object, {
+        get(target, prop, recv) {
+          if (prop === "$transaction") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => Promise<unknown>;
+            return async (...args: unknown[]) => {
+              if (blips-- > 0) {
+                throw new Error(
+                  "Timed out fetching a new connection from the connection pool",
+                );
+              }
+              return orig.apply(target, args);
+            };
+          }
+          if (prop === "$extends") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => unknown;
+            return (...args: unknown[]) => wrap(orig.apply(target, args));
+          }
+          return Reflect.get(target, prop, recv);
+        },
+      });
+
+    expect(
+      await recordAndProcessChatwootDelivery({
+        tenantId,
+        instanceId: r.instanceId as bigint,
+        deliveryId: r.deliveryId as string,
+        agentBotId: r.agentBotId ?? null,
+        normalized: r.normalized as NonNullable<typeof r.normalized>,
+        base: wrap(appDb) as PrismaClient,
+      }),
+    ).toBe("processed");
+
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { chatwootInstanceId: instanceId, deliveryId: "uuid-blip" },
+    });
+    expect(row.status).toBe("PROCESSED");
+  });
+
+  // The warm case above is the easy half. THE HARD HALF IS THE COLD ONE, and it is the common one:
+  // the entry lives 30s, so an instance quieter than that is cold on every single message, and the
+  // message that finds it cold is the first of a conversation, the one that starts the turn. If the
+  // TTL meant a miss, this path would put an interactive transaction back inside the 5s budget on
+  // exactly the traffic that cannot afford it.
+  test("an entry past its TTL still acks without waiting on Postgres", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 51,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+
+    // Exactly the state of an instance that went quiet: resolved once, then nothing for longer than
+    // the TTL. Back-dated rather than slept for, so the test is not a timer.
+    invalidateRouteTokenCache();
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+
+    const refuses = {
+      $transaction: () => {
+        throw new Error("the ack path opened a transaction");
+      },
+      $extends: () => refuses,
+    } as unknown as PrismaClient;
+
+    const r = await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-cold"),
+      nowSeconds: NOW,
+      base: refuses,
+    });
+    expect(r.outcome).toBe("queued");
+    expect(r.normalized?.conversationId).toBe(51);
+
+    // THE REFRESH IT FIRED BEHIND THE ACK FAILED, AND THAT CHANGES THE NEXT ANSWER. A 200 is a
+    // promise: Chatwoot does not retry a 2xx and the payload is not stored, so answering out of a
+    // cache the database can no longer back loses the event in silence. The failed refresh has
+    // already marked lookups unhealthy, so the next request takes the blocking path and fails
+    // honestly, which is what puts the event back on Chatwoot's retry ladder.
+    await expect(
+      receiveChatwootWebhook({
+        routeToken,
+        rawBody: body,
+        getHeader: signedHeaders(body, NOW, "uuid-cold-2"),
+        nowSeconds: NOW,
+        base: refuses,
+      }),
+    ).rejects.toThrow();
+
+    // AND IT HAS TO COME BACK. `lookupHealthy` only ever flips false on its own, so without a
+    // successful lookup restoring it, one transient blip would disable the shield for the lifetime
+    // of the process and every cold ack after it would pay for a transaction again.
+    invalidateRouteTokenCache();
+    await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-cold-heal"),
+      nowSeconds: NOW,
+      base: appDb,
+    });
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+    const healed = await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-cold-3"),
+      nowSeconds: NOW,
+      base: refuses,
+    });
+    expect(healed.outcome).toBe("queued");
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+  });
+
+  // Q: what happens to the requests that arrive WHILE the refresh is deciding? They wait on it. On a
+  // healthy database that costs a millisecond and saves a lookup, which is the burst the cache exists
+  // to keep off Postgres; on a dead one it is the difference between one acked-and-lost event and all
+  // of them, since Chatwoot never redelivers a 2xx.
+  test("a request arriving during the refresh waits for it instead of looking up again", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 53,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+
+    // A real lookup, held open until released, so the window is a fact rather than a race.
+    let lookups = 0;
+    let release = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const wrap = (client: unknown): unknown =>
+      new Proxy(client as object, {
+        get(target, prop, recv) {
+          if (prop === "$transaction") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => Promise<unknown>;
+            return async (...args: unknown[]) => {
+              lookups++;
+              await gate;
+              return orig.apply(target, args);
+            };
+          }
+          if (prop === "$extends") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => unknown;
+            return (...args: unknown[]) => wrap(orig.apply(target, args));
+          }
+          return Reflect.get(target, prop, recv);
+        },
+      });
+    const held = wrap(appDb) as PrismaClient;
+
+    const send = (uuid: string, base: PrismaClient) =>
+      receiveChatwootWebhook({
+        routeToken,
+        rawBody: body,
+        getHeader: signedHeaders(body, NOW, uuid),
+        nowSeconds: NOW,
+        base,
+      });
+
+    // The first is served stale and starts the one refresh.
+    expect((await send("uuid-race-1", held)).outcome).toBe("queued");
+    const second = send("uuid-race-2", held);
+    release();
+    expect((await second).outcome).toBe("queued");
+    // ONE lookup between them. Without the wait the second would find the entry withheld (a refresh
+    // is deciding) and open its own, which is the burst, at the moment the pool can least afford it.
+    expect(lookups).toBe(1);
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+  });
+
+  // AND WHEN THAT REFRESH FAILS, THE WAIT MUST NOT READ AS A GREEN LIGHT. The waiters resume into a
+  // cache the failure just closed, so each one would take the blocking path and open its OWN
+  // transaction — a burst against the pool at the exact moment the pool is what is broken, which is
+  // the amplification this whole module exists to prevent. They inherit the failure instead: one
+  // lookup for all of them, and every one of them fails honestly onto Chatwoot's retry ladder.
+  test("a failed refresh is inherited by the requests waiting on it", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 54,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+
+    // Held open, then failed: the window is a fact rather than a race, and what ends it is the
+    // outage, not a timer.
+    let lookups = 0;
+    let release = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const wrap = (client: unknown): unknown =>
+      new Proxy(client as object, {
+        get(target, prop, recv) {
+          if (prop === "$transaction") {
+            return async () => {
+              lookups++;
+              await gate;
+              throw new Error("pool exhausted");
+            };
+          }
+          if (prop === "$extends") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => unknown;
+            return (...args: unknown[]) => wrap(orig.apply(target, args));
+          }
+          return Reflect.get(target, prop, recv);
+        },
+      });
+    const failing = wrap(appDb) as PrismaClient;
+
+    const send = (uuid: string, base: PrismaClient) =>
+      receiveChatwootWebhook({
+        routeToken,
+        rawBody: body,
+        getHeader: signedHeaders(body, NOW, uuid),
+        nowSeconds: NOW,
+        base,
+      });
+
+    // The first is served stale and starts the one refresh; it is already acked when the refresh
+    // fails, and that residual event is what issue #228 tracks.
+    expect((await send("uuid-fail-1", failing)).outcome).toBe("queued");
+    const second = send("uuid-fail-2", failing);
+    release();
+    await expect(second).rejects.toThrow();
+    // ONE lookup, the refresh's. The waiter did not add a second one to a pool that just refused.
+    expect(lookups).toBe(1);
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+  });
+
+  // THE BURST AT TTL EXPIRY, which is the case the coalescing exists for and the one the wait alone
+  // does not cover. Deliveries that arrive together all find no refresh in flight and pass the wait;
+  // the first then registers one, and every other reads a MISS — the cache withholds a stale answer
+  // while a refresh decides — and falls through to open its own transaction. N deliveries, N-1
+  // needless interactive transactions, at the moment the pool is tightest.
+  test("a burst at expiry opens one lookup between all of them", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 56,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+
+    let lookups = 0;
+    const wrap = (client: unknown): unknown =>
+      new Proxy(client as object, {
+        get(target, prop, recv) {
+          if (prop === "$transaction") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => Promise<unknown>;
+            return async (...args: unknown[]) => {
+              lookups++;
+              return orig.apply(target, args);
+            };
+          }
+          if (prop === "$extends") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => unknown;
+            return (...args: unknown[]) => wrap(orig.apply(target, args));
+          }
+          return Reflect.get(target, prop, recv);
+        },
+      });
+    const counted = wrap(appDb) as PrismaClient;
+
+    const results = await Promise.all(
+      ["b1", "b2", "b3", "b4"].map((uuid) =>
+        receiveChatwootWebhook({
+          routeToken,
+          rawBody: body,
+          getHeader: signedHeaders(body, NOW, `uuid-burst-${uuid}`),
+          nowSeconds: NOW,
+          base: counted,
+        }),
+      ),
+    );
+
+    expect(results.every((r) => r.outcome === "queued")).toBe(true);
+    // ONE lookup for the whole burst: the one refresh they all coalesce onto.
+    expect(lookups).toBe(1);
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+  });
+
+  // AND THE BOUND IS THE RECEIVER'S, not merely the cache module's. A unit test of
+  // `awaitRouteTokenRefresh` proves the helper and says nothing about whether the ack path calls it:
+  // reading the map directly would compile, pass every other test here, and wedge this bot's webhook
+  // behind a lookup that never answers. So this asks the question where it is answered.
+  test("a refresh that never answers does not wedge the next delivery", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 55,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+    writeRouteTokenCache(
+      hashRouteToken(routeToken),
+      {
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        webhookSecret: encryptJson(SECRET),
+      },
+      { now: Date.now() - ROUTE_TOKEN_CACHE_TTL_MS - 1 },
+    );
+
+    // A lookup that hangs rather than failing: the socket is up, the answer never comes.
+    const wrap = (client: unknown): unknown =>
+      new Proxy(client as object, {
+        get(target, prop, recv) {
+          if (prop === "$transaction") return () => new Promise(() => {});
+          if (prop === "$extends") {
+            const orig = Reflect.get(target, prop, recv) as (
+              ...a: unknown[]
+            ) => unknown;
+            return (...args: unknown[]) => wrap(orig.apply(target, args));
+          }
+          return Reflect.get(target, prop, recv);
+        },
+      });
+    const hanging = wrap(appDb) as PrismaClient;
+
+    const send = (uuid: string) =>
+      receiveChatwootWebhook({
+        routeToken,
+        rawBody: body,
+        getHeader: signedHeaders(body, NOW, uuid),
+        nowSeconds: NOW,
+        base: hanging,
+      });
+
+    // The first is served stale and starts the refresh that will never answer.
+    expect((await send("uuid-hang-1")).outcome).toBe("queued");
+
+    // The second must come back one way or the other, well inside Chatwoot's budget.
+    const started = Date.now();
+    const settled = await Promise.race([
+      send("uuid-hang-2").then(
+        () => "resolved" as const,
+        () => "rejected" as const,
+      ),
+      new Promise<"wedged">((r) =>
+        setTimeout(() => r("wedged"), ROUTE_TOKEN_REFRESH_WAIT_MS + 2_000),
+      ),
+    ]);
+    expect(settled).not.toBe("wedged");
+    expect(Date.now() - started).toBeLessThan(
+      ROUTE_TOKEN_REFRESH_WAIT_MS + 1_500,
+    );
+
+    invalidateRouteTokenCache();
+    noteRouteTokenLookup(true);
+  }, 15_000);
+
+  test("a delivery stranded on PENDING is recovered by the redelivery", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 48,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+    const r = await receiveChatwootWebhook({
+      routeToken,
+      rawBody: body,
+      getHeader: signedHeaders(body, NOW, "uuid-stranded"),
+      nowSeconds: NOW,
+      base: appDb,
+    });
+
+    // The shape of a process that died after acking: the ledger row exists, nothing ran. Every
+    // redelivery from here on reads as a duplicate, so dropping duplicates would lose this message
+    // for good, since Chatwoot already has its 200 and will not send it again.
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: "uuid-stranded",
+        event: "conversation_updated",
+        status: "PENDING",
+      },
+    });
+
+    expect(
+      await recordAndProcessChatwootDelivery({
+        tenantId,
+        instanceId: r.instanceId as bigint,
+        deliveryId: r.deliveryId as string,
+        agentBotId: r.agentBotId ?? null,
+        normalized: r.normalized as NonNullable<typeof r.normalized>,
+        base: appDb,
+      }),
+    ).toBe("processed");
+
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { chatwootInstanceId: instanceId, deliveryId: "uuid-stranded" },
+    });
+    expect(row.status).toBe("PROCESSED");
+  });
+
+  test("disconnecting the instance takes the route token out of the cache", async () => {
+    const body = JSON.stringify({
+      event: "conversation_updated",
+      id: 49,
+      inbox_id: 7,
+      status: "pending",
+      meta: { assignee_type: "AgentBot", assignee: { id: 9 } },
+    });
+    const send = (uuid: string) =>
+      receiveChatwootWebhook({
+        routeToken,
+        rawBody: body,
+        getHeader: signedHeaders(body, NOW, uuid),
+        nowSeconds: NOW,
+        base: appDb,
+      });
+
+    expect((await send("uuid-live")).outcome).toBe("queued");
+
+    await suDb.chatwootInstance.update({
+      where: { id: instanceId },
+      data: { disconnectedAt: new Date() },
+    });
+    // Written straight to the row here, so the cache still holds the live answer. The production
+    // writers call invalidateRouteTokenCache themselves; this pins that the invalidation is what
+    // makes the change land, rather than the TTL quietly doing it later.
+    invalidateRouteTokenCache();
+
+    await expect(send("uuid-dead")).rejects.toThrow();
+
+    await suDb.chatwootInstance.update({
+      where: { id: instanceId },
+      data: { disconnectedAt: null },
+    });
+    invalidateRouteTokenCache();
+    expect((await send("uuid-again")).outcome).toBe("queued");
   });
 
   test("ignores a payload with no event field", async () => {
@@ -432,7 +1076,7 @@ describe.skipIf(!dbUp)("chatwoot webhook receiver", () => {
       base: appDb,
     });
     expect(r.outcome).toBe("ignored");
-    expect(r.deliveryRowId).toBeUndefined();
+    expect(r.deliveryId).toBeUndefined();
   });
 
   test("issue #8: an inbound message during a human-owned period advances the handled watermark", async () => {
@@ -460,10 +1104,10 @@ describe.skipIf(!dbUp)("chatwoot webhook receiver", () => {
       base: appDb,
     });
     expect(r.outcome).toBe("queued");
-    const proc = await processChatwootDelivery({
+    const proc = await recordAndProcessChatwootDelivery({
       tenantId,
       instanceId: r.instanceId as bigint,
-      deliveryRowId: r.deliveryRowId as bigint,
+      deliveryId: r.deliveryId as string,
       agentBotId: r.agentBotId ?? null,
       normalized: r.normalized as NonNullable<typeof r.normalized>,
       base: appDb,
@@ -490,10 +1134,10 @@ describe.skipIf(!dbUp)("chatwoot webhook receiver", () => {
         base: appDb,
       });
       expect(r.outcome).toBe("queued");
-      const proc = await processChatwootDelivery({
+      const proc = await recordAndProcessChatwootDelivery({
         tenantId,
         instanceId: r.instanceId as bigint,
-        deliveryRowId: r.deliveryRowId as bigint,
+        deliveryId: r.deliveryId as string,
         agentBotId: r.agentBotId ?? null,
         normalized: r.normalized as NonNullable<typeof r.normalized>,
         base: appDb,

@@ -6,6 +6,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { lastAssistantText } from "@/graph/graph";
+import type { ModelRetryInfo } from "@/graph/model-limit";
 import type { ResolvedModelConfig } from "@/graph/models";
 import type { AgentNudge } from "@/graph/nudge";
 import { renderNudge } from "@/graph/nudge";
@@ -45,12 +46,12 @@ import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { renderInboundMessage } from "@/modules/chatwoot/render";
+import { documentToolName } from "@/modules/documents/templates";
 import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
-import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import {
   readFollowUpConfig,
   stepDelayMinutes,
@@ -120,10 +121,6 @@ async function lastRenderedMessageId(
   }
 }
 
-function sysCtx(tenantId: bigint): TenantContext {
-  return { tenantId, userId: null, role: "TENANT_ADMIN" };
-}
-
 export interface PlaygroundDeps {
   makeModel?: (cfg: ResolvedModelConfig) => BaseChatModel;
   checkpointer?: BaseCheckpointSaver;
@@ -134,7 +131,12 @@ export interface PlaygroundDeps {
 }
 
 export interface PlaygroundTurnParams {
-  tenantId: bigint;
+  // The REQUEST's context, not an id lifted out of it, and every playground entry point takes the
+  // same. `runScopedOn` verifies an unknown tenant only for a SUPER_ADMIN caller, because the role
+  // is what separates an id that came from outside the process from one it read from a row: this
+  // module used to rebuild a TENANT_ADMIN context here, which told that check the id was internal
+  // and turned a dead console selection into an empty playground instead of a refusal (issue #268).
+  ctx: TenantContext;
   agentId: bigint;
   message: string;
   threadId?: string;
@@ -215,14 +217,15 @@ export function applyToolMocks(
 // vars come from `overrides.promptVars` when the operator simulates them. Throws the same
 // not-runnable errors as the turn path (agent missing vs no model credential).
 async function loadPlaygroundConfig(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   threadId: string;
   base: PrismaClient;
   overrides?: AgentConfigOverrides;
 }): Promise<AgentConfig> {
-  const { tenantId, agentId, threadId, base } = params;
-  const loaded = await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const { ctx, agentId, threadId, base } = params;
+  const tenantId = ctx.tenantId as bigint;
+  const loaded = await runScopedOn(base, ctx, (db) =>
     loadAgentConfig(
       db,
       { tenantId, instanceId: 0n, conversationId: 0, agentId, threadId },
@@ -231,7 +234,7 @@ async function loadPlaygroundConfig(params: {
   );
   if (!loaded) {
     // Agent missing OR no model credential configured — distinguish the two for the operator.
-    const exists = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    const exists = await runScopedOn(base, ctx, (db) =>
       db.agent.findUnique({ where: { id: agentId }, select: { id: true } }),
     );
     if (!exists)
@@ -251,7 +254,7 @@ async function loadPlaygroundConfig(params: {
 function buildPlaygroundToolset(
   loaded: AgentConfig,
   params: {
-    tenantId: bigint;
+    ctx: TenantContext;
     threadId: string;
     base: PrismaClient;
     deps?: PlaygroundDeps;
@@ -260,7 +263,7 @@ function buildPlaygroundToolset(
   return buildToolset(
     loaded,
     {
-      tenantId: params.tenantId,
+      tenantId: params.ctx.tenantId as bigint,
       instanceId: 0n,
       base: params.base,
       client: {} as ChatwootClient,
@@ -272,6 +275,11 @@ function buildPlaygroundToolset(
       // (calculator, get_current_time) run for real. `allowed` is the agent's own native set.
       buildNativeTools: (ctx, allowed) =>
         buildSimulatedNativeTools(ctx, allowed),
+      // A document tool is conversation-scoped for the same reason handoff/resolve are: it needs a
+      // turn to attach the file to. Run for real here it would refuse every call with the message
+      // meant for proactive nudges, so the playground would show behaviour production never
+      // produces. Simulated, the operator sees the agent choose it — which is what they came to see.
+      simulateDocuments: true,
       mcp: params.deps?.mcp,
     },
   );
@@ -281,7 +289,7 @@ function buildPlaygroundToolset(
 // toolset, applies the operator's `toolMocks` over the result, then the model+graph and tracing
 // callbacks. Returns `traceLabels` so callers can tag mocked/simulated results in the trace.
 async function buildPlaygroundGraph(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   threadId: string;
   base: PrismaClient;
@@ -291,7 +299,25 @@ async function buildPlaygroundGraph(params: {
   turnId?: string;
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
-  onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  // The same two lines the two production entrypoints leave. The playground is where an operator
+  // finds out what their agent does, so a fallback that silently answers here is a fallback they
+  // conclude the wrong things from.
+  onModelFallback?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackFailed?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackUnavailable?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
   onHistoryTrim?: (info: {
     kept: number;
     dropped: number;
@@ -299,16 +325,17 @@ async function buildPlaygroundGraph(params: {
   }) => void;
   nudgeDecision?: NudgeDecisionState;
 }) {
-  const { tenantId, agentId, threadId, base } = params;
+  const { ctx, agentId, threadId, base } = params;
+  const tenantId = ctx.tenantId as bigint;
   const loaded = await loadPlaygroundConfig({
-    tenantId,
+    ctx,
     agentId,
     threadId,
     base,
     overrides: params.overrides,
   });
   const rawTools = await buildPlaygroundToolset(loaded, {
-    tenantId,
+    ctx,
     threadId,
     base,
     deps: params.deps,
@@ -328,15 +355,21 @@ async function buildPlaygroundGraph(params: {
   const mockedNames = new Set(Object.keys(toolMocks ?? {}));
   const toolNames = new Set(tools.map((tl) => tl.name));
   const simulatedNames = new Set(
-    CONVERSATION_NATIVE_TOOL_NAMES.filter(
-      (n) => toolNames.has(n) && !mockedNames.has(n),
-    ),
+    [
+      ...CONVERSATION_NATIVE_TOOL_NAMES,
+      // The document tools the agent was granted, by the name each template produces: they are
+      // simulated here too, and a trace that did not say so would read as a document really issued.
+      ...loaded.documentSelections.map((d) => documentToolName(d.slug)),
+    ].filter((n) => toolNames.has(n) && !mockedNames.has(n)),
   );
   const traceLabels: TraceLabelOpts = { mockedNames, simulatedNames };
   const graph = await buildModelAndGraph(loaded, tools, {
     makeModel: params.deps?.makeModel,
     checkpointer: params.deps?.checkpointer,
     onModelRetry: params.onModelRetry,
+    onModelFallback: params.onModelFallback,
+    onModelFallbackFailed: params.onModelFallbackFailed,
+    onModelFallbackUnavailable: params.onModelFallbackUnavailable,
     onHistoryTrim: params.onHistoryTrim,
   });
   // Tag usage as playground so it never pollutes the real dashboard figures (the dashboard
@@ -376,21 +409,24 @@ export interface PlaygroundToolInfo {
 // then classifies each tool by the loaded grant name-sets. MCP is best-effort (same network a turn
 // does); a failed MCP load just omits those tools, like a turn.
 export async function listPlaygroundTools(params: {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   base?: PrismaClient;
   deps?: PlaygroundDeps;
 }): Promise<PlaygroundToolInfo[]> {
   const base = params.base ?? basePrisma;
-  const threadId = newPlaygroundThreadId(params.tenantId, params.agentId);
+  const threadId = newPlaygroundThreadId(
+    params.ctx.tenantId as bigint,
+    params.agentId,
+  );
   const loaded = await loadPlaygroundConfig({
-    tenantId: params.tenantId,
+    ctx: params.ctx,
     agentId: params.agentId,
     threadId,
     base,
   });
   const tools = await buildPlaygroundToolset(loaded, {
-    tenantId: params.tenantId,
+    ctx: params.ctx,
     threadId,
     base,
     deps: params.deps,
@@ -398,6 +434,12 @@ export async function listPlaygroundTools(params: {
 
   const conversation = new Set<string>(CONVERSATION_NATIVE_TOOL_NAMES);
   const utility = new Set<string>(UTILITY_NATIVE_TOOL_NAMES);
+  // Simulated here for the same reason the conversation natives are, so the catalog has to say so:
+  // the panel's badge is what tells the operator this run cannot issue a real document, and without
+  // it the tool reads as an ordinary external one that does.
+  const document = new Set(
+    loaded.documentSelections.map((d) => documentToolName(d.slug)),
+  );
   const knowledge = new Set(loaded.ragConfig?.tools ?? []);
   const http = new Set(loaded.httpToolDefs.map((d) => d.name));
   const mcp = new Set(loaded.mcpSelections.flatMap((s) => s.enabledTools));
@@ -410,6 +452,8 @@ export async function listPlaygroundTools(params: {
     const description = tl.description ?? "";
     if (conversation.has(name))
       return { name, description, category: "native", simulated: true };
+    if (document.has(name))
+      return { name, description, category: "external", simulated: true };
     if (utility.has(name))
       return { name, description, category: "utility", simulated: false };
     if (knowledge.has(name))
@@ -437,7 +481,8 @@ function lastAiMessageId(messages: unknown[]): string | undefined {
 export async function runPlaygroundTurn(
   params: PlaygroundTurnParams,
 ): Promise<PlaygroundTurnResult> {
-  const { tenantId, agentId, message } = params;
+  const { ctx, agentId, message } = params;
+  const tenantId = ctx.tenantId as bigint;
   const base = params.base ?? basePrisma;
   const text = message.trim();
   if (!text) throw new AppError("empty message", 400, "errors.emptyMessage");
@@ -463,19 +508,56 @@ export async function runPlaygroundTurn(
   };
   const { graph, callbacks, loaded, tools, traceLabels } =
     await buildPlaygroundGraph({
-      tenantId,
+      ctx,
       agentId,
       threadId,
       base,
       deps: params.deps,
       overrides: params.overrides,
       turnId,
-      onModelRetry: ({ attempt }) =>
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
@@ -489,6 +571,12 @@ export async function runPlaygroundTurn(
           },
         }),
     });
+  // Assigned rather than passed at construction: the debug mode is an agent SETTING, and the agent's
+  // settings are what `buildPlaygroundGraph` just read. Every callback above only fires during
+  // `graph.invoke` below, so none of them can emit before this line runs. Playground rows are on the
+  // Logs page like any other, so an operator who turned the mode on for this agent gets the same
+  // answer here as on real traffic (#58).
+  flow.fullDetail = loaded.fullDetail;
 
   // The SAME gate the inbox path runs (issue #136). Without it the operator read the agent's raw
   // reply while the customer would have received the template, or nothing at all — the one setting
@@ -504,7 +592,7 @@ export async function runPlaygroundTurn(
   const saveInboundMedia = async (): Promise<string | undefined> =>
     params.userMedia
       ? ((await savePlaygroundMedia(base, {
-          tenantId,
+          ctx,
           agentId,
           threadId,
           messageId: humanId,
@@ -539,7 +627,7 @@ export async function runPlaygroundTurn(
     const blockedReply = screenedText(inGuard, text) ?? "";
     await upsertPlaygroundSession(
       base,
-      tenantId,
+      ctx,
       agentId,
       threadId,
       params.titleHint ?? text,
@@ -549,7 +637,7 @@ export async function runPlaygroundTurn(
     // SHOWS (see lastRenderedMessageId), which is not always what the thread ends on.
     const blockedMediaId = await saveInboundMedia();
     await savePlaygroundTurnNote(base, {
-      tenantId,
+      ctx,
       agentId,
       threadId,
       messageId: null,
@@ -617,7 +705,7 @@ export async function runPlaygroundTurn(
   ];
   await upsertPlaygroundSession(
     base,
-    tenantId,
+    ctx,
     agentId,
     threadId,
     params.titleHint ?? text,
@@ -637,7 +725,7 @@ export async function runPlaygroundTurn(
   // surface one operator drives.
   if (gTrace.length > 0) {
     await savePlaygroundTurnNote(base, {
-      tenantId,
+      ctx,
       agentId,
       threadId,
       messageId: lastAiMessageId(result.messages) ?? null,
@@ -697,7 +785,7 @@ export async function runPlaygroundTurn(
       if (tts && aiId) {
         ttsMediaId =
           (await savePlaygroundMedia(base, {
-            tenantId,
+            ctx,
             agentId,
             threadId,
             messageId: aiId,
@@ -727,7 +815,7 @@ export async function runPlaygroundTurn(
 }
 
 export interface PlaygroundFollowupParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   threadId?: string;
   // Optional operator-supplied situation note; overrides the default "inactive for ~N min" summary.
@@ -761,7 +849,8 @@ export interface PlaygroundFollowupResult {
 export async function runPlaygroundFollowup(
   params: PlaygroundFollowupParams,
 ): Promise<PlaygroundFollowupResult> {
-  const { tenantId, agentId } = params;
+  const { ctx, agentId } = params;
+  const tenantId = ctx.tenantId as bigint;
   const base = params.base ?? basePrisma;
 
   const threadId =
@@ -786,7 +875,7 @@ export async function runPlaygroundFollowup(
   };
   const { graph, callbacks, loaded, tools, traceLabels } =
     await buildPlaygroundGraph({
-      tenantId,
+      ctx,
       agentId,
       threadId,
       base,
@@ -794,12 +883,49 @@ export async function runPlaygroundFollowup(
       overrides: params.overrides,
       turnId,
       nudgeDecision,
-      onModelRetry: ({ attempt }) =>
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
@@ -813,10 +939,12 @@ export async function runPlaygroundFollowup(
           },
         }),
     });
+  // Same reason as the turn path above: set after the settings read, before any callback can emit.
+  flow.fullDetail = loaded.fullDetail;
 
   // Draft settings (if present) drive the follow-up instructions/delay so the simulation matches
   // what the operator is editing live; otherwise the saved settings.
-  const agent = await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const agent = await runScopedOn(base, ctx, (db) =>
     db.agent.findUnique({ where: { id: agentId }, select: { settings: true } }),
   );
   const settings = params.overrides?.settings ?? agent?.settings;
@@ -847,7 +975,11 @@ export async function runPlaygroundFollowup(
         callbacks: [
           ...callbacks,
           new ToolFlowLogger(flow, {
-            logValues: readObservabilityConfig(settings).logToolValues,
+            // From the loaded config, which reads this block off the SAVED bag — never from
+            // `settings` here, which is the draft. Recording policy does not follow a draft (see
+            // `prepare.ts`), and this line reading it separately is how the follow-up path came to
+            // answer differently from the turn path for the same agent.
+            logValues: loaded.logToolValues,
             tools,
           }),
         ],
@@ -896,7 +1028,7 @@ export async function runPlaygroundFollowup(
   ];
   if (gTrace.length > 0) {
     await savePlaygroundTurnNote(base, {
-      tenantId,
+      ctx,
       agentId,
       threadId,
       messageId: lastAiMessageId(result.messages) ?? null,
@@ -911,7 +1043,7 @@ export async function runPlaygroundFollowup(
     });
   }
   // Bump the session (or create one titled by the first message if the follow-up is the first turn).
-  await upsertPlaygroundSession(base, tenantId, agentId, threadId, "");
+  await upsertPlaygroundSession(base, ctx, agentId, threadId, "");
   return {
     reply,
     threadId,
@@ -952,7 +1084,7 @@ async function normalizeAudioUpload(
 }
 
 export interface PlaygroundTranscribeOnlyParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   file: File;
   // Live draft (live-edit popup): its STT config overrides the saved one, so an unsaved credential
@@ -971,7 +1103,7 @@ export async function runPlaygroundTranscribe(
 ): Promise<{ transcription: string }> {
   const { bytes, mimeType } = await normalizeAudioUpload(params.file);
   const transcription = await transcribePlaygroundAudio({
-    tenantId: params.tenantId,
+    ctx: params.ctx,
     agentId: params.agentId,
     audio: bytes,
     mimeType,
@@ -983,7 +1115,7 @@ export async function runPlaygroundTranscribe(
 }
 
 export interface PlaygroundAudioParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   file: File;
   threadId?: string;
@@ -1012,7 +1144,7 @@ export interface PlaygroundAudioResult extends PlaygroundTurnResult {
 export async function runPlaygroundAudioTurn(
   params: PlaygroundAudioParams,
 ): Promise<PlaygroundAudioResult> {
-  const { tenantId, agentId, file } = params;
+  const { ctx, agentId, file } = params;
   const { bytes, mimeType } = await normalizeAudioUpload(file);
 
   // Reuse the transcribe-only step's result when supplied (the UI shows it early); otherwise
@@ -1021,7 +1153,7 @@ export async function runPlaygroundAudioTurn(
     params.transcription !== undefined
       ? params.transcription
       : await transcribePlaygroundAudio({
-          tenantId,
+          ctx,
           agentId,
           audio: bytes,
           mimeType,
@@ -1037,7 +1169,7 @@ export async function runPlaygroundAudioTurn(
     attachmentTypes: ["audio"],
   });
   const turn = await runPlaygroundTurn({
-    tenantId,
+    ctx,
     agentId,
     message,
     threadId: params.threadId,
@@ -1075,7 +1207,7 @@ async function readFileUpload(file: File): Promise<ArrayBuffer> {
 export type PlaygroundExtractKind = "image" | "document" | "unsupported";
 
 export interface PlaygroundExtractOnlyParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   file: File;
   // Live draft (live-edit popup): its vision config overrides the saved one (test an unsaved key).
@@ -1095,14 +1227,14 @@ export async function runPlaygroundExtract(
   // Log the read as a `vision` stage on the Logs page (source=playground). This is step 1 of the
   // two-step UI flow, so the extraction runs HERE (step 2 reuses the result and skips it).
   const flow: FlowContext = {
-    tenantId: params.tenantId,
+    tenantId: params.ctx.tenantId as bigint,
     turnId: crypto.randomUUID(),
     source: "playground",
     agentId: params.agentId,
     base: params.base,
   };
   const { kind, text } = await extractPlaygroundFile({
-    tenantId: params.tenantId,
+    ctx: params.ctx,
     agentId: params.agentId,
     file: bytes,
     mimeType: params.file.type || null,
@@ -1115,7 +1247,7 @@ export async function runPlaygroundExtract(
 }
 
 export interface PlaygroundFileParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   agentId: bigint;
   file: File;
   threadId?: string;
@@ -1144,14 +1276,14 @@ export interface PlaygroundFileResult extends PlaygroundTurnResult {
 // Playground-only read; falls back to a generic label if the agent/config vanished.
 async function resolveVisionLabel(
   base: PrismaClient,
-  tenantId: bigint,
+  ctx: TenantContext,
   agentId: bigint,
   draftSettings: unknown,
 ): Promise<{ provider: string; model: string | null }> {
   const cfg =
     draftSettings !== undefined
       ? readVisionConfig(draftSettings)
-      : await runScopedOn(base, sysCtx(tenantId), async (db) => {
+      : await runScopedOn(base, ctx, async (db) => {
           const agent = await db.agent.findUnique({
             where: { id: agentId },
             select: { settings: true },
@@ -1168,7 +1300,8 @@ async function resolveVisionLabel(
 export async function runPlaygroundFileTurn(
   params: PlaygroundFileParams,
 ): Promise<PlaygroundFileResult> {
-  const { tenantId, agentId, file } = params;
+  const { ctx, agentId, file } = params;
+  const tenantId = ctx.tenantId as bigint;
   const base = params.base ?? basePrisma;
   const bytes = await readFileUpload(file);
 
@@ -1178,7 +1311,7 @@ export async function runPlaygroundFileTurn(
     params.kind !== undefined && params.extracted !== undefined
       ? { kind: params.kind, text: params.extracted }
       : await extractPlaygroundFile({
-          tenantId,
+          ctx,
           agentId,
           file: bytes,
           mimeType: file.type || null,
@@ -1215,7 +1348,7 @@ export async function runPlaygroundFileTurn(
           });
 
   const turn = await runPlaygroundTurn({
-    tenantId,
+    ctx,
     agentId,
     message,
     threadId: params.threadId,
@@ -1240,7 +1373,7 @@ export async function runPlaygroundFileTurn(
   if (kind === "image" || kind === "document") {
     const label = await resolveVisionLabel(
       base,
-      tenantId,
+      ctx,
       agentId,
       params.overrides?.settings,
     );

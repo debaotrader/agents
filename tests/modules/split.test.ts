@@ -106,4 +106,19 @@ describe("deliverReply", () => {
     expect(rec.sent).toEqual([canonical]);
     expect(rec.typing).toEqual([true, false]);
   });
+
+  test("a run called off during typing sends no partial balloon", async () => {
+    const rec = { sent: [] as string[], typing: [] as boolean[] };
+    const n = await deliverReply(
+      stub(rec),
+      1,
+      "Olá!\n\nComo vai?\n\nPosso ajudar?",
+      { ...SPLIT_DEFAULTS, enabled: true },
+      noSleep,
+      undefined,
+      async () => true,
+    );
+    expect(n).toBe(0);
+    expect(rec.sent).toEqual([]);
+  });
 });

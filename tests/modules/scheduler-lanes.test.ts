@@ -3,6 +3,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import {
+  JOB_DEATH_LEVEL,
   JOB_DELETE_ON_DONE,
   JOB_LANE,
   JOB_SPENDS_PROVIDER,
@@ -85,6 +86,9 @@ const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // deciding correctness — and the debounce lane can be switched off entirely, which would have
   // stranded every queued message on an install that does not use debounce.
   INGEST_MESSAGE: "shared",
+  // Shared: a sweep with a cadence of minutes and one indexed query per tenant. The recovery it
+  // arms is a DEBOUNCE job, which is claimed on the fast lane on its own account (issue #228).
+  DELIVERY_SWEEP: "shared",
 };
 
 // Same discipline as EXPECTED_LANE, and for a sharper reason: the bound test below can only
@@ -104,6 +108,9 @@ const EXPECTED_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
   INGEST_MESSAGE: false,
+  // Reads and writes rows, emits log lines, invokes nothing: the sweep reports a stranded delivery
+  // rather than answering it (issue #295).
+  DELIVERY_SWEEP: false,
 };
 
 // Same discipline again, and both of these maps were added by the change that introduced
@@ -124,6 +131,7 @@ const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   APPOINTMENT_REMINDER: false,
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
+  DELIVERY_SWEEP: false,
 };
 
 const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
@@ -138,6 +146,26 @@ const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   APPOINTMENT_REMINDER: false,
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
+  DELIVERY_SWEEP: false,
+};
+
+// Written out ON PURPOSE, like the tables above: derived, it would mirror whatever the source says.
+const EXPECTED_DEATH_LEVEL: Record<
+  SchedulerJobKind,
+  "info" | "warn" | "error"
+> = {
+  FOLLOWUP: "error",
+  FOLLOWUP_SWEEP: "error",
+  WEBHOOK_RETRY: "error",
+  DEBOUNCE: "error",
+  RAG_INGEST: "error",
+  HEARTBEAT: "error",
+  FLOWLOG_SWEEP: "error",
+  APPOINTMENT_REMINDER: "error",
+  REDIRECT_FOLLOWUP: "error",
+  MEMORY_COMPACT: "error",
+  INGEST_MESSAGE: "error",
+  DELIVERY_SWEEP: "error",
 };
 
 const ALL_KINDS = Object.keys(EXPECTED_LANE) as SchedulerJobKind[];
@@ -167,6 +195,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     const ids = new Map<bigint, SchedulerJobKind>();
     for (const kind of ALL_KINDS) {
       const id = await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind,
         dedupeKey: `lane-${kind}`,
@@ -244,6 +273,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     });
 
     await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "HEARTBEAT",
       dedupeKey: "drain-first",
@@ -251,6 +281,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
       base: appDb,
     });
     await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "FLOWLOG_SWEEP",
       dedupeKey: "drain-second",
@@ -318,6 +349,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
 
     for (let i = 0; i < N; i++) {
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "APPOINTMENT_REMINDER",
         dedupeKey: `bound-costly-${i}`,
@@ -325,6 +357,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
         base: appDb,
       });
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "HEARTBEAT",
         dedupeKey: `bound-cheap-${i}`,
@@ -379,6 +412,10 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     expect(JOB_SPENDS_PROVIDER).toEqual(EXPECTED_SPENDS_PROVIDER);
     expect(JOB_TRAFFIC_PROPORTIONAL).toEqual(EXPECTED_TRAFFIC_PROPORTIONAL);
     expect(JOB_DELETE_ON_DONE).toEqual(EXPECTED_DELETE_ON_DONE);
+    // What each kind's DEATH says to the operator (issue #356). Stated here for the same reason as
+    // the three above, and with one more: the answers currently agree, so no behavioural test can
+    // tell this table from a default. This is what says the thirteenth kind has to be asked.
+    expect(JOB_DEATH_LEVEL).toEqual(EXPECTED_DEATH_LEVEL);
   }, 30_000);
 
   // The production sizing, which the test above deliberately does not exercise: never the whole
@@ -403,6 +440,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     });
     try {
       const foreign = await enqueueJob({
+        rearm: "same-work",
         tenantId: other.id,
         kind: "WEBHOOK_RETRY",
         dedupeKey: "foreign",
@@ -441,6 +479,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
   // change that a function was covered and its call site was not.
   test("the shared tick drains both halves of its lane", async () => {
     const fixed = await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "WEBHOOK_RETRY",
       dedupeKey: "dk-tick-fixed",
@@ -448,6 +487,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
       base: appDb,
     });
     const traffic = await enqueueJob({
+      rearm: "same-work",
       tenantId,
       kind: "INGEST_MESSAGE",
       dedupeKey: "dk-tick-traffic",
@@ -504,6 +544,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
 
     for (const key of ["reject-a", "reject-b"]) {
       await enqueueJob({
+        rearm: "same-work",
         tenantId,
         kind: "WEBHOOK_RETRY",
         dedupeKey: key,

@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
+import {
+  FULL_DETAIL_MAX_HOURS,
+  parseIsoInstant,
+} from "@/modules/flowlog/settings";
 import { FOLLOW_UP_DELAY_UNITS } from "@/modules/followups/settings";
 import { HANDOFF_MODES } from "@/modules/handoff/settings";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
@@ -217,6 +221,12 @@ const followUpStep = z.looseObject({
     .optional()
     .describe("merged into the conversation's labels, never replacing"),
   resolve: z.boolean().optional().describe("honored on the LAST step only"),
+  ignoreAppointmentPause: z
+    .boolean()
+    .optional()
+    .describe(
+      "let THIS step fire while a booking stands; no-op unless followUp.pauseWhileAppointment is on",
+    ),
 });
 
 const followUp = z.looseObject({
@@ -365,6 +375,30 @@ const observability = z.looseObject({
     .boolean()
     .optional()
     .describe("tool arguments as VALUES instead of shapes"),
+  // NOTE: `z.string()`, not `z.iso.datetime()`. The typed form publishes a 430-character regex into
+  // every listing of this tool, which is a third of a block's whole budget spent restating a format
+  // the description states in four words. The check is the same either way — it runs in the refine
+  // below, which publishes nothing — and what a caller loses is the machine-readable `format`, not
+  // the constraint.
+  fullDetailUntil: z
+    .string()
+    .nullable()
+    .optional()
+    .refine((v) => {
+      if (v == null) return true;
+      // Through the READER's own parser, so a caller is refused by the same rule the runtime will
+      // apply — an offset-bearing ISO instant, never `Date.parse`'s wider vocabulary. Refusing here
+      // is the courtesy half: the reader refuses it either way, but silently, as the mode simply
+      // never arming.
+      const t = parseIsoInstant(v);
+      return (
+        t !== null &&
+        t.getTime() <= Date.now() + FULL_DETAIL_MAX_HOURS * 3_600_000
+      );
+    }, `an ISO instant with an offset, at most ${FULL_DETAIL_MAX_HOURS}h ahead`)
+    .describe(
+      `ISO instant the log debug mode ends, at most ${FULL_DETAIL_MAX_HOURS}h ahead; until then this agent's log detail is stored whole instead of cut at 2000 chars`,
+    ),
 });
 
 const memory = z.looseObject({
@@ -388,7 +422,30 @@ const memory = z.looseObject({
     .optional(),
 });
 
-// The 17 behavior blocks of `agent_settings_set`, each a partial patch over the stored block.
+const modelFallback = z.looseObject({
+  // WHERE THE TURN GOES when the agent's own provider cannot take it. Resolved by the same
+  // `resolveModelOverride` the speech rewrite and the summariser use, so the rules about whose key
+  // may travel to which host are written once — a fallback on another vendor carries its own
+  // credential or it does not run.
+  //
+  // The one place this block reads DIFFERENTLY from its two siblings: there, everything absent means
+  // "run on the agent's own model", which is a useful default. Here that would be a fallback to the
+  // provider that just failed — configured-looking and a guaranteed no-op. So a fallback exists only
+  // when the operator named BOTH a provider and a model, and anything less is no fallback at all.
+  provider: oneOf(MODEL_PROVIDERS)
+    .nullable()
+    .optional()
+    .describe("the fallback's model PROVIDER; absent = no fallback"),
+  model: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("the fallback's model id; absent = no fallback"),
+  credentialRef: credentialRef(),
+  baseURL: baseURL(),
+});
+
+// The 18 behavior blocks of `agent_settings_set`, each a partial patch over the stored block.
 export const BEHAVIOR_PATCH_SHAPE = {
   debounce: debounce.optional(),
   stt: stt.optional(),
@@ -407,6 +464,7 @@ export const BEHAVIOR_PATCH_SHAPE = {
   sendImage: sendImage.optional(),
   observability: observability.optional(),
   memory: memory.optional(),
+  modelFallback: modelFallback.optional(),
 } satisfies z.ZodRawShape;
 
 export type BehaviorPatchArgs = z.infer<

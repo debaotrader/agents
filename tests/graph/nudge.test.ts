@@ -26,10 +26,11 @@ import {
   renderNudge,
   runAgentNudge,
 } from "@/graph/nudge";
+import { claimIngestWrite, releaseIngestWrite } from "@/graph/thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { selectClosedPrefix } from "@/modules/memory/cut";
-import { getJobHandler, registerJobHandler } from "@/modules/scheduler/worker";
+import { withJobHandler } from "@/tests/utils/job-registry";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
@@ -165,6 +166,30 @@ const suDb = su as PrismaClient;
 let tenantId = 0n;
 let instanceId = 0n;
 let inboxDbId = 0n;
+
+// Turns one of the stub's Chatwoot calls into the moment /reset lands: the returned closure answers
+// `stillWanted` and flips the first time that call is made. The point is the POSITION — a retirement
+// that lands before the run starts is a different (and easier) test than one that lands mid-turn.
+function retireOn(
+  s: { client: ChatwootClient },
+  method:
+    | "toggleStatus"
+    | "sendMessage"
+    | "setConversationLabels"
+    | "getConversationLabels",
+): () => Promise<boolean> {
+  let wanted = true;
+  const holder = s.client as unknown as Record<
+    string,
+    (...a: never[]) => unknown
+  >;
+  const inner = holder[method]?.bind(s.client);
+  holder[method] = ((...args: never[]) => {
+    wanted = false;
+    return inner?.(...args);
+  }) as (...a: never[]) => unknown;
+  return async () => wanted;
+}
 
 function stub() {
   const messages: Array<[number, string]> = [];
@@ -411,6 +436,74 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(isTurnInFlight(graphThreadId)).toBe(false);
   });
 
+  // The window between the thread claim and the invoke, which is not empty on a conversation that
+  // has a contact-inbox: the state read, the divider write, the marker move and armCompaction all
+  // sit in it, and the last opens a transaction of its own OUTSIDE the lock. The invoke persists the
+  // channel /reset is clearing, so an answer taken at the claim is an answer about the wrong moment.
+  test("a reset landing between the thread claim and the invoke stops the turn", async () => {
+    const contactInboxId = 8803;
+    await seedConv(9979, null, new Date(), contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    let wanted = true;
+    // The command commits at the thread write inside the lock — after the ask there, before the
+    // invoke. A boolean and not a job row: this path takes `stillWanted` as a closure.
+    const claimWatcher = appDb.$extends({
+      query: {
+        agentThread: {
+          async upsert({ args, query }) {
+            const res = await query(args);
+            wanted = false;
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    const s = stub();
+    // Counted at the GENERATION, not at the factory: the graph is built before any of this and a
+    // build counter would read 1 on a turn that never invoked.
+    let generated = 0;
+    class CountingModel extends BaseChatModel {
+      constructor() {
+        super({});
+      }
+      _llmType() {
+        return "fake-counting";
+      }
+      async _generate(): Promise<ChatResult> {
+        generated += 1;
+        return {
+          generations: [
+            { text: "Tudo certo?", message: new AIMessage("Tudo certo?") },
+          ],
+        };
+      }
+    }
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9979`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      stillWanted: async () => wanted,
+      base: claimWatcher,
+      deps: {
+        makeModel: () => new CountingModel(),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("stale");
+    expect(s.messages).toEqual([]);
+    // The thread was neither written to nor left claimed.
+    expect(isTurnInFlight(graphThreadId)).toBe(false);
+    expect(generated).toBe(0);
+  });
+
   // THE BARRIER (issue #194), at the third reader of the memory thread. A nudge is a model call on
   // this thread like any other, so a message the agent stayed silent on that is still a queued row
   // is a message the nudge writes without — and the nudge is the writer most likely to ask about
@@ -454,10 +547,6 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // One checkpointer for both, as production has: the drain runs its job through the scheduler's
     // registry, so this is where a test says which store it writes to.
     const saver = new MemorySaver();
-    const previous = getJobHandler("INGEST_MESSAGE");
-    registerJobHandler("INGEST_MESSAGE", (job, jobBase) =>
-      ingestHandler(job, jobBase, saver),
-    );
     const seen: string[] = [];
     class ContextObservingModel extends BaseChatModel {
       calls = 0;
@@ -493,34 +582,34 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       }
     }
     const s = stub();
-    let outcome: string;
-    try {
-      outcome = await runAgentNudge({
-        tenantId,
-        threadId: `${tenantId}:${instanceId}:917`,
-        nudge: { source: "followup", kind: "inactivity", step: 1 },
-        base: appDb,
-        deps: {
-          makeModel: () => new ContextObservingModel(),
-          makeClient: s.makeClient,
-          checkpointer: saver,
-          persistUsage: async () => {},
-        },
-      });
-    } finally {
-      if (previous) registerJobHandler("INGEST_MESSAGE", previous);
-    }
+    const outcome = await withJobHandler(
+      "INGEST_MESSAGE",
+      (job, jobBase) => ingestHandler(job, jobBase, saver),
+      () =>
+        runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:917`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          base: appDb,
+          deps: {
+            makeModel: () => new ContextObservingModel(),
+            makeClient: s.makeClient,
+            checkpointer: saver,
+            persistUsage: async () => {},
+          },
+        }),
+    );
 
     expect(outcome).toBe("messaged");
     // The customer's owed words were in the context the nudge was written from.
     expect(seen[0] ?? "").toContain(OWED);
   });
 
-  // The claim is taken inside a transaction, and a transaction can reject AFTER its callback ran (a
-  // failed commit, a lost connection). A claim made on the way to a rejection that skips the release
-  // never comes back: every later compaction on this thread reads it as busy and reschedules until
-  // the process restarts.
-  test("a claim taken on a transaction that then rejects is still released", async () => {
+  // The claim is taken inside the thread's critical section, and anything in there can fail after
+  // the mark is set: a short transaction, the checkpointer write, a lost connection. A claim made on
+  // the way to a rejection that skips the release never comes back, and every later compaction on
+  // this thread reads it as busy and reschedules until the process restarts.
+  test("a claim taken in a section that then fails is still released", async () => {
     const contactInboxId = 8803;
     await seedConv(914, null, new Date(), contactInboxId);
     const graphThreadId = contactInboxThreadId(
@@ -528,55 +617,54 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       instanceId,
       contactInboxId,
     );
-    // Fails ONLY the transaction that takes the claim, and only on the way OUT — the callback, and
-    // the mark inside it, already ran. That transaction is the one that acquires the advisory lock,
-    // which is how it is told apart from the scoped reads the nudge makes before it; failing all of
-    // them would abort the nudge before it ever claimed, and the test would pass with the bug in.
+    // Fails ONLY the transaction that writes the sidecar row, and only on the way OUT: that write is
+    // the one piece of work that runs AFTER the mark is set, so it is what tells the post-claim
+    // transaction apart from the reads the nudge makes before it. Failing by count instead was the
+    // first attempt and it proved nothing: the nudge opens several transactions before the section,
+    // so the count tripped early, the nudge aborted before it ever claimed, and the test passed with
+    // the release deleted.
     // biome-ignore lint/suspicious/noExplicitAny: proxying Prisma's client surface
-    const failCommitOnLock = (client: any): any =>
+    const failAfterClaim = (client: any): any =>
       new Proxy(client, {
         get(target, prop, receiver) {
           if (prop === "$extends") {
             return (...args: unknown[]) =>
-              failCommitOnLock(target.$extends(...args));
+              failAfterClaim(target.$extends(...args));
           }
           if (prop === "$transaction") {
             return async (fn: (tx: unknown) => Promise<unknown>) => {
-              let tookTheLock = false;
+              let wroteTheMarker = false;
               // biome-ignore lint/suspicious/noExplicitAny: proxying Prisma's client surface
               const out = await target.$transaction((tx: any) =>
                 fn(
                   new Proxy(tx, {
                     // biome-ignore lint/suspicious/noExplicitAny: same
                     get(t2: any, p2: string | symbol, r2: unknown) {
-                      if (p2 === "$executeRaw") {
-                        return (
-                          strings: TemplateStringsArray,
-                          ...v: unknown[]
-                        ) => {
-                          if (
-                            String(strings?.[0]).includes(
-                              "pg_advisory_xact_lock",
-                            )
-                          ) {
-                            tookTheLock = true;
-                          }
-                          return t2.$executeRaw(strings, ...v);
-                        };
+                      if (p2 === "agentThread") {
+                        const model = Reflect.get(t2, p2, r2);
+                        return new Proxy(model, {
+                          // biome-ignore lint/suspicious/noExplicitAny: same
+                          get(m: any, mp: string | symbol, mr: unknown) {
+                            if (mp === "upsert") {
+                              wroteTheMarker = true;
+                            }
+                            return Reflect.get(m, mp, mr);
+                          },
+                        });
                       }
                       return Reflect.get(t2, p2, r2);
                     },
                   }),
                 ),
               );
-              if (tookTheLock) throw new Error("connection lost on commit");
+              if (wroteTheMarker) throw new Error("connection lost on commit");
               return out;
             };
           }
           return Reflect.get(target, prop, receiver);
         },
       });
-    const rejectingBase = failCommitOnLock(appDb) as typeof appDb;
+    const rejectingBase = failAfterClaim(appDb) as typeof appDb;
     const s2 = stub();
 
     await expect(
@@ -888,6 +976,74 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(row?.lastConversationId).toBe(942);
   });
 
+  // Issue #203, the seam the DURABLE claim opened. `stillWanted({strict:true})` is asked before the
+  // claim, and back when the claim was a synchronous Map write that was the whole window. The row
+  // claim WAITS: on an append's lease, and on the row lock /reset itself takes. So a reset can
+  // retire this run and clear the thread while the call sits in that wait, and the lock case is
+  // worse than a coincidence, since a reset holding the row releases it straight into this waiter.
+  //
+  // The wait is personified by an append that holds the write claim; the retirement lands on the ask
+  // that immediately precedes the claim, which is exactly the answer that goes stale. What proves
+  // the fix is the thread's STATE, not the outcome: both versions end on "stale" (the fence after
+  // the invoke catches it), and only the broken one has written the marker back by then.
+  test("a run retired while the durable claim waits writes nothing", async () => {
+    const contactInboxId = 8815;
+    await seedConv(948, null, new Date(), contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    const key = {
+      tenantId_chatwootInstanceId_contactInboxId: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+      },
+    };
+    const append = await claimIngestWrite(owner, appDb);
+    expect(append.state).not.toBe("busy");
+    let wanted = true;
+    let strictAsks = 0;
+    let releasing: Promise<void> | null = null;
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:948`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      // The ask right before the claim still answers yes, and /reset lands on that same instant.
+      // The append finishes shortly after, so the claim is granted into a thread that was cleared.
+      stillWanted: async ({ strict }) => {
+        if (!strict) return wanted;
+        strictAsks += 1;
+        if (strictAsks > 1) return wanted;
+        wanted = false;
+        releasing = Bun.sleep(150).then(() =>
+          releaseIngestWrite(owner, appDb, append),
+        );
+        return true;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    await releasing;
+    // The consequence first: a marker advanced here is a cleared thread recreated, and it is what
+    // arms compaction on the attendance the operator just wiped.
+    const row = await suDb.agentThread.findUnique({ where: key });
+    expect(row?.lastConversationId ?? null).toBeNull();
+    expect(outcome).toBe("stale");
+    expect(s.messages).toEqual([]);
+    // And the claim really was waited out, so the ask above is the one AFTER the wait rather than a
+    // second copy of the one before it.
+    expect(strictAsks).toBeGreaterThan(1);
+  });
+
   // ORDER, and observed at the only moment that proves it. The divider used to ride in the nudge's
   // own invoke while the marker advanced inside the claim, so the marker moved on a divider that did
   // not exist yet: a turn arriving in that window read the conversation as already recorded, declined
@@ -1172,6 +1328,374 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(row?.resolvedByAt).toBe(LIVE_AT);
   });
 
+  // The handoff line returns before the terminal deliveries, so it is the one customer-visible send
+  // the checks around them never see. A job retired while the turn ran reaches the customer through
+  // this path alone — and the transfer itself is NOT undone by the fence: the tool already ran, and
+  // the conversation stays with the human queue. Withholding the sentence is the part still ours.
+  // Inside applyPostActions itself. The labels are two Chatwoot round trips and the resolve follows
+  // them, so a command landing between the two is a conversation the operator just cleared and
+  // handed back to the agent being CLOSED — which is not a label to peel off afterwards, it is the
+  // attendance ended. The labels that already went out stay: they were written before the command,
+  // and the reset clears them on its own way through.
+  test("a reset landing between the labels and the resolve withholds the resolve", async () => {
+    await seedConv(9994, null);
+    const s = stub();
+    const wanted = retireOn(s, "setConversationLabels");
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9994`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      stillWanted: wanted,
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("messaged");
+    expect(s.labelSets).toEqual([["follow-up"]]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  // One round trip earlier, and the write it guards is the label SET. Reading the conversation's
+  // current labels is a Chatwoot call like any other, so a command landing inside it finds an answer
+  // taken before it — and the merged list then puts back the very labels the reset peeled off.
+  test("a reset landing during the label read withholds the label write", async () => {
+    await seedConv(9996, null);
+    const s = stub();
+    const wanted = retireOn(s, "getConversationLabels");
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9996`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      stillWanted: wanted,
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("messaged");
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  // The control: nothing retired, and the resolve follows the labels.
+  test("the same turn resolves when nothing retires it", async () => {
+    await seedConv(9995, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9995`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("messaged");
+    expect(s.labelSets).toEqual([["follow-up"]]);
+    expect(s.resolved).toEqual([9995]);
+  });
+
+  // The window of the POST-MODEL ownership probe, whose answer every end below it consumes — the
+  // silent branch, the template, the two notes and the post-actions. The check above that probe
+  // answers for the model call and not for the round trip after it, so a command landing inside the
+  // GET reached labels and a resolve on a conversation it had just cleared.
+  test("a job retired during the post-model ownership probe writes nothing", async () => {
+    await seedConv(9992, null);
+    const s = stub();
+    let wanted = true;
+    let probes = 0;
+    const inner = await s.makeClient();
+    const client = {
+      ...inner,
+      getConversation: async (c: number) => {
+        // The PRE-invoke probe answers cleanly; the command lands inside the one AFTER the model.
+        if (probes++ > 0) wanted = false;
+        return { id: c, status: "pending", meta: {} };
+      },
+    } as unknown as ChatwootClient;
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9992`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      requireLiveBotOwnership: true,
+      stillWanted: async () => wanted,
+      base: appDb,
+      deps: {
+        // SILENT on purpose. A spoken reply leaves through the freeform branch, which asks again
+        // over the judge's stretch and would answer for this window by accident; the silent end
+        // posts no message and goes straight to the post-actions, which is the end that had nothing
+        // between the probe and the write.
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("stale");
+    // The probe itself said "ours" — the abort is the retirement's, not the ownership's, which is
+    // what makes this the probe's window and not a rerun of the ownership fence.
+    expect(probes).toBe(2);
+    expect(s.messages).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  // The control for the two above: the same live-gated shape, nothing retired, everything applies.
+  test("the same live-gated turn messages and labels when nothing retires it", async () => {
+    await seedConv(9993, null);
+    const s = stub();
+    const inner = await s.makeClient();
+    const client = {
+      ...inner,
+      getConversation: async (c: number) => ({
+        id: c,
+        status: "pending",
+        meta: {},
+      }),
+    } as unknown as ChatwootClient;
+
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9993`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"] },
+      requireLiveBotOwnership: true,
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("messaged");
+    expect(s.messages).toEqual([[9993, "Tudo certo?"]]);
+    expect(s.labelSets).toEqual([["follow-up"]]);
+  });
+
+  test("a retired job's handoff line is withheld, but the transfer stands", async () => {
+    await seedConv(9997, null);
+    const s = stub();
+    // The command lands AT THE TRANSFER, mid-turn — the only window in which the line is already
+    // owed and the run is already retired. Counting asks instead would pin the abort to whichever
+    // check happens to be second, and the run would stop before it ever transferred.
+    const wanted = retireOn(s, "toggleStatus");
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9997`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      stillWanted: wanted,
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel("", "Um humano vai te atender.") as never,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(s.messages).toEqual([]);
+    // The handoff's own `open` still happened — that is the transfer, and it is not this fence's to
+    // reverse. What must not follow it is the resolve.
+    expect(s.resolved).toEqual([9997]);
+    // "stale" and not "silent", which is the difference between ending the episode and continuing
+    // it: `followUpHandler` stamps `lastFollowUpAt` on a silent turn AND reschedules the next step,
+    // so a retired job returning "silent" wrote its watermark onto the conversation /reset had just
+    // cleared and re-armed the sequence the command ended.
+    expect(outcome).toBe("stale");
+  });
+
+  // The end that posts NOTHING, which is the one a fence placed among the sends misses. The agent
+  // answering [[SKIP]] still fires the deterministic post-actions — that is the point of them, "no
+  // reply on the last step: label + resolve" — so a job retired during the generation relabelled and
+  // RESOLVED the conversation /reset had just cleared, and returned an outcome that made
+  // followUpHandler stamp its watermark and arm the next step.
+  test("a job retired during a silent turn applies no post-actions", async () => {
+    await seedConv(9985, null);
+    const s = stub();
+    let asks = 0;
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9985`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      // Yes on the read before the turn, no by the time the generation comes back.
+      stillWanted: async () => {
+        asks += 1;
+        return asks < 2;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("stale");
+    expect(s.messages).toEqual([]);
+    expect(s.notes).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  // The judge's own stretch of time, ending on the branch that posts nothing. A `silent` action
+  // suppresses the reply and the post-actions fire anyway, so a check placed after the suppression
+  // guarded only the sends: a job retired while the judge read still resolved the conversation.
+  test("a job retired while the judge reads applies no post-actions", async () => {
+    await withGuardrails(
+      {
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        input: { enabled: false },
+        output: {
+          enabled: true,
+          action: "silent",
+          checks: {
+            toxicity: true,
+            unsafeContent: false,
+            competitorMentions: false,
+            promptAdherence: false,
+          },
+        },
+      },
+      async () => {
+        await seedConv(9986, null);
+        const s = stub();
+        let wanted = true;
+        const outcome = await runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:9986`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          postActions: { assignLabels: ["follow-up"], resolve: true },
+          stillWanted: async () => wanted,
+          base: appDb,
+          deps: {
+            makeModel: ((cfg: { model: string }) =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    // The retire lands inside the judge's call, after the answer taken before it.
+                    wanted = false;
+                    return {
+                      content: JSON.stringify({
+                        violated: true,
+                        categories: ["toxicity"],
+                        rationale: "",
+                        suggestedReply: null,
+                      }),
+                    };
+                  })
+                : new FakeListChatModel({
+                    responses: ["Oi! Ainda posso ajudar?"],
+                  })) as never,
+            makeClient: s.makeClient,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+        expect(wanted).toBe(false);
+        expect(outcome).toBe("stale");
+        expect(s.messages).toEqual([]);
+        expect(s.labelSets).toEqual([]);
+        expect(s.resolved).toEqual([]);
+      },
+    );
+  });
+
+  // And the window inside the handoff path: the closing line is screened by the guardrail before it
+  // goes out, which is a model call, so the answer taken before it is spent by the time it returns.
+  // The rendezvous is the judge's own call, the same one the reply branch uses.
+  test("a job retired while the handoff line is screened does not send it", async () => {
+    await withGuardrails(
+      {
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        input: { enabled: false },
+        output: {
+          enabled: true,
+          action: "template",
+          checks: {
+            toxicity: true,
+            unsafeContent: false,
+            competitorMentions: false,
+            promptAdherence: false,
+          },
+          templateMessage: "TEMPLATE-NUDGE",
+        },
+      },
+      async () => {
+        await seedConv(9984, null);
+        const s = stub();
+        let wanted = true;
+        const outcome = await runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:9984`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          postActions: { assignLabels: ["follow-up"], resolve: true },
+          stillWanted: async () => wanted,
+          base: appDb,
+          deps: {
+            makeModel: ((cfg: { model: string }) =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    // The retire lands here, inside the judge's own call: between the answer taken
+                    // before the screening and the send that follows it.
+                    wanted = false;
+                    return {
+                      content: JSON.stringify({
+                        violated: false,
+                        categories: [],
+                        rationale: "",
+                        suggestedReply: null,
+                      }),
+                    };
+                  })
+                : new HandoffThenReplyModel(
+                    "",
+                    "Um humano vai te atender.",
+                  )) as never,
+            makeClient: s.makeClient,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+        expect(wanted).toBe(false);
+        expect(s.messages).toEqual([]);
+        // "stale", and it leaves through its own door in the caller: reporting silence here made
+        // followUpHandler stamp the watermark and arm the next step, and ran the post-actions on the
+        // way out — relabelling and resolving a conversation the command had just cleared.
+        expect(outcome).toBe("stale");
+        expect(s.labelSets).toEqual([]);
+        // The transfer's own toggle to `open`, and nothing after it: the post-action resolve would
+        // be a SECOND entry on this same conversation.
+        expect(s.resolved).toEqual([9984]);
+      },
+    );
+  });
+
   // The episode has to leave a trace the operator can read. A handed-off follow-up that posted a
   // line and then logged nothing would be invisible on the Logs page, which is the one place the
   // operator goes to find out why the bot went quiet on a conversation.
@@ -1197,8 +1721,15 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(outcome).toBe("messaged");
     let logged = false;
     for (let i = 0; i < 30 && !logged; i++) {
+      // Scoped to this nudge's own thread: 76 tests share the tenant, and `outcome`/`step` are
+      // values several of them write. Filtered by tenant alone this poll can exit on a neighbour's
+      // row and report a trail this turn never left (#258).
       const rows = await suDb.executionLog.findMany({
-        where: { tenantId, stage: "generate" },
+        where: {
+          tenantId,
+          stage: "generate",
+          threadId: `${tenantId}:${instanceId}:9912`,
+        },
         select: { detail: true },
       });
       logged = rows.some((r) => {
@@ -1230,6 +1761,41 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       }),
     ).rejects.toThrow();
     expect(s.messages).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+  });
+
+  // And the retirement question on that same failure path. The catch runs BEFORE the post-generation
+  // check, so it was the last delivery still reaching the world without asking — a /reset that
+  // retired this job while the invoke was failing was still followed by the promised line.
+  test("a throw after the transfer withholds the line when the job was retired", async () => {
+    // Outside the 24h window (last inbound 48h ago), which is the shape the finding names: there the
+    // promised line becomes an operator NOTE and returns before any other check.
+    await seedConv(9987, null, new Date(Date.now() - 48 * 3_600_000));
+    const s = stub();
+    // Same rendezvous as the sibling above: the command lands at the transfer, inside the turn that
+    // then throws.
+    const wanted = retireOn(s, "toggleStatus");
+    await expect(
+      runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:9987`,
+        nudge: { source: "followup", kind: "inactivity", step: 1 },
+        postActions: { assignLabels: ["follow-up"], resolve: true },
+        stillWanted: wanted,
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new HandoffThenThrowModel("Um humano vai te atender.") as never,
+          makeClient: s.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      }),
+    ).rejects.toThrow();
+    // The throw still leaves — the turn genuinely failed, and swallowing it would cost the operator
+    // the alert. What does not happen is the delivery.
+    expect(s.messages).toEqual([]);
+    expect(s.notes).toEqual([]);
     expect(s.labelSets).toEqual([]);
   });
 
@@ -1658,6 +2224,142 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         expect(s.labelSets).toEqual([]);
       },
     );
+  });
+
+  // `stillWanted` is the same shape of question as the ownership above, asked by a caller that
+  // schedules work: a scheduler job retired while it sat CLAIMED. Cancelling a job reaches PENDING
+  // rows only, so the handler runs on regardless and asking is the only thing that can stop it.
+  //
+  // Two reads, and this proves the SECOND: the answer flips inside the judge's own call, which is
+  // exactly the stretch the first read cannot cover.
+  test("work retired while the guardrail reads is not sent, nor resolved", async () => {
+    await withGuardrails(
+      {
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        input: { enabled: false },
+        output: {
+          enabled: true,
+          action: "template",
+          checks: {
+            toxicity: true,
+            unsafeContent: false,
+            competitorMentions: false,
+            promptAdherence: false,
+          },
+          templateMessage: "TEMPLATE-NUDGE",
+        },
+      },
+      async () => {
+        await seedConv(9980, null);
+        const s = stub();
+        let wanted = true;
+        const outcome = await runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:9980`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          postActions: { assignLabels: ["follow-up"], resolve: true },
+          stillWanted: async () => wanted,
+          base: appDb,
+          deps: {
+            makeModel: ((cfg: { model: string }) =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    // The retire lands here, between the two reads.
+                    wanted = false;
+                    return {
+                      content: JSON.stringify({
+                        violated: false,
+                        categories: [],
+                        rationale: "",
+                        suggestedReply: null,
+                      }),
+                    };
+                  })
+                : new FakeListChatModel({
+                    responses: ["Ainda por aí?"],
+                  })) as never,
+            makeClient: s.makeClient,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+        expect(outcome).toBe("stale");
+        expect(s.messages).toEqual([]);
+        expect(s.resolved).toEqual([]);
+        expect(s.labelSets).toEqual([]);
+      },
+    );
+  });
+
+  // The third read, and the one that covers the deliveries the branch above never reaches: the
+  // template, the outside-window note, and the plain note to the operator. A conversation a human
+  // holds takes that last one, and it is a write to Chatwoot like any other — so a retire that
+  // landed while the turn was generating must stop it too.
+  test("work retired while the turn generates is not even noted", async () => {
+    const threadId = `${tenantId}:${instanceId}:9998`;
+    await seedConv(9998, "User");
+    const s = stub();
+    // The predicate itself is the clock: yes on the read that precedes the turn, no on the one the
+    // terminal deliveries take. There is no other hook between them on this path — the fake model
+    // reports no usage, so `persistUsage` never fires, and the client is built before generation.
+    let asks = 0;
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      stillWanted: async () => {
+        asks += 1;
+        return asks < 2;
+      },
+      base: appDb,
+      deps: {
+        makeModel: (() =>
+          new FakeListChatModel({ responses: ["Ainda por aí?"] })) as never,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("stale");
+    expect(asks).toBe(2);
+    expect(s.notes).toEqual([]);
+    expect(s.messages).toEqual([]);
+    expect(s.resolved).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+  });
+
+  // And the first read, which buys something the second cannot: the turn is never RUN. Asking only
+  // at the send boundary would still invoke the graph, and an invoked graph writes the proactive
+  // turn into the conversation's thread — memory nobody was messaged about.
+  test("work already retired does not even write a turn", async () => {
+    const threadId = `${tenantId}:${instanceId}:9999`;
+    await seedConv(9999, null);
+    const s = stub();
+    const saver = new MemorySaver();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      stillWanted: async () => false,
+      base: appDb,
+      deps: {
+        makeModel: (() =>
+          new FakeListChatModel({ responses: ["Ainda por aí?"] })) as never,
+        makeClient: s.makeClient,
+        checkpointer: saver,
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("stale");
+    expect(
+      await saver.getTuple({ configurable: { thread_id: threadId } }),
+    ).toBeUndefined();
+    expect(s.messages).toEqual([]);
+    expect(s.resolved).toEqual([]);
   });
 
   // The sibling of the test above, and the reason the recheck sits above the verdict instead of
@@ -2491,11 +3193,11 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         },
       },
       async () => {
-        await seedConv(9984, null);
+        await seedConv(10000, null);
         const s = stub();
         const outcome = await runAgentNudge({
           tenantId,
-          threadId: `${tenantId}:${instanceId}:9984`,
+          threadId: `${tenantId}:${instanceId}:10000`,
           nudge: { source: "followup", kind: "inactivity", step: 1 },
           postActions: { assignLabels: ["must-not-apply"], resolve: true },
           base: appDb,
@@ -2542,7 +3244,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         },
       },
       async () => {
-        await seedConv(9985, null);
+        await seedConv(10001, null);
         const s = stub();
         const inner = await s.makeClient();
         const client = {
@@ -2553,7 +3255,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         } as unknown as ChatwootClient;
         const outcome = await runAgentNudge({
           tenantId,
-          threadId: `${tenantId}:${instanceId}:9985`,
+          threadId: `${tenantId}:${instanceId}:10001`,
           nudge: { source: "followup", kind: "inactivity", step: 1 },
           postActions: { assignLabels: ["must-not-apply"], resolve: true },
           base: appDb,
@@ -3252,7 +3954,12 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     let logged = false;
     for (let i = 0; i < 30 && !logged; i++) {
       const rows = await suDb.executionLog.findMany({
-        where: { tenantId, stage: "generate", level: "warn" },
+        where: {
+          tenantId,
+          stage: "generate",
+          level: "warn",
+          threadId: `${tenantId}:${instanceId}:913`,
+        },
         select: { detail: true },
       });
       logged = rows.some(

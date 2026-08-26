@@ -49,6 +49,46 @@ async function descriptions(): Promise<Map<string, string>> {
   return new Map([...(await listed())].map(([n, t]) => [n, t.description]));
 }
 
+async function listedFor(scopes: string[]): Promise<Set<string>> {
+  const principal: VerifiedToken = {
+    userId: 1n,
+    tenantId: 1n,
+    role: "TENANT_ADMIN",
+    scopes,
+    clientId: "c",
+    jti: "j",
+  };
+  const server = buildMcpServer(principal);
+  const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverT);
+  const client = new Client({ name: "scope-check", version: "0" });
+  await client.connect(clientT);
+  const { tools } = await client.listTools();
+  await client.close();
+  return new Set(tools.map((t) => t.name));
+}
+
+// The scope contract from docs/mcp.md, as a sweep rather than a list of names: everything that only
+// READS is visible to a read-only token. Stated this way it also catches the next read tool that
+// gets registered in the write block by being pasted next to its siblings — which is exactly how
+// the four document reads ended up invisible to an AGENT-role token.
+describe("scope contract", () => {
+  test("every *_list / *_get / *_schema tool is visible to mcp:read alone", async () => {
+    const all = await listedFor(["mcp:read", "mcp:write"]);
+    const readOnly = await listedFor(["mcp:read"]);
+    const reads = [...all].filter((n) => /(_list|_get|_schema)$/.test(n));
+    expect(reads.length).toBeGreaterThan(5);
+    expect(reads.filter((n) => !readOnly.has(n))).toEqual([]);
+  });
+
+  test("a read-only token sees no write tool", async () => {
+    const readOnly = await listedFor(["mcp:read"]);
+    expect(
+      [...readOnly].filter((n) => /(_set|_create|_update|_delete)$/.test(n)),
+    ).toEqual([]);
+  });
+});
+
 // NOTE: headroom over the current 1,931 for an ordinary edit, the same slack the 3,800 carried over
 // 3,534. Issue #142 spent 166 of that slack and the ceiling is deliberately NOT moving for it: what
 // went into the prose is only the half a caller cannot read off the schema (a summariser override
@@ -84,7 +124,37 @@ const SETTINGS_DESC_CEILING = 2_000;
 // and never runs. `denyMessage: null` means say nothing, which is a refusal the customer sees no
 // sign of. The rest is the shape: nine fields, an enum and the nullable wrappers, and that part
 // does not compress. Headroom over 11,303 stays tighter than a block, as before.
-const SETTINGS_SCHEMA_CEILING = 11_650;
+//
+// RAISED from 11,650 for issue #58, and this time the trim came first and bought most of it. The
+// `observability` block gained one field, `fullDetailUntil`, and typing it as `z.iso.datetime()`
+// published a 430-character regex — a third of a whole block's budget spent restating a format the
+// description states in four words. Declaring it a plain string moved the check into a `refine`,
+// which publishes nothing, and gave back 351 of the 738 the field had cost. What is left is the
+// field name, the nullable wrapper, and one sentence a caller cannot get by trying: that the value
+// is the instant the mode ENDS rather than a duration or a switch, and that the mode stores log
+// detail whole instead of cutting it at 2,000. Headroom over 11,690 stays tighter than a block, as
+// before.
+//
+// RAISED from 12,050 for issue #143, and the trim was measured BEFORE the raise rather than after.
+// The `modelFallback` block declares the same quartet the two other model overrides carry and costs
+// 657 characters; dropping BOTH its `describe` notes buys 130 and still does not fit. So the raise
+// is not avoidable by trimming, and trimming would only delete the half a caller cannot get by
+// trying: a fallback needs a provider AND a model, and naming one of the two stores a block that
+// reads as configured and can never run — the same silent-failure shape every raise above paid for.
+// The remaining 527 is the shape (four fields, the provider enum, the nullable wrappers) and does
+// not compress. Headroom over 12,347 stays tighter than a block, as before.
+//
+// RAISED from 12,400 for issue #103, and the trim was measured first, against the 53 characters
+// #143 left. `ignoreAppointmentPause` on a follow-up step costs 201 with the note it was written
+// with; rewriting the note to its shortest honest form buys 48 and lands at 153, which still does
+// not fit. Dropping the note entirely WOULD fit, and that is precisely the trade every raise above
+// refuses: what it says is the one thing a caller cannot get by trying, because the flag is INERT
+// unless `followUp.pauseWhileAppointment` is on. Without it a caller exempts a step, stores a block
+// that reads as configured, and nothing about that step ever fires differently — the same
+// silent-failure shape as `includeMessageText` and the half-named `modelFallback` above. The
+// remaining 153 is the field name, the boolean, and that sentence. Headroom over 12,500 stays
+// tighter than a block, as before.
+const SETTINGS_SCHEMA_CEILING = 12_550;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -156,6 +226,79 @@ describe("MCP tool descriptions", () => {
       .filter((f) => /[a-z][A-Z]/.test(f) && !namedByARule.has(f))
       .filter((f) => d.includes(f));
     expect(restated).toEqual([]);
+  });
+
+  // The instrument the ceiling above did NOT have. It guards the schema of exactly one tool, so a
+  // second heavy schema could land anywhere else and pass green — and the schema half is the larger
+  // one: 38k characters against 25k of prose, published in full on every tools/list of every
+  // session, before a client knows whether any of it will be used.
+  //
+  // Measured with the document tools in: 103 tools, 25,738 characters of description and 39,726 of
+  // schema. The headroom below is deliberately smaller than one substantial tool, so the next
+  // addition is a decision — raising these is a legitimate outcome of that decision, and not
+  // noticing is not.
+  //
+  // The schema figure was 38,379 when this test was written and the cap 39,500. It moved because the
+  // `contactAuth` block landed on the base while this branch was open, costing 1,347 characters of
+  // agent_settings_set — the same addition that raised SETTINGS_SCHEMA_CEILING above. Re-measured
+  // rather than trimmed: nothing here grew, the total simply now includes a block that was not in it
+  // when the number was taken, and cutting a document description to fit an unrelated arrival is
+  // cutting what is easiest rather than what is cheapest.
+  //
+  // The description figure moved again for issue #305, which added three tools (delivery list, get
+  // and requeue) at 748 characters against 467 of headroom. Raised deliberately, and only after the
+  // two that could be trimmed without costing the model anything were: `_get` stopped restating the
+  // field list that `_list` publishes one line above it. The delivery ledger is a surface an
+  // operator agent needs to be able to find, so the alternative here was not a smaller number, it
+  // was a tool nobody can call. The schema figure moved with it, by 345: most of that is
+  // `webhook_delivery_list`, whose seven filters and four-value status enum are the whole point of
+  // a dead-letter view, and the enum is derived from the module's vocabulary rather than hand-typed
+  // (see the note at its registration) so shrinking it here would mean advertising fewer statuses
+  // than the surface accepts.
+  // Issue #143 moves the SCHEMA figure and not the description one: `agent_settings_set` is the only
+  // tool the `modelFallback` block reaches, and a block publishes fields, not prose. Re-measured
+  // rather than trimmed, for the reason the paragraph above gives — the alternative is cutting an
+  // unrelated document description to pay for it.
+  //
+  // The two arrived together on the way to the merge, so these figures are a FRESH measurement of
+  // the combined tree rather than either branch's number: adding the two deltas would assume nothing
+  // else moved between them, and it does not survive the measurement. Measured here: 26,764 of
+  // description and 41,852 of schema. The DESCRIPTION ceiling therefore does NOT move for #143 —
+  // this block publishes a schema and no new tool, so #305's number still has room and raising it
+  // would have been a number nobody had measured. The schema ceiling does, to 41,950.
+  //
+  // #103 moves the schema figure again and not the description one, for the same reason: the
+  // follow-up step gains one boolean and its note, and no tool is added. Measured at 42,027 of
+  // schema after the trim documented at SETTINGS_SCHEMA_CEILING, so the ceiling goes to 42,100.
+  test("the whole tools/list payload stays under its ceiling", async () => {
+    const all = await listed();
+    let desc = 0;
+    let schema = 0;
+    for (const t of all.values()) {
+      desc += t.description.length;
+      schema += t.schema.length;
+    }
+    expect(desc).toBeLessThanOrEqual(27_250);
+    expect(schema).toBeLessThanOrEqual(42_100);
+  });
+
+  // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in
+  // document_template_schema instead: a six-variant discriminated union publishes as JSON Schema by
+  // inlining every variant, measured at ~3.2k characters PER TOOL against the ~700 below, on both
+  // the create and the update. That trade is the reason the totals above are where they are, so it
+  // is asserted rather than left as a claim in a comment.
+  test("the document write tools keep their schemas compact", async () => {
+    const all = await listed();
+    for (const name of [
+      "document_template_create",
+      "document_template_update",
+    ]) {
+      const t = all.get(name);
+      expect(t).toBeDefined();
+      expect((t as { schema: string }).schema.length).toBeLessThanOrEqual(
+        1_000,
+      );
+    }
   });
 
   // NOTE: the norm is about WHERE content lives, not about length, so the check that matters for the

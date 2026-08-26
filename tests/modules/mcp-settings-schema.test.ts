@@ -8,12 +8,16 @@ import {
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
-import { readObservabilityConfig } from "@/modules/flowlog/settings";
+import {
+  readObservabilityConfig,
+  storableObservability,
+} from "@/modules/flowlog/settings";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { buildMcpServer } from "@/modules/mcp/server";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
 import { VISION_PROVIDER_NAMES } from "@/modules/vision/providers";
+import { followUpStepFields } from "../utils/followup-step-fields";
 
 // Issue #174. The blocks of `agent_settings_set` were `z.record(z.string(), z.unknown())`, so the
 // shape lived in the description and drifted there unwatched: `vision.provider` was published as
@@ -90,6 +94,14 @@ function keywordOf(
 // take, so the drift check must not demand a schema for it.
 const EXPOSED = BEHAVIOR_SETTINGS_KEYS.filter((k) => k !== "guardrails");
 
+// Fields a reader DERIVES rather than stores. Computed from the block's own storable projection, so
+// it cannot describe a state the code has left — see the test below it.
+const DERIVED = new Set(
+  Object.keys(readObservabilityConfig({}))
+    .filter((k) => !(k in storableObservability(readObservabilityConfig({}))))
+    .map((k) => `observability.${k}`),
+);
+
 describe("agent_settings_set argument schema", () => {
   test("every block the tool exposes is declared", () => {
     expect(Object.keys(BEHAVIOR_PATCH_SHAPE).sort()).toEqual(
@@ -109,10 +121,36 @@ describe("agent_settings_set argument schema", () => {
     for (const key of EXPOSED) {
       const declared = Object.keys(BEHAVIOR_PATCH_SHAPE[key].unwrap().shape);
       for (const field of Object.keys(produced[key] ?? {})) {
-        if (!declared.includes(field)) missing.push(`${key}.${field}`);
+        if (declared.includes(field) || DERIVED.has(`${key}.${field}`))
+          continue;
+        missing.push(`${key}.${field}`);
       }
     }
     expect(missing).toEqual([]);
+  });
+
+  // The one field a reader produces that must NOT be declared, and why the exception is COMPUTED
+  // rather than written down: `observability.fullDetail` is derived from `fullDetailUntil` on every
+  // read (issue #58), so declaring it would let a caller write a value the next read recomputes,
+  // and the stored answer and the computed one could then disagree. `storableObservability` is
+  // already the single projection every writer of that block goes through, so the difference
+  // between what the reader answers and what that projection stores IS the derived set. Written by
+  // hand it would go stale the moment the block gains or loses one.
+  test("the derived set is exactly what the storable projection drops", () => {
+    const read = readObservabilityConfig({});
+    const dropped = Object.keys(read).filter(
+      (k) => !(k in storableObservability(read)),
+    );
+    expect(dropped).toEqual(["fullDetail"]);
+    expect([...DERIVED]).toEqual(dropped.map((k) => `observability.${k}`));
+    // And a derived field must genuinely be absent from the schema, or the exception is hiding a
+    // declaration rather than excusing one.
+    for (const name of DERIVED) {
+      const field = name.split(".")[1] as string;
+      expect(
+        Object.keys(BEHAVIOR_PATCH_SHAPE.observability.unwrap().shape),
+      ).not.toContain(field);
+    }
   });
 
   // The two nested shapes the loop above only sees the top of.
@@ -125,8 +163,11 @@ describe("agent_settings_set argument schema", () => {
     );
     const step = BEHAVIOR_PATCH_SHAPE.followUp.unwrap().shape.steps.unwrap()
       .element.shape;
-    expect(Object.keys(step)).toContain("delayValue");
-    expect(Object.keys(step)).toContain("assignLabels");
+    // Compared whole, not by membership: every field of a step is OPTIONAL, so the sweep above,
+    // which reads a DEFAULT bag, never sees one of them. The list comes off the interface itself,
+    // for the same reason the sweep reads the readers — a field added there and not declared here
+    // is a field no caller is ever told about.
+    expect(Object.keys(step).sort()).toEqual(followUpStepFields());
   });
 
   // What the stale prose got wrong, asserted against the registry rather than against a copy of it —

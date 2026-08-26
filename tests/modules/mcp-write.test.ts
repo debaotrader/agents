@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
+import { unstorableProblem } from "@/lib/text";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import {
@@ -15,6 +17,7 @@ import {
   promptSet,
   resolveSecretRef,
   tenantUpdate,
+  truncForAudit,
 } from "@/modules/mcp/write";
 import { langfuseConnect } from "@/modules/mcp/write-settings";
 
@@ -41,6 +44,41 @@ describe("diffFields", () => {
   });
   test("empty when nothing changed (deep-equal via JSON)", () => {
     expect(diffFields({ x: { y: 1 } }, { x: { y: 1 } })).toEqual({});
+  });
+});
+
+// The audit projection's own walker, asserted directly: unlike the flow log, every current call
+// site projects fields that were already written to a column, so a value that would break the audit
+// write would have broken the write it audits first. The protection is a property of those call
+// sites and not of this function, and `agent.settings` is a genuinely open bag, so the rule belongs
+// here rather than in the callers.
+describe("truncForAudit", () => {
+  const NUL = String.fromCharCode(0);
+
+  test("returns a projection the jsonb column can hold", () => {
+    const out = truncForAudit({
+      name: `Agent${NUL}One`,
+      note: "half\ud800a character",
+    }) as Record<string, string>;
+    expect(unstorableProblem(out.name ?? "", "name")).toBeNull();
+    expect(unstorableProblem(out.note ?? "", "note")).toBeNull();
+    expect(out.name).toBe("AgentOne");
+  });
+
+  test("does not let a `__proto__` key become the prototype", () => {
+    // Assignment on that key invokes the legacy prototype setter, and Prisma's serialization
+    // enumerates inherited properties, so the contents would be written as top-level fields of the
+    // audit record: a field nobody wrote, in the row that says who changed what.
+    const out = truncForAudit(
+      JSON.parse('{"__proto__":{"leaked":1},"keep":"x"}'),
+    ) as Record<string, unknown>;
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(JSON.parse(JSON.stringify(out))).not.toHaveProperty("leaked");
+  });
+
+  test("leaves a whole astral character alone", () => {
+    const out = truncForAudit({ name: "Suporte 😀" }) as Record<string, string>;
+    expect(out.name).toBe("Suporte 😀");
   });
 });
 
@@ -286,6 +324,66 @@ describe("MCP write gate (no DB)", () => {
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
+// EVERY BLOCK THIS TOOL PUBLISHES IS A BLOCK IT ACTUALLY WRITES.
+//
+// `agentSettingsSet` used to copy the args into its patch with one `if (args.X !== undefined)` line
+// per block, seventeen of them, and the eighteenth went in without one. `modelFallback` was in the
+// tool's schema, accepted by the parser, and dropped on the floor: a fallback-only call answered
+// "no updatable fields provided" and a call that also carried some other block succeeded while
+// ignoring the fallback entirely. Nothing failed; the tool reported success for a write it did not
+// make.
+//
+// The copy is a loop over `BEHAVIOR_PATCH_SHAPE` now, so this fence is not what stops the next one —
+// it is what proves the loop is still wired to the schema rather than to a list that drifted from
+// it. Keyed on the schema, DB-free, and one test per block so a failure names the block.
+describe("agent_settings_set writes every block it advertises", () => {
+  const KEYS = Object.keys(
+    BEHAVIOR_PATCH_SHAPE,
+  ) as (keyof typeof BEHAVIOR_PATCH_SHAPE)[];
+
+  // "Did this key reach the patch" and nothing more. Past the patch the call needs a row, so what it
+  // answers there — not found, or a database that is not up — is not this test's subject; the one
+  // answer that means the key was dropped is the refusal that lists the accepted fields.
+  const reachedThePatch = async (key: string): Promise<boolean> => {
+    try {
+      const r = await agentSettingsSet(principal({}), {
+        agent_id: "1",
+        [key]: {},
+      } as never);
+      return r.ok || !r.error.includes("no updatable fields");
+    } catch {
+      return true;
+    }
+  };
+
+  for (const key of KEYS) {
+    test(`${key} reaches the patch on its own`, async () => {
+      expect(await reachedThePatch(key)).toBe(true);
+    });
+  }
+
+  // POSITIVE CONTROL. Without it, a probe that answered `true` for anything at all would report the
+  // whole schema as wired and be unable to tell that from the code being right.
+  test("a block the schema does not publish does NOT reach it", async () => {
+    expect(await reachedThePatch("nonesuch")).toBe(false);
+  });
+
+  test("the scan sees the real schema, including the newest block", () => {
+    expect(KEYS.length).toBeGreaterThanOrEqual(18);
+    expect(KEYS).toContain("modelFallback");
+  });
+
+  // The refusal is the operator's only list of what this tool takes, so it is derived from the same
+  // keys rather than typed out beside them — it named seventeen blocks while the schema had
+  // eighteen, and the missing one was exactly the block a caller would have been refused for.
+  test("and the refusal names every one of them", async () => {
+    const r = await agentSettingsSet(principal({}), { agent_id: "1" });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    for (const key of KEYS) expect(r.error).toContain(key);
+  });
+});
+
 let dbUp = false;
 let su: PrismaClient | undefined;
 let app: PrismaClient | undefined;

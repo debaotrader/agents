@@ -10,6 +10,12 @@ import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 // still reach the agent's memory through ingestion. Left behind, the watermark makes the next
 // debounce flush re-coalesce the whole human-era backlog (handoff reason included) after a human
 // returns a conversation to the bot (issue #8).
+//
+// NOTE: it answers "will anything answer this again", and NOT "did anything answer this" — most
+// writers below advance it precisely because no turn is running. A reader that needs the second
+// question cannot get it from here, and must not try: the stranded-delivery sweep asked it this way
+// through three review rounds of PR #282 and was wrong each time, and now gets its answer from the
+// delivery ledger instead (../chatwoot/delivery-sweep.ts, `retireCoveredDeliveries`).
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };

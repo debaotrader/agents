@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { encryptJson } from "@/api/lib/crypto";
 import config from "@/config";
 import {
@@ -8,8 +8,25 @@ import {
   langfuseKeysSchema,
   makeMask,
   resolveLangfuseConfig,
+  shutdownLangfuseClients,
 } from "@/graph/observability";
 import type { ScopedDb } from "@/lib/tenancy";
+
+// NOTE: `buildLangfuseHandler` below is called with a real config on purpose — the handler under
+// test only exists once a client has minted a trace. That queues events the SDK delivers on a
+// BACKGROUND flush, and "unreachable baseUrl" does NOT keep them in the process: the POST still
+// goes out through `globalThis.fetch`, which by flush time is whatever stub the NEXT test file
+// installed. That is how three `POST /api/public/ingestion` landed in an unrelated client test's
+// `expect(posted).toEqual([])`, roughly one CI run in four. This file creates the work, so this
+// file settles it before ending.
+//
+// The 15s budget is the measured cost, not a guess: draining takes ~9s because the SDK retries
+// with backoff and, under happy-dom's `fetch`, even a live local sink reads as a failed delivery
+// (measured: 20ms with the native fetch, 9023ms here). Paid once per suite run, in the file that
+// owes it, instead of at random in someone else's assertion.
+afterAll(async () => {
+  await shutdownLangfuseClients();
+}, 15000);
 
 describe("langfuse key pair", () => {
   test("parses a valid key pair (the vault secret value)", () => {

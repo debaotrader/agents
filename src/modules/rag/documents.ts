@@ -2,9 +2,15 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { broadcastDocumentEvent } from "@/api/features/realtime/realtime.service";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import {
+  EMBEDDING_BLOCK_KEY,
+  type EmbeddingBlockReason,
+} from "@/lib/embedding-block";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { sanitizeErrorMessage } from "@/lib/redact";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
-import { clipText } from "@/lib/text";
+import { firstUnstorableField } from "@/lib/text";
+import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
 import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
@@ -75,9 +81,10 @@ export async function resolveEmbeddingStatus(
 }
 
 // NOTE: The English message carries the reason, and is not allowed to collapse into one generic
-// sentence. MCP hands `AppError.message` to the caller verbatim and the translation key has no
-// server-side locale entry, so outside the console the message is the only thing that says which of
-// the three happened.
+// sentence. The three keys DO have server-side entries now (EMBEDDING_BLOCK_KEY, issue #256), but
+// only the console reads them: MCP hands `AppError.message` to the caller verbatim, on a surface
+// with no locale and no structured error channel, so outside the console this message is still the
+// only thing that says which of the three happened.
 function embeddingBlockMessage(
   status: Exclude<EmbeddingStatus, { ok: true }>,
 ): string {
@@ -98,7 +105,7 @@ export async function resolveEmbeddingConfig(
   throw new AppError(
     embeddingBlockMessage(status),
     400,
-    `errors.embedding.${embeddingBlock(status).reason}`,
+    EMBEDDING_BLOCK_KEY[embeddingBlock(status).reason],
   );
 }
 
@@ -118,8 +125,28 @@ export function validateChunkParams(
   }
 }
 
+// The refusal, in the core rather than at a transport, because three roads reach these writes: the
+// REST endpoints, the MCP write tool, and the agent's own suggestion being published. `unstorable`
+// carries the field and the offending code point, which is the whole difference between an answer a
+// caller can act on and the 500 this replaces.
+export function refuseUnstorable(
+  fields: readonly (readonly [string, string | null | undefined])[],
+): void {
+  const bad = firstUnstorableField(fields);
+  if (bad) {
+    // The PARTS, not the sentence. `translationKey` is translated per the request's Accept-Language
+    // and `message` is only the untranslated fallback, so interpolating an English sentence into a
+    // pt-BR template would answer in two languages at once. What stays English either way is the
+    // field name, which names the request field to change the way a schema path does.
+    throw new AppError(bad.message, 400, "errors.unstorableText", {
+      field: bad.what,
+      codePoints: bad.codePoints.join(" "),
+    });
+  }
+}
+
 export interface CreateDocumentParams {
-  tenantId: bigint;
+  ctx: TenantContext;
   knowledgeBaseId: bigint;
   title: string;
   text: string;
@@ -129,13 +156,31 @@ export interface CreateDocumentParams {
   base?: PrismaClient;
 }
 
+// The whole write is held to what the columns can store, before anything is read or enqueued. It is
+// not a hypothetical shape: `extractText` decodes an uploaded .txt with `TextDecoder("utf-8")`, so a
+// file carrying a 0x00 byte hands a NUL straight to `content`, and Postgres refuses one in a `text`
+// column (22021). Nothing caught it between the write and the transport, so an operator uploading a
+// file got a 500 naming neither the file nor the reason (issue #247).
+//
+// REFUSED, not repaired, which is the opposite of what #218 and #243 do with the same characters.
+// The rule is who can act on the answer: there the writer is a third party's webhook or an exception
+// message and nobody reads a rejection, so repairing keeps the event. Here it is a person who chose
+// this file, or a client calling an API that answers them, and silently deleting bytes out of a
+// document an agent is about to answer from is worse than saying it cannot be stored.
 export async function createDocument(
   params: CreateDocumentParams,
 ): Promise<{ id: bigint; status: string }> {
   const base = params.base ?? basePrisma;
-  const { tenantId, knowledgeBaseId } = params;
+  const { ctx, knowledgeBaseId } = params;
+  const tenantId = ctx.tenantId as bigint;
+  refuseUnstorable([
+    ["title", params.title],
+    ["text", params.text],
+    ["fileName", params.fileName],
+    ["mimeType", params.mimeType],
+  ]);
 
-  const doc = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  const doc = await runScopedOn(base, ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: knowledgeBaseId },
       select: { id: true },
@@ -161,6 +206,10 @@ export async function createDocument(
     kind: "RAG_INGEST",
     dedupeKey: `doc:${doc.id}`,
     runAt: new Date(),
+    // NOTE: A document that was just created: no row can exist under this key yet, so the answer is
+    // only ever about the insert. It is still stated, because a field nobody has to answer is a
+    // default.
+    rearm: "new-work",
     payload: { documentId: String(doc.id) },
     base,
   });
@@ -189,11 +238,11 @@ interface DocumentListRow {
 }
 
 export async function listDocuments(
-  tenantId: bigint,
+  ctx: TenantContext,
   knowledgeBaseId: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<DocumentListRow[]> {
-  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+  return runScopedOn(base, ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: knowledgeBaseId },
       select: { id: true },
@@ -222,11 +271,11 @@ export async function listDocuments(
 }
 
 export async function getDocument(
-  tenantId: bigint,
+  ctx: TenantContext,
   id: bigint,
   base: PrismaClient = basePrisma,
 ) {
-  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+  return runScopedOn(base, ctx, async (db) => {
     const doc = await db.knowledgeDocument.findUnique({
       where: { id },
       select: {
@@ -250,11 +299,11 @@ export async function getDocument(
 }
 
 export async function deleteDocument(
-  tenantId: bigint,
+  ctx: TenantContext,
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<void> {
-  await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  await runScopedOn(base, ctx, async (db) => {
     const res = await db.knowledgeDocument.deleteMany({ where: { id } });
     if (res.count === 0) throw new NotFoundError("document not found");
   });
@@ -269,38 +318,41 @@ export interface UpdateDocumentParams {
 // RAG_INGEST job re-chunks + re-embeds, replacing the old chunks — same path as retry/create); a
 // title-only edit just updates the metadata, no re-embed (the chunks are the content, not the title).
 export async function updateDocument(
-  tenantId: bigint,
+  ctx: TenantContext,
   id: bigint,
   params: UpdateDocumentParams,
   base: PrismaClient = basePrisma,
 ): Promise<{ id: bigint; status: string }> {
+  const tenantId = ctx.tenantId as bigint;
   const hasTitle = params.title !== undefined;
   const hasText = params.text !== undefined;
   if (!hasTitle && !hasText) throw new AppError("nothing to update", 400);
+  // Same rule as the create, and asked here too because an edit is a write of its own: the create's
+  // check says nothing about the text an update carries.
+  refuseUnstorable([
+    ["title", params.title],
+    ["text", params.text],
+  ]);
 
-  const { doc, reingest } = await runScopedOn(
-    base,
-    sysCtx(tenantId),
-    async (db) => {
-      const existing = await db.knowledgeDocument.findUnique({
-        where: { id },
-        select: { id: true, content: true },
-      });
-      if (!existing) throw new NotFoundError("document not found");
-      const reingest = hasText && params.text !== existing.content;
-      const updated = await db.knowledgeDocument.update({
-        where: { id },
-        data: {
-          ...(hasTitle ? { title: params.title } : {}),
-          ...(reingest
-            ? { content: params.text, status: "PENDING", error: null }
-            : {}),
-        },
-        select: { id: true, status: true, knowledgeBaseId: true },
-      });
-      return { doc: updated, reingest };
-    },
-  );
+  const { doc, reingest } = await runScopedOn(base, ctx, async (db) => {
+    const existing = await db.knowledgeDocument.findUnique({
+      where: { id },
+      select: { id: true, content: true },
+    });
+    if (!existing) throw new NotFoundError("document not found");
+    const reingest = hasText && params.text !== existing.content;
+    const updated = await db.knowledgeDocument.update({
+      where: { id },
+      data: {
+        ...(hasTitle ? { title: params.title } : {}),
+        ...(reingest
+          ? { content: params.text, status: "PENDING", error: null }
+          : {}),
+      },
+      select: { id: true, status: true, knowledgeBaseId: true },
+    });
+    return { doc: updated, reingest };
+  });
 
   if (reingest) {
     await enqueueJob({
@@ -308,6 +360,10 @@ export async function updateDocument(
       kind: "RAG_INGEST",
       dedupeKey: `doc:${id}`,
       runAt: new Date(),
+      // NOTE: The document's CONTENT changed, so this is a different index of a different text. The
+      // key is the document and lives as long as it does, so without the reset an ingest that
+      // failed once would follow the document through every edit it ever gets.
+      rearm: "new-work",
       payload: { documentId: String(id) },
       base,
     });
@@ -322,11 +378,12 @@ export async function updateDocument(
 }
 
 export async function retryDocument(
-  tenantId: bigint,
+  ctx: TenantContext,
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<void> {
-  const doc = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  const tenantId = ctx.tenantId as bigint;
+  const doc = await runScopedOn(base, ctx, async (db) => {
     const existing = await db.knowledgeDocument.findUnique({
       where: { id },
       select: { id: true, status: true, knowledgeBaseId: true },
@@ -352,6 +409,10 @@ export async function retryDocument(
     kind: "RAG_INGEST",
     dedupeKey: `doc:${id}`,
     runAt: new Date(),
+    // NOTE: An operator asked for this, on a document sitting in FAILED or UNINDEXED. FAILED is
+    // reached by exhausting the budget, so without the reset the retry button is worth exactly one
+    // attempt, and every press after the first fails straight back to DEAD.
+    rearm: "new-work",
     payload: { documentId: String(id) },
     base,
   });
@@ -371,10 +432,7 @@ export async function retryDocument(
 // read the console renders from. `credential_empty` joined it so all three resolvable reasons have a
 // name here instead of two of them collapsing into one.
 export interface EmbeddingBlock {
-  reason:
-    | "embedding_not_configured"
-    | "credential_pending"
-    | "credential_empty";
+  reason: EmbeddingBlockReason;
   credentialRef?: string;
   vaultId?: string;
 }
@@ -413,10 +471,11 @@ function embeddingBlock(
 // block never depends on which base is being looked at — which is also why the caller does not have
 // to load a knowledge base (and pay its chunk count) to ask this question.
 export async function readEmbeddingBlock(
-  tenantId: bigint,
+  ctx: TenantContext,
   base: PrismaClient = basePrisma,
 ): Promise<EmbeddingBlock | null> {
-  const status = await runScopedOn(base, sysCtx(tenantId), (db) =>
+  const tenantId = ctx.tenantId as bigint;
+  const status = await runScopedOn(base, ctx, (db) =>
     resolveEmbeddingStatus(db, tenantId, ""),
   );
   return status.ok ? null : embeddingBlock(status);
@@ -427,13 +486,14 @@ export async function readEmbeddingBlock(
 // recovery of genuine ingestion errors — the same PENDING → ingest path as the per-document retry). If
 // the embedding prerequisite is missing, nothing is queued and `blocked` explains why (docs stay put).
 export async function reindexKnowledgeBase(
-  tenantId: bigint,
+  ctx: TenantContext,
   knowledgeBaseId: bigint,
   base: PrismaClient = basePrisma,
   opts: { includeFailed?: boolean; dryRun?: boolean } = {},
 ): Promise<ReindexResult> {
+  const tenantId = ctx.tenantId as bigint;
   const statuses = opts.includeFailed ? ["UNINDEXED", "FAILED"] : ["UNINDEXED"];
-  const outcome = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+  const outcome = await runScopedOn(base, ctx, async (db) => {
     const kb = await db.knowledgeBase.findUnique({
       where: { id: knowledgeBaseId },
       select: { id: true, embeddingModel: true },
@@ -471,6 +531,10 @@ export async function reindexKnowledgeBase(
       kind: "RAG_INGEST",
       dedupeKey: `doc:${d.id}`,
       runAt: new Date(),
+      // NOTE: Same as the single-document retry, in bulk: an operator asked for the whole base to
+      // be indexed again, and a document that failed on a previous embedding provider is exactly
+      // the one this is for.
+      rearm: "new-work",
       payload: { documentId: String(d.id) },
       base,
     });
@@ -617,13 +681,15 @@ async function runIngestJobForTenant(
     return { outcome: "done" };
   } catch (err) {
     // Store the i18n key (a stable token) when the failure is a known AppError, so the UI can localize
-    // the reason (e.g. embedding credential missing); otherwise the raw message (diagnostic).
+    // the reason (e.g. embedding credential missing); otherwise the message itself (diagnostic).
+    //
+    // `sanitizeErrorMessage` rather than a cut: the diagnostic branch carries what the embedding
+    // provider answered, and `error` is a `text` column that refuses a NUL outright. It also bounds
+    // the non-Error branch, which `String(err)` left unbounded (issue #243).
     const message =
       err instanceof AppError && err.translationKey
         ? err.translationKey
-        : err instanceof Error
-          ? clipText(err.message, 500)
-          : String(err);
+        : sanitizeErrorMessage(err, 500);
     logger.error({ err, documentId: String(documentId) }, "RAG ingest failed");
     // NOTE: the same release, and for the same reason. A failure belongs to the content this run
     // read, so stamping it on a document that has since been edited both reports the wrong thing
@@ -641,6 +707,29 @@ async function runIngestJobForTenant(
         documentId: String(documentId),
         status: "FAILED",
         error: message,
+      });
+      // NOTE: TERMINAL, which is not obvious from here — the row is now FAILED, the re-armed job re-reads
+      // it, finds it is no longer PENDING and returns `done`, so this document is never indexed
+      // again without somebody asking. The broadcast above reaches a console that is OPEN right now
+      // and nothing else; the trail is what is left for the operator who was not watching, and the
+      // only thing an alert channel can subscribe to (issue #356).
+      //
+      // `warn`, and it is the one site of the four that is: the document list shows FAILED with the
+      // stored reason and offers a re-index, so the operator has their own way back to it. The
+      // others lost work with no surface at all.
+      emitDeadLetter({
+        tenantId,
+        unit: "knowledge_document",
+        level: "warn",
+        // NOTE: either the i18n key of a known AppError or the sanitized provider text, whichever
+        // the row itself stores — the two say different things to a reader and the line must not
+        // diverge from the column beside it.
+        error: message,
+        detail: {
+          documentId: String(documentId),
+          knowledgeBaseId: String(doc.knowledgeBaseId),
+        },
+        base,
       });
     }
     return { outcome: "fail", error: message };

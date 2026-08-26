@@ -1,6 +1,6 @@
 import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
-import type { UsageSource } from "@/graph/usage";
+import { NON_AGENT_TURN_NODES, type UsageSource } from "@/graph/usage";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { classifyOutcome } from "@/modules/conversations/resolution-origin";
 
@@ -237,6 +237,24 @@ export interface DashboardKpis {
   involvementRate: number;
   resolutionRate: number;
   automationRate: number;
+  // MEDIAN seconds from the conversation's creation to the team's first reply — Chatwoot's own
+  // first-response SLA, mirrored (`chatwootCreatedAt` / `chatwootFirstReplyAt`) rather than
+  // recomputed, so this reports the same number the operator reads on the Chatwoot dashboard.
+  // Median and not mean: one conversation opened on a Friday night and answered on Monday moves a
+  // mean by hours and says nothing about the week.
+  //
+  // This is the only KPI here that does not go through LlmUsage, and it is the only one that still
+  // answers on an inbox the agent never touched. NULL when no conversation in the window carries
+  // both readings — a conversation nobody has answered yet has no response time, and one no event
+  // has been seen for since the columns existed has not been mirrored yet. Hence the sample count
+  // beside it: a median over four conversations is not a service level, and the caller has to be
+  // able to tell that apart from a median over four hundred.
+  //
+  // A conversation the BUSINESS opened counts its own opening message as the reply, because that is
+  // what `first_reply_created_at` means to Chatwoot. Timing the customer's wait instead is a
+  // different metric (Chatwoot answers it with `waiting_since`) and a different decision.
+  firstResponseSeconds: number | null;
+  firstResponseSampled: number;
 }
 
 export async function getKpis(
@@ -254,6 +272,14 @@ export async function getKpis(
         // mirror conversation (conversationId stays null), and source="inbox" makes that explicit.
         conversationId: { not: null },
         source: "inbox",
+        // A billed call is not the same claim as "the agent took this conversation", and this is
+        // the only reader that makes the second one. Vision runs on the incoming attachment before
+        // the bot-ownership gate decides anything, so an image sent into a conversation a human
+        // handled start to finish would otherwise land here as bot involvement.
+        //   The null arm is not a formality: Prisma renders `notIn` as plain SQL `NOT IN`, which
+        // drops NULL rows rather than keeping them (measured), and a legacy row with no node is an
+        // agent turn. Without it this filter would quietly shrink every historical figure.
+        OR: [{ node: null }, { node: { notIn: [...NON_AGENT_TURN_NODES] } }],
         ...(filter.since ? { createdAt: { gte: filter.since } } : {}),
       },
       select: { conversationId: true },
@@ -286,12 +312,39 @@ export async function getKpis(
         }
       }
     }
+    // Raw SQL for percentile_cont (no Prisma builder), inside the scoped tx so RLS fences the rows —
+    // never filter tenant_id by hand. EPOCH of the difference: both columns are mirrored from the
+    // same Chatwoot row, so the subtraction is between two readings of one source rather than
+    // across two clocks.
+    const [responseRow] = await db.$queryRaw<
+      { median: number | null; sampled: number }[]
+    >(Prisma.sql`
+      SELECT percentile_cont(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (chatwoot_first_reply_at - chatwoot_created_at))
+             )::float8 AS median,
+             COUNT(*)::int AS sampled
+        FROM conversations
+       WHERE chatwoot_created_at IS NOT NULL
+         AND chatwoot_first_reply_at IS NOT NULL
+         -- A reply cannot precede the conversation that carries it: a clock skew or a hand-written
+         -- row would otherwise contribute a negative "response time".
+         AND chatwoot_first_reply_at >= chatwoot_created_at
+         -- The window is the one the other KPIs use — OUR row's createdAt — so a filtered dashboard
+         -- counts the same conversations here as it does above.
+         AND (${filter.since ?? null}::timestamptz IS NULL OR created_at >= ${filter.since ?? null})`);
+    // COUNT and the percentile come from ONE aggregate over the same rows, so they cannot
+    // disagree: no row in the sample means `sampled` is 0 and `median` is NULL together.
+    const sampled = Number(responseRow?.sampled ?? 0);
+
     return {
       totalConversations,
       involved,
       resolvedByBot,
       handoff,
       resolvedBeforeTracking,
+      firstResponseSeconds:
+        responseRow?.median != null ? Number(responseRow.median) : null,
+      firstResponseSampled: sampled,
       involvementRate:
         totalConversations > 0 ? involved / totalConversations : 0,
       resolutionRate: involved > 0 ? resolvedByBot / involved : 0,

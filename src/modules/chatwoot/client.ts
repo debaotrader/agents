@@ -858,6 +858,17 @@ export class ChatwootClient {
     return this.request(this.config.adminToken, "GET", "/inboxes");
   }
 
+  // One inbox's detail (admin token). Exists to answer ONE question before a mirror row is
+  // destroyed: does this inbox still exist in Chatwoot? `fetch_inbox` resolves it with
+  // `Current.account.inboxes.find(params[:id])` and only THEN runs `authorize @inbox, :show?`, so an
+  // inbox that is gone raises RecordNotFound before any policy check and Rails answers 404.
+  // Measured live against the fork (2026-08-25): live id → 200 with the inbox JSON, absent id → 404
+  // {"error":"Resource could not be found"}, missing token → 401. Deliberately NOT parsed here — the
+  // caller wants the STATUS, and any body we could parse would be a second thing to be wrong about.
+  getInbox(inboxId: number): Promise<unknown> {
+    return this.request(this.config.adminToken, "GET", `/inboxes/${inboxId}`);
+  }
+
   // WhatsApp Cloud (official) HSM templates of an inbox, read from the inbox detail's
   // `message_templates` (admin token), returned as { name, category, language } (approved only when a
   // status is present). NOTE: baileys/zapi inboxes are also `Channel::Whatsapp` but with an unofficial
@@ -995,10 +1006,15 @@ export class ChatwootClient {
   // Update a contact's identity fields (admin token). `PUT /contacts/:id` assigns the provided
   // attributes; used to stamp a stable `identifier` on the WhatsApp contact so the widget's
   // setUser(identifier, …) merges the website conversation onto it. Only provided fields are sent.
+  //
+  // `identifier: null` CLEARS it, and null is the only way to clear it: the unique index is
+  // `(identifier, account_id)` with no partial predicate, so an empty string is a value like any other
+  // and a second contact cleared that way collides with the first. Postgres does not consider two
+  // NULLs equal, so nulls never do.
   updateContact(
     contactId: number,
     fields: {
-      identifier?: string;
+      identifier?: string | null;
       phone_number?: string;
       email?: string;
       name?: string;
@@ -1010,6 +1026,19 @@ export class ChatwootClient {
       `/contacts/${contactId}`,
       fields,
     );
+  }
+
+  // A contact's current `identifier` (admin token), or null when it has none. Addressed by id, so
+  // unlike the search and filter endpoints there is no paging, no case folding and no scope that can
+  // hide the row: `GET /contacts/:id` answers about exactly the contact asked for.
+  async getContactIdentifier(contactId: number): Promise<string | null> {
+    const res = (await this.request(
+      this.config.adminToken,
+      "GET",
+      `/contacts/${contactId}`,
+    )) as { payload?: { identifier?: unknown } } | null;
+    const id = res?.payload?.identifier;
+    return typeof id === "string" && id.length > 0 ? id : null;
   }
 
   // Merge two contacts (admin token): moves the mergee's conversations/contact_inboxes onto the base
@@ -1028,11 +1057,19 @@ export class ChatwootClient {
     );
   }
 
+  // NOTE: `originDisplayId` is the conversation the link is being SENT ON (the WhatsApp entry
+  // thread), and the mint is the only moment the two halves of a redirect episode are known
+  // together — the resolve endpoint identifies the CONTACT, and a contact does not say which of its
+  // conversations minted the link (issue #222). The fork carries it in the token and stamps it on
+  // the widget conversation, where it reaches us on the webhook payload. It authorizes the value
+  // against the caller: an origin this token cannot see is REFUSED (404/401), not dropped, so a
+  // link whose episode could not be paired is never handed back.
   async mintRedirectToken(p: {
     inboxId: number;
     identifier: string;
     message?: string;
     ttlSeconds?: number;
+    originDisplayId?: number;
   }): Promise<{ token: string; websiteUrl: string | null }> {
     const res = (await this.request(
       this.config.adminToken,
@@ -1043,6 +1080,7 @@ export class ChatwootClient {
         identifier: p.identifier,
         message: p.message,
         ttl_seconds: p.ttlSeconds,
+        origin_display_id: p.originDisplayId,
       },
     )) as { token?: string; website_url?: string | null } | null;
     if (!res?.token) {

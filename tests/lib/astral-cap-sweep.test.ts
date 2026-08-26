@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEBUG_MAX_STRING } from "@/modules/flowlog/service";
 
 // THE GUARD AGAINST THE NEXT CAP THAT CUTS A CHARACTER IN HALF.
 //
@@ -69,6 +70,19 @@ const CAPS: {
     run: async (s) => {
       const { redactSecretsDeep } = await import("@/lib/redact");
       return (redactSecretsDeep({ t: s }) as { t: string }).t;
+    },
+  },
+  {
+    // The SAME function under the log debug mode (#58), which raises the ceiling rather than
+    // removing it. It is a second cap through one code path, which is precisely the shape this file
+    // exists to catch: the entry above would keep passing while the raised one cut a character in
+    // half, because nothing about a higher number makes a slice safe.
+    name: "redact: redactSecretsDeep under the log debug ceiling",
+    cap: DEBUG_MAX_STRING,
+    run: async (s) => {
+      const { redactSecretsDeep } = await import("@/lib/redact");
+      return (redactSecretsDeep({ t: s }, 0, DEBUG_MAX_STRING) as { t: string })
+        .t;
     },
   },
   {
@@ -220,6 +234,33 @@ const CAPS: {
       return toPlaygroundInvokeError(new Error(s)).message;
     },
   },
+  {
+    // Every value a document prints: the fields the model fills in on issuance, and the contact and
+    // company values the token resolver splices in. It ends up in `issued_documents.snapshot`, which
+    // is `jsonb` — so this one FAILS the issuance rather than degrading the PDF.
+    name: "documents: sanitizeDocumentValue",
+    cap: 2_000,
+    run: async (s) => {
+      const { sanitizeDocumentValue } = await import(
+        "@/modules/documents/tokens"
+      );
+      return sanitizeDocumentValue(s);
+    },
+  },
+  {
+    // The window quoted back at whoever authored a template with an unreadable {{token}}. The start
+    // is a computed index (the offending braces), but the 40 that follows is a cap on the author's
+    // own text, and the refusal travels through the API and to the model.
+    // 38, not 40: the two braces the window opens on are themselves inside it, so the emoji has to
+    // start two units earlier than the cap to straddle the cut. Measured, not reasoned — at 40 the
+    // probe swept right past the boundary and the entry passed with the cut left bare.
+    name: "documents: malformed-token window",
+    cap: 38,
+    run: async (s) => {
+      const { malformedTokenIn } = await import("@/modules/documents/tokens");
+      return malformedTokenIn(`{{${s}`) ?? "";
+    },
+  },
 ];
 
 describe("no text cap ever cuts an astral character in half", () => {
@@ -309,11 +350,13 @@ const BARE_SLICES: Record<
   "src/client/contexts/ThemeContext.tsx": [1, "index"],
   "src/client/lib/breadcrumbs.ts": [1, "array"],
   "src/client/pages/LogsPage.tsx": [1, "array"],
-  "src/client/pages/agents/AgentEditorPage.tsx": [1, "array"],
   "src/client/pages/agents/CapabilityMap.tsx": [1, "array"],
   "src/client/pages/agents/PlaygroundChat.tsx": [1, "array"],
   "src/client/pages/agents/PromptPanel.tsx": [1, "index"],
+  "src/client/pages/agents/followUpFormState.ts": [1, "array"],
   "src/client/pages/resources/ToolEditModal.tsx": [1, "index"],
+  // The idempotency key's tail is a hex digest.
+  "src/graph/tools/documents.ts": [1, "ascii"],
   "src/graph/tools/mcp.ts": [4, "ascii"],
   "src/graph/tools/native.ts": [4, "array"],
   "src/graph/tools/toolName.ts": [1, "ascii"],
@@ -323,6 +366,9 @@ const BARE_SLICES: Record<
   "src/lib/text.ts": [3, "the-cut"],
   "src/modules/agents/credential-paths.ts": [2, "array"],
   "src/modules/agents/text-caps.ts": [1, "array"],
+  // `countNotStoredAsWritten`: the bundled entries a schedule cap lets through, so the ones past it
+  // count as loss rather than being tested. An array of JSON entries, never a string.
+  "src/modules/agents/transfer.ts": [1, "array"],
   "src/modules/analytics/langfuse-costs.ts": [2, "fixed-format"],
   "src/modules/api-keys/verify.ts": [1, "ascii"],
   "src/modules/appointments/settings.ts": [1, "array"],
@@ -330,9 +376,24 @@ const BARE_SLICES: Record<
   "src/modules/business-hours/hours.ts": [1, "fixed-format"],
   "src/modules/chatwoot/attributes.ts": [1, "array"],
   "src/modules/conversations/service.ts": [1, "array"],
-  "src/modules/debounce/handler.ts": [1, "array"],
+  "src/modules/debounce/handler.ts": [2, "array"],
+  // The logo's one-shot download token is hex from randomUUID.
+  "src/modules/documents/company.ts": [1, "ascii"],
+  // The legacy date fallback reads a fixed ISO prefix; the file name was already reduced to
+  // [a-zA-Z0-9-] before it is bounded, because it travels through a Content-Disposition header.
+  "src/modules/documents/issue.ts": [2, "fixed-format + ascii"],
+  "src/modules/documents/sample.ts": [1, "fixed-format"],
+  // The tool name a template derives to, after the name was reduced to [a-z0-9_]. The two cuts moved
+  // here from templates.ts when the slug rules were split out for the console to import; this ledger
+  // is keyed by PATH, so a move reads exactly like an unaccounted cut appearing from nowhere.
+  "src/modules/documents/slug.ts": [2, "ascii"],
   "src/modules/flowlog/export.ts": [2, "fixed-format + array"],
   "src/modules/flowlog/read.ts": [1, "array"],
+  // `parseIsoInstant`: the date half of an ISO instant, to check a calendar `Date.parse` would
+  // silently normalise instead (February 30 → March 2). Position 10 is the format's own boundary,
+  // and the string was already matched against an ASCII-only pattern, so there is no character
+  // there for a cut to land inside of.
+  "src/modules/flowlog/settings.ts": [1, "fixed-format"],
   "src/modules/followups/settings.ts": [1, "array"],
   "src/modules/images/fetch.ts": [1, "array"],
   // The five response-body caps below all feed `JSON.parse` and nothing else. When one of them
@@ -344,6 +405,9 @@ const BARE_SLICES: Record<
     2,
     "parse-only + fixed-format",
   ],
+  // The refusal a calendar write answers with lists the nearest bookable slots; the cut bounds that
+  // LIST, and each entry is a slot object this code built, never received text.
+  "src/modules/integrations/toolpacks/calendar-slots.ts": [1, "array"],
   "src/modules/integrations/toolpacks/google-calendar.ts": [1, "parse-only"],
   "src/modules/integrations/toolpacks/google-drive.ts": [1, "parse-only"],
   // Zod issue PATHS, which name our own schema's keys, never the received values.
@@ -357,6 +421,9 @@ const BARE_SLICES: Record<
   // Read only to be substring-matched against the provider's auth-failure shapes, then dropped:
   // never stored, never shown, never sent anywhere.
   "src/modules/vault/secret-test.ts": [1, "parse-only"],
+  // The page's own overshoot row, dropped: the list takes `limit + 1` to learn whether a next page
+  // exists. Same shape as flowlog/read.ts, and it cuts an array of rows, never a string.
+  "src/modules/webhooks/outbound/deliveries.ts": [1, "array"],
 };
 
 describe("every bare cut left in src/ is accounted for", () => {

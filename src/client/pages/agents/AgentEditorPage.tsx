@@ -61,6 +61,8 @@ import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditMo
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import { readModelFallbackConfig } from "@/graph/fallback-settings";
+import { modelOptionalFor } from "@/graph/model-defaults";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import type { Schedule } from "@/modules/business-hours/hours";
 import {
@@ -68,8 +70,6 @@ import {
   type ChannelRedirectConfig,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
-import { readObservabilityConfig } from "@/modules/flowlog/settings";
-import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
@@ -80,6 +80,7 @@ import {
   BehaviorTab,
   type ContactAuthState,
   type MemoryState,
+  type ModelFallbackState,
   type SendImageState,
 } from "./BehaviorTab";
 import {
@@ -88,11 +89,20 @@ import {
 } from "./ChannelRedirectTab";
 import { ChannelsTab } from "./ChannelsTab";
 import { ExportAgentModal } from "./ExportAgentModal";
+import { followUpToForm, followUpToStored } from "./followUpFormState";
 import { GeneralTab } from "./GeneralTab";
 import { GuardrailsTab } from "./GuardrailsTab";
 import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { memoryToForm, memoryToStored } from "./memoryFormState";
+import {
+  modelFallbackToForm,
+  modelFallbackToStored,
+} from "./modelFallbackFormState";
+import {
+  observabilityToForm,
+  observabilityToStored,
+} from "./observabilityFormState";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import { ToolsTab } from "./ToolsTab";
@@ -232,17 +242,6 @@ function str(v: unknown): string {
 function num(v: unknown): string {
   return typeof v === "number" ? String(v) : "";
 }
-// Read the follow-up step's labels: the new `assignLabels` array, falling back to the legacy single
-// `assignLabel` string so an agent saved before multi-label keeps its label in the editor.
-function stepLabels(st: Record<string, unknown>): string[] {
-  if (Array.isArray(st.assignLabels)) {
-    return st.assignLabels.filter((l): l is string => typeof l === "string");
-  }
-  return typeof st.assignLabel === "string" && st.assignLabel
-    ? [st.assignLabel]
-    : [];
-}
-
 // Split the editor's "agent:<id>" | "team:<id>" | "" target back into the stored handoff shape. Only
 // "pinned" carries a concrete target; the other modes null both out. Mirrors readBehaviorState's
 // inverse (which packs targetAgentId/targetTeamId into `target`).
@@ -281,23 +280,6 @@ function readModelState(a: Agent) {
   };
 }
 
-// Map the raw followUp bag into the editor's step list from the multi-step `steps` array. No
-// back-compat: a bag without a steps array yields one default step (the old flat config is not read).
-// Always returns at least one step.
-function readFollowUpSteps(fu: Record<string, unknown>) {
-  const rawSteps =
-    Array.isArray(fu.steps) && fu.steps.length > 0
-      ? (fu.steps as Record<string, unknown>[])
-      : [{}];
-  return rawSteps.slice(0, FOLLOW_UP_MAX_STEPS).map((st) => ({
-    delayValue: num(st.delayValue) || "30",
-    delayUnit: str(st.delayUnit) || "minutes",
-    instructions: str(st.instructions),
-    assignLabels: stepLabels(st),
-    resolve: st.resolve === true,
-  }));
-}
-
 function readBehaviorState(a: Agent) {
   const s = (a.settings ?? {}) as Record<string, unknown>;
   const d = (s.debounce ?? {}) as Record<string, unknown>;
@@ -305,7 +287,6 @@ function readBehaviorState(a: Agent) {
   const tt = (s.tts ?? {}) as Record<string, unknown>;
   const sp = (s.split ?? {}) as Record<string, unknown>;
   const sw = (s.serviceWindow ?? {}) as Record<string, unknown>;
-  const fu = (s.followUp ?? {}) as Record<string, unknown>;
   const vi = (s.vision ?? {}) as Record<string, unknown>;
   const ho = (s.handoff ?? {}) as Record<string, unknown>;
   const ka = (s.kanban ?? {}) as Record<string, unknown>;
@@ -378,11 +359,7 @@ function readBehaviorState(a: Agent) {
         : "",
       templateContent: str(sw.templateContent),
     },
-    followUp: {
-      enabled: typeof fu.enabled === "boolean" ? fu.enabled : false,
-      steps: readFollowUpSteps(fu),
-      pauseWhileAppointment: fu.pauseWhileAppointment !== false,
-    },
+    followUp: followUpToForm(s),
     handoff: {
       mode: str(ho.mode) || "route",
       target: num(ho.targetAgentId)
@@ -420,11 +397,12 @@ function readBehaviorState(a: Agent) {
     // REST or an import can carry the string "true", which the runtime honors — reading it stricter
     // here would show the switch off while values were being logged, and would then persist that lie
     // on the next save.
-    observability: readObservabilityConfig(s),
+    observability: observabilityToForm(s),
     // NOTE: Same reason as observability above — through the runtime's own reader, because this one
     // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
     // predates the feature, then persist that lie on the next save.
     memory: memoryToForm(s),
+    modelFallback: modelFallbackToForm(s),
   };
 }
 
@@ -670,6 +648,7 @@ function AgentEditor() {
         instructions: "",
         assignLabels: [] as string[],
         resolve: false,
+        ignoreAppointmentPause: false,
       },
     ],
     pauseWhileAppointment: true,
@@ -689,14 +668,31 @@ function AgentEditor() {
     maxToolCalls: "10",
     maxHistoryTokens: "",
   });
-  // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
-  // agent.settings.observability (modules/flowlog/settings).
-  const [observability, setObservability] = useState({ logToolValues: false });
+  // Whether this agent's tool lines log the values the model sent instead of their shape, and
+  // whether the log debug mode is armed. Mirrors agent.settings.observability
+  // (modules/flowlog/settings), and seeded from the reader over an empty bag rather than a literal
+  // so a field added to that block cannot default differently here than it does at runtime.
+  // Null until the tenant settings answer, which reads as "not known yet" and never as "off".
+  const [langfuseSendContent, setLangfuseSendContent] = useState<
+    boolean | null
+  >(null);
+  const [observability, setObservability] = useState(observabilityToForm({}));
+  // What the SERVER is doing, as opposed to what the form is about to ask it to do. The "recording
+  // more than the default" warning reads this one, never the form: a switch flipped off stops
+  // recording when the save lands, not when the operator touches it, and a warning that goes quiet
+  // on the touch tells them recording stopped while it is still running. Set only where a server
+  // read set the form (load, post-save refresh, discard), never by a switch.
+  const [savedObservability, setSavedObservability] = useState(
+    observabilityToForm({}),
+  );
   // Whether an attendance that ended is folded into a summary, and which model writes it. Seeded
   // from the reader over an empty bag rather than a literal: the pre-load state is the same shape
   // the round-trip pair produces, so a field added to `compaction` cannot default differently here
   // than it does everywhere else.
   const [memory, setMemory] = useState<MemoryState>(() => memoryToForm({}));
+  const [modelFallback, setModelFallback] = useState<ModelFallbackState>(() =>
+    modelFallbackToForm({}),
+  );
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -768,6 +764,7 @@ function AgentEditor() {
   const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
   const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
   const memoryCredBaseUrl = vaultBaseUrl(memory.credentialRef);
+  const modelFallbackCredBaseUrl = vaultBaseUrl(modelFallback.credentialRef);
   const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
@@ -895,7 +892,9 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -932,7 +931,9 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -963,6 +964,17 @@ function AgentEditor() {
         api.api.v1.agents({ id })["tool-selections"].get(),
         api.api.v1["business-hours"].get(),
       ]);
+      // Only for the shared debug warning (#58): the third switch that widens what is recorded is
+      // the tenant's `langfuse.sendContent`, and it lives on another page. Deliberately OUTSIDE the
+      // load above and not awaited with it — the warning is allowed to say less, never to hold the
+      // editor open or send it to the error state, and inside that `Promise.all` a slow or refused
+      // optional read would do both.
+      void api.api.v1["tenant-settings"]
+        .get()
+        .then((r) =>
+          setLangfuseSendContent(r.data?.langfuse.sendContent ?? null),
+        )
+        .catch(() => setLangfuseSendContent(null));
       if (agentRes.error || !agentRes.data || tsRes.error || !tsRes.data) {
         setError(true);
         return;
@@ -1088,7 +1100,7 @@ function AgentEditor() {
   function guardModelBeforeSave(): boolean {
     if (
       model.provider &&
-      model.provider !== "openai-compatible" &&
+      !modelOptionalFor(model.provider) &&
       !model.model.trim()
     ) {
       showToast(
@@ -1172,26 +1184,7 @@ function AgentEditor() {
           .filter(Boolean),
         templateContent: serviceWindow.templateContent.trim() || null,
       },
-      followUp: {
-        enabled: followUp.enabled,
-        pauseWhileAppointment: followUp.pauseWhileAppointment,
-        // `resolve` is sent only for the LAST step (the server also enforces this); `assignLabels` is
-        // omitted when empty so the persisted shape stays minimal and round-trips cleanly.
-        steps: followUp.steps.map((s, i) => {
-          const labels = s.assignLabels
-            .map((l) => l.trim())
-            .filter((l) => l.length > 0);
-          return {
-            delayValue: Math.max(1, Number(s.delayValue) || 1),
-            delayUnit: s.delayUnit,
-            instructions: s.instructions.trim(),
-            ...(labels.length > 0 ? { assignLabels: labels } : {}),
-            ...(i === followUp.steps.length - 1 && s.resolve
-              ? { resolve: true }
-              : {}),
-          };
-        }),
-      },
+      followUp: followUpToStored(followUp),
       vision: {
         enabled: vision.enabled,
         provider: vision.provider,
@@ -1215,11 +1208,15 @@ function AgentEditor() {
         // is what "not configured" means everywhere else in this payload.
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
-      observability: { logToolValues: observability.logToolValues },
+      // NOTE: through the pair, for the same reason `memory` below is — this save REPLACES the
+      // block, so a field written out by hand here is deleted from the bag the moment someone
+      // forgets it. ./observabilityFormState is the round-trip guard.
+      observability: observabilityToStored(observability),
       // NOTE: through the pair, not spelled out here. The Behavior save REPLACES the block, so a
       // field the form dropped would be deleted on the next save — which is exactly how
       // `tts.baseURL` was lost once, and the round-trip test over ./memoryFormState is the guard.
       memory: memoryToStored(memory),
+      modelFallback: modelFallbackToStored(modelFallback),
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1267,6 +1264,7 @@ function AgentEditor() {
       sendImage,
       observability,
       memory,
+      modelFallback,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1437,7 +1435,9 @@ function AgentEditor() {
   // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
   // t('editor.configIssue.memoryModel', 'A separate model is set for attendance summaries but its configuration cannot run, so attendances that end will not be summarized and the contact keeps no memory of them. Check its provider, model, key and endpoint.')
+  // t('editor.configIssue.modelFallback', 'A fallback provider is set but its configuration cannot run, so a turn the primary provider drops is still lost. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.memoryModel', 'The summary-model credential is referenced but not filled in yet, so attendances that end are not summarized.')
+  // t('editor.configIssuePending.modelFallback', 'The fallback-provider credential is referenced but not filled in yet, so the fallback cannot take a turn.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
@@ -1461,6 +1461,7 @@ function AgentEditor() {
   // t('editor.configIssueUnresolved.tts', 'The audio-reply credential no longer exists, so replies are sent as text.')
   // t('editor.configIssueUnresolved.ttsNormalize', 'The speech-rewrite credential no longer exists, so replies are spoken without the rewrite.')
   // t('editor.configIssueUnresolved.memoryModel', 'The summary-model credential no longer exists, so attendances that end are not summarized.')
+  // t('editor.configIssueUnresolved.modelFallback', 'The fallback-provider credential no longer exists, so the fallback cannot take a turn.')
   // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
   // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
@@ -1489,6 +1490,12 @@ function AgentEditor() {
     readMemoryConfig(syncedAgentRef.current?.settings).compaction
       .credentialRef ?? "",
   );
+  // Same rule, same reason: the fallback is judged on the STORED bag, so its endpoint has to come
+  // from the credential the row names rather than from the one the form is holding.
+  const savedModelFallbackCredBaseUrl = vaultBaseUrl(
+    readModelFallbackConfig(syncedAgentRef.current?.settings).credentialRef ??
+      "",
+  );
   const configIssues = computeConfigIssues({
     settings: syncedAgentRef.current?.settings,
     // Saved, like the settings above. Absent only before the first load lands, and nothing that
@@ -1504,6 +1511,7 @@ function AgentEditor() {
     savedModelBaseURL: savedModelBaseUrl,
     savedModelCredentialRef: savedModel.credentialRef,
     savedMemoryCredentialBaseURL: savedMemoryCredBaseUrl,
+    savedModelFallbackCredentialBaseURL: savedModelFallbackCredBaseUrl,
     ttsNormalize: tts.normalize,
     ttsNormalizeProvider: tts.normalizeProvider,
     ttsNormalizeModel: tts.normalizeModel,
@@ -1741,6 +1749,18 @@ function AgentEditor() {
           'Business hours "{{name}}" already existed and were reused; check the schedule is right.',
           p,
         );
+      case "hoursWindowsDropped":
+        return t(
+          "editor.importWarning.hoursWindowsDropped",
+          'Business hours "{{name}}": {{count}} weekly window(s) were not stored as written. Open the schedule and check the days are right.',
+          p,
+        );
+      case "hoursExceptionsDropped":
+        return t(
+          "editor.importWarning.hoursExceptionsDropped",
+          'Business hours "{{name}}": {{count}} date exception(s) were not stored as written. Open the schedule and check the holidays and closures are right.',
+          p,
+        );
       case "httpToolBodyIgnored":
         return t(
           "editor.importWarning.httpToolBodyIgnored",
@@ -1811,6 +1831,36 @@ function AgentEditor() {
         return t(
           "editor.importWarning.mcpGrantNotFound",
           'MCP server "{{name}}" was not found, so its grant was skipped.',
+          p,
+        );
+      case "unknownGrantSourceSkipped":
+        return t(
+          "editor.importWarning.unknownGrantSourceSkipped",
+          "{{n}} tool grant(s) came from a newer version and were skipped.",
+          p,
+        );
+      case "documentGrantNotFound":
+        return t(
+          "editor.importWarning.documentGrantNotFound",
+          'Document template "{{name}}" was not found, so its grant was skipped.',
+          p,
+        );
+      case "documentTemplateReused":
+        return t(
+          "editor.importWarning.documentTemplateReused",
+          'Document template "{{name}}" already existed and was reused; check it is right.',
+          p,
+        );
+      case "documentTemplateNameTaken":
+        return t(
+          "editor.importWarning.documentTemplateNameTaken",
+          'Document template "{{name}}" was not imported: this account already has a template with that name ({{existing}}). Names have to be unique, because the agent picks between documents by name.',
+          p,
+        );
+      case "documentTemplateInvalid":
+        return t(
+          "editor.importWarning.documentTemplateInvalid",
+          'Document template "{{name}}" could not be imported: {{reason}}',
           p,
         );
       case "integrationGrantNotFound":
@@ -1895,6 +1945,12 @@ function AgentEditor() {
           else navigate("/resources/knowledge");
           break;
         }
+        // The panel rather than a modal, unlike tools and MCP above: a document template's editor
+        // opens from its own row and needs the loaded template, which this page does not carry.
+        // Without an arm here the Review action only dismissed the warning and went nowhere.
+        case "document":
+          navigate("/resources/documents");
+          break;
       }
     }
     const key = `${w.code}:${JSON.stringify(w.params ?? {})}`;
@@ -2008,7 +2064,9 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
@@ -2399,8 +2457,11 @@ function AgentEditor() {
       a.download = `agents-agent-${slugify(data.export.agent.name) || "agent"}.json`;
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      showToast(t("editor.exportError", "Could not export."), "error");
+    } catch (caught) {
+      showToast(
+        apiErrorMessage(caught) || t("editor.exportError", "Could not export."),
+        "error",
+      );
     }
   }
 
@@ -2464,10 +2525,11 @@ function AgentEditor() {
           .delete({ confirmName, password });
         if (err) {
           showToast(
-            t(
-              "editor.deleteError",
-              "Could not delete. Check your password and try again.",
-            ),
+            apiErrorMessage(err) ||
+              t(
+                "editor.deleteError",
+                "Could not delete. Check your password and try again.",
+              ),
             "error",
           );
           throw err; // keep the dialog open
@@ -2886,6 +2948,8 @@ function AgentEditor() {
             {tab === "behavior" && (
               <BehaviorTab
                 agentId={id}
+                langfuseSendContent={langfuseSendContent}
+                savedObservability={savedObservability}
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}
@@ -2927,10 +2991,13 @@ function AgentEditor() {
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
                 memoryCredBaseUrl={memoryCredBaseUrl}
+                modelFallbackCredBaseUrl={modelFallbackCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
                 memory={memory}
                 setMemory={setMemory}
+                modelFallback={modelFallback}
+                setModelFallback={setModelFallback}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}

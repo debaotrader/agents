@@ -34,7 +34,8 @@ import {
 import { Tooltip } from "@/client/components/Tooltip";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
-import { mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
+import { apiErrorMessage } from "@/client/lib/apiError";
+import { docErrorEntry, mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
 import { cn } from "@/client/lib/utils";
 
 type BasesData = Awaited<
@@ -75,6 +76,7 @@ interface PickedFile {
   status: UploadStatus;
   // HTTP status of the failed upload (set when status === "error"); 0 for a thrown/network error.
   errorStatus?: number;
+  errorMessage?: string;
 }
 
 // Run `worker` over `items` with at most `limit` in flight (bounded concurrency for batch uploads,
@@ -127,8 +129,8 @@ export function useKnowledgeManager(opts: {
   const onChanged = opts.onChanged;
 
   const ADD_TABS: TabItem[] = [
-    { key: "texto", label: t("knowledge.tabTexto", "Texto") },
-    { key: "arquivo", label: t("knowledge.tabArquivo", "Arquivo") },
+    { key: "texto", label: t("knowledge.tabTexto", "Text") },
+    { key: "arquivo", label: t("knowledge.tabArquivo", "File") },
   ];
 
   const createModal = useModalController();
@@ -450,8 +452,11 @@ export function useKnowledgeManager(opts: {
       createModal.close();
       void onChanged();
       opts.onCreated?.({ id: data.base.id, name: name.trim() });
-    } catch {
-      showToast(t("knowledge.createError", "Could not create."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("knowledge.createError", "Could not create."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -475,8 +480,11 @@ export function useKnowledgeManager(opts: {
       showToast(t("knowledge.updated", "Knowledge base updated."), "success");
       editModal.close();
       void onChanged();
-    } catch {
-      showToast(t("knowledge.updateError", "Could not update."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("knowledge.updateError", "Could not update."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -503,15 +511,27 @@ export function useKnowledgeManager(opts: {
       addContentModal.close();
       if (docsModal.payload) await reloadDocs(docsModal.payload.id);
       void onChanged();
-    } catch {
-      showToast(t("knowledge.addError", "Could not add document."), "error");
+    } catch (e) {
+      // The server's own message when it sent one: a refusal that names the field and the character
+      // is the whole answer, and collapsing it into "Could not add document" throws away the only
+      // part the operator can act on (issue #247).
+      showToast(
+        apiErrorMessage(e) ??
+          t("knowledge.addError", "Could not add document."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
   }
 
-  // Localized failure reason for a per-file upload error (static keys: extractor-friendly).
-  function uploadErrorMessage(status: number | undefined): string {
+  // Localized failure reason for a per-file upload error (static keys: extractor-friendly). The
+  // server's own message wins when it sent one: the statuses below are the ones we can phrase better
+  // than the API can, and everything else the API already phrased for this operator's language.
+  function uploadErrorMessage(
+    status: number | undefined,
+    message: string | undefined,
+  ): string {
     if (status === 422) {
       return t(
         "knowledge.fileNotExtractable",
@@ -524,7 +544,7 @@ export function useKnowledgeManager(opts: {
     if (status === 413) {
       return t("knowledge.fileTooLarge", "The file exceeds the size limit.");
     }
-    return t("knowledge.addError", "Could not add document.");
+    return message ?? t("knowledge.addError", "Could not add document.");
   }
 
   // Upload one staged file, returning the failing HTTP status (undefined on success, 0 on a thrown
@@ -534,7 +554,7 @@ export function useKnowledgeManager(opts: {
     baseId: string,
     pf: PickedFile,
     useTitle: boolean,
-  ): Promise<number | undefined> {
+  ): Promise<{ status: number; message?: string } | undefined> {
     try {
       // NOTE: the treaty serializes a File body as multipart AND injects the
       // X-Tenant-Id header (SUPER_ADMIN target tenant); a raw fetch here 500s
@@ -545,9 +565,11 @@ export function useKnowledgeManager(opts: {
           file: pf.file,
           ...(useTitle && docTitle.trim() ? { title: docTitle.trim() } : {}),
         });
-      return err ? err.status : undefined;
+      return err
+        ? { status: err.status, message: apiErrorMessage(err) ?? undefined }
+        : undefined;
     } catch {
-      return 0;
+      return { status: 0 };
     }
   }
 
@@ -567,17 +589,21 @@ export function useKnowledgeManager(opts: {
           : { ...p, status: "uploading", errorKey: undefined },
       ),
     );
-    const results = new Map<string, number | undefined>();
+    const results = new Map<
+      string,
+      { status: number; message?: string } | undefined
+    >();
     await runPool(toUpload, 3, async (pf) => {
-      const errorStatus = await uploadOne(payload.id, pf, useTitle);
-      results.set(pf.id, errorStatus);
+      const failure = await uploadOne(payload.id, pf, useTitle);
+      results.set(pf.id, failure);
       setPicked((prev) =>
         prev.map((p) =>
           p.id === pf.id
             ? {
                 ...p,
-                status: errorStatus === undefined ? "done" : "error",
-                errorStatus,
+                status: failure === undefined ? "done" : "error",
+                errorStatus: failure?.status,
+                errorMessage: failure?.message,
               }
             : p,
         ),
@@ -656,9 +682,10 @@ export function useKnowledgeManager(opts: {
       docEditModal.close();
       if (docsModal.payload) await reloadDocs(docsModal.payload.id);
       void onChanged();
-    } catch {
+    } catch (e) {
       showToast(
-        t("knowledge.docUpdateError", "Could not update the document."),
+        apiErrorMessage(e) ||
+          t("knowledge.docUpdateError", "Could not update the document."),
         "error",
       );
     } finally {
@@ -675,8 +702,12 @@ export function useKnowledgeManager(opts: {
       const base = data.bases.find((b) => b.id === id);
       if (!base) throw new Error("not found");
       editModal.open(base);
-    } catch {
-      showToast(t("knowledge.loadError", "Could not load this base."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("knowledge.loadError", "Could not load this base."),
+        "error",
+      );
     }
   }
 
@@ -700,13 +731,16 @@ export function useKnowledgeManager(opts: {
       // (e.g. the editor's "documents need indexing" banner) clear immediately.
       void onChanged();
       showToast(t("knowledge.retried", "Retrying..."), "success");
-    } catch {
+    } catch (e) {
       setDocs((prev) =>
         prev
           ? prev.map((d) => (d.id === doc.id ? { ...d, status: original } : d))
           : null,
       );
-      showToast(t("knowledge.retryError", "Could not retry."), "error");
+      showToast(
+        apiErrorMessage(e) || t("knowledge.retryError", "Could not retry."),
+        "error",
+      );
     }
   }
 
@@ -761,10 +795,11 @@ export function useKnowledgeManager(opts: {
       // (e.g. the editor's "documents need indexing" banner) clear immediately.
       void onChanged();
       showToast(t("knowledge.indexing", "Indexing…"), "success");
-    } catch {
+    } catch (e) {
       revert();
       showToast(
-        t("knowledge.indexAllError", "Could not start indexing."),
+        apiErrorMessage(e) ||
+          t("knowledge.indexAllError", "Could not start indexing."),
         "error",
       );
     }
@@ -784,7 +819,8 @@ export function useKnowledgeManager(opts: {
           .delete();
         if (err) {
           showToast(
-            t("knowledge.docDeleteError", "Could not delete document."),
+            apiErrorMessage(err) ||
+              t("knowledge.docDeleteError", "Could not delete document."),
             "error",
           );
           throw err;
@@ -811,7 +847,11 @@ export function useKnowledgeManager(opts: {
           .bases({ id: b.id })
           .delete();
         if (err) {
-          showToast(t("knowledge.deleteError", "Could not delete."), "error");
+          showToast(
+            apiErrorMessage(err) ||
+              t("knowledge.deleteError", "Could not delete."),
+            "error",
+          );
           throw err;
         }
         showToast(t("knowledge.deleted", "Deleted."), "success");
@@ -822,20 +862,19 @@ export function useKnowledgeManager(opts: {
 
   // Localizes a document's failure reason. The ingest job stores a stable i18n token for known
   // failures (e.g. a missing embedding credential); anything else is a raw diagnostic message.
+  //
+  // The branch table moved to src/client/lib/knowledgeDocs.ts, keyed on the SAME map the server
+  // throws from, because the two used to spell the tokens differently and neither branch ever fired
+  // (issue #256). Only the `t` call is left here: `t` is a hook binding this component owns.
+  //
+  // t('knowledge.docError.embeddingEmpty', 'The embedding credential is empty. Fill it in, then index again.')
+  // t('knowledge.docError.embeddingNotConfigured', 'The embedding credential is not configured for this workspace. Set it under Components, then index again.')
+  // t('knowledge.docError.embeddingPending', 'The embedding credential has not been filled in yet. Fill it in, then index again.')
   function docErrorText(error: string): string {
-    if (error === "errors.embeddingNotConfigured") {
-      return t(
-        "knowledge.docError.embeddingNotConfigured",
-        "The embedding credential is not configured for this workspace. Set it under Components, then index again.",
-      );
-    }
-    if (error === "errors.embeddingEmpty") {
-      return t(
-        "knowledge.docError.embeddingEmpty",
-        "The embedding credential is empty. Fill it in, then index again.",
-      );
-    }
-    return error;
+    const entry = docErrorEntry(error);
+    if (!entry) return error;
+    // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via the magic comments just above
+    return t(entry.key, entry.fallback);
   }
 
   // Operator-facing text for one block reason. The three need different instructions: create a
@@ -872,7 +911,7 @@ export function useKnowledgeManager(opts: {
     if (doc.status === "READY") {
       return (
         <span className="rounded-full bg-success/10 px-2 py-0.5 text-success text-xs">
-          {t("knowledge.docStatus.READY", "{{n}} trechos", {
+          {t("knowledge.docStatus.READY", "{{n}} chunks", {
             n: doc.chunkCount,
           })}
         </span>
@@ -1096,13 +1135,9 @@ export function useKnowledgeManager(opts: {
         modal={addContentModal}
         size="lg"
         unsavedChanges={addContentDirty}
-        title={t(
-          "knowledge.addContentTitle",
-          "Adicionar conteúdo em {{name}}",
-          {
-            name: addContentModal.payload?.name ?? "",
-          },
-        )}
+        title={t("knowledge.addContentTitle", "Add content to {{name}}", {
+          name: addContentModal.payload?.name ?? "",
+        })}
         footer={
           <div className="flex justify-end gap-2">
             <ModalCancelButton disabled={busy} />
@@ -1111,7 +1146,7 @@ export function useKnowledgeManager(opts: {
               loading={busy}
               disabled={!addContentValid}
             >
-              {t("knowledge.addContentAction", "Adicionar")}
+              {t("knowledge.addContentAction", "Add")}
             </Button>
           </div>
         }
@@ -1121,7 +1156,7 @@ export function useKnowledgeManager(opts: {
             items={ADD_TABS}
             value={addTab}
             onChange={setAddTab}
-            aria-label={t("knowledge.addContent", "Adicionar conteúdo")}
+            aria-label={t("knowledge.addContent", "Add content")}
           />
           {addTab === "texto" && (
             <div className="flex flex-col gap-4">
@@ -1210,7 +1245,7 @@ export function useKnowledgeManager(opts: {
                   >
                     {t(
                       "knowledge.dropHint",
-                      "Arraste e solte arquivos aqui, ou clique para escolher",
+                      "Drag and drop files here, or click to choose",
                     )}
                   </span>
                   <span className="text-text-muted text-xs">
@@ -1252,7 +1287,10 @@ export function useKnowledgeManager(opts: {
                       )}
                       {p.status === "error" && (
                         <Tooltip
-                          content={uploadErrorMessage(p.errorStatus)}
+                          content={uploadErrorMessage(
+                            p.errorStatus,
+                            p.errorMessage,
+                          )}
                           side="top"
                         >
                           <span className="shrink-0 cursor-help rounded-full bg-error/10 px-2 py-0.5 text-error text-xs">
@@ -1263,10 +1301,7 @@ export function useKnowledgeManager(opts: {
                       {(p.status === "idle" || p.status === "error") && (
                         <button
                           type="button"
-                          aria-label={t(
-                            "knowledge.clearFile",
-                            "Limpar arquivo",
-                          )}
+                          aria-label={t("knowledge.clearFile", "Clear file")}
                           onClick={() => removeFile(p.id)}
                           className="shrink-0 rounded p-0.5 text-text-muted transition-colors hover:text-text-primary"
                         >
@@ -1327,7 +1362,7 @@ export function useKnowledgeManager(opts: {
               }}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />
-              {t("knowledge.addContentAction", "Adicionar")}
+              {t("knowledge.addContentAction", "Add")}
             </Button>
           </div>
           {docs === null ? (

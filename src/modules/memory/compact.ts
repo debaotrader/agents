@@ -8,7 +8,6 @@ import {
   contactInboxThreadId,
   getCheckpointer,
 } from "@/graph/checkpointer";
-import { isTurnInFlight } from "@/graph/inflight";
 import { drainPendingIngest } from "@/graph/ingest-drain";
 import { memoryHeadMessage, stampedConversationId } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
@@ -16,8 +15,9 @@ import type { ModelConfig } from "@/graph/model-config";
 import { resolveModelOverride } from "@/graph/model-override";
 import { createChatModel, type ResolvedModelConfig } from "@/graph/models";
 import { buildCallbacks, loadAgentConfig } from "@/graph/prepare";
+import { turnOwnsThread } from "@/graph/thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
-import { withEntityLock } from "@/lib/locks";
+import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
@@ -115,7 +115,7 @@ export async function armCompaction(
       // This dedupeKey is the THREAD, so the same row is reused by every attendance this contact ever
       // has. Each attendance is new work and gets its own retry budget; otherwise failures accumulate
       // across months and one bad day retires compaction for that contact permanently.
-      resetAttempts: true,
+      rearm: "new-work",
       payload: {
         instanceId: String(p.instanceId),
         contactInboxId: p.contactInboxId,
@@ -184,6 +184,10 @@ export async function runCompaction(
     instanceId,
     contactInboxId,
   );
+  // The thread's owner, asked of the ROW and not only of this process: compaction runs on the
+  // leader and a turn runs wherever the webhook landed, so an in-process registry reads a busy
+  // thread as free and the rewrite is undone by the turn that saves after it (issue #203).
+  const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
 
   const loaded = await runScopedOn(base, sysCtx(tenantId), async (db) => {
     const agent = await db.agent.findUnique({
@@ -324,7 +328,7 @@ export async function runCompaction(
   // A turn holding this thread will undo the rewrite below, so there is nothing to gain by reading
   // its channel now. Checked here as well as under the lock because this side is what avoids PAYING
   // for a summary that the locked check would then discard; the locked one is what makes it correct.
-  if (isTurnInFlight(graphThreadId)) {
+  if (await turnOwnsThread(owner, base)) {
     return deferForTurn(graphThreadId, "before reading the thread");
   }
 
@@ -591,8 +595,8 @@ export async function runCompaction(
   // recreates it with a NEW id, so the id this job started with is the generation token — already in
   // the schema, one indexed read, nothing new to thread through.
   if (summary) {
-    const wrote = await runScopedOn(base, sysCtx(tenantId), (db) =>
-      withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+    const wrote = await withKeyedQueue(`ingest:${graphThreadId}`, () =>
+      runScopedOn(base, sysCtx(tenantId), async (db) => {
         // GENERATION FENCE, second half: the row this job started with is gone, so a /reset ran
         // while the provider call was in flight. Non-null by the check right after the load.
         const stillThere = await db.agentThread.count({
@@ -627,41 +631,44 @@ export async function runCompaction(
     }
   }
 
-  const rewrite = await runScopedOn(base, sysCtx(tenantId), (db) =>
-    // The lock ingestion also takes, so an ingested message cannot interleave with the rewrite.
-    // It is NOT the whole story: a graph TURN writes to this thread without taking any lock, which
-    // is why the update below names the messages it removes instead of clearing the channel.
-    withEntityLock(db, `ingest:${graphThreadId}`, async () => {
-      // The check that actually makes this safe. A graph invoke is a read-modify-write of the WHOLE
-      // message channel — it saves the state it loaded at the start plus its own messages — so a
-      // rewrite that lands while one is running is silently undone the moment it finishes: the raw
-      // turns come back, the memory head disappears, and the next cut summarizes a segment that ends
-      // one message later, writing a SECOND row that says the same thing. Removing messages by id
-      // does not help, because the loser here is this whole checkpoint, not individual writes.
-      //
-      // Turns mark themselves under this same lock (src/graph/runtime.ts, src/graph/nudge.ts), so
-      // reading the registry from inside it is exclusive: either no turn has started reading, or
-      // this attempt stands down and comes back.
-      if (isTurnInFlight(graphThreadId)) return "busy" as const;
-      const fresh = await graph.getState(threadCfg);
-      const current = ((
-        fresh.values as { messages?: BaseMessage[] } | undefined
-      )?.messages ?? []) as BaseMessage[];
-      const consumed = [...(cut.head ? [cut.head] : []), ...cut.closed];
-      // The thread is append-only between the read and this write, so the messages we summarized
-      // must still be its prefix. If they are not, something rewrote the thread underneath us (the
-      // /reset command deletes it outright) and the safe move is to abandon this attempt rather than
-      // delete messages we never read. A shorter thread is covered by the same comparison: past its
-      // end `current[i]` is undefined, which never equals an id.
-      for (let i = 0; i < consumed.length; i++) {
-        if (current[i]?.id !== consumed[i]?.id) return "changed" as const;
-      }
-      // Only what the head can render. The rows are kept forever by design (the head bounds what the
-      // MODEL reads, not what the table stores), so a contact with years of history would otherwise
-      // have every one of them loaded and sorted on every compaction to keep the newest twenty.
-      // Newest-first with a limit, then back to chronological order, which is how the head reads.
-      const rows = (
-        await db.attendanceSummary.findMany({
+  // The critical section ingestion also enters, so an ingested message cannot interleave with the
+  // rewrite. It is NOT the whole story: a graph TURN writes to this thread without entering it,
+  // which is why the update below names the messages it removes instead of clearing the channel.
+  //
+  // A process-local queue rather than a transaction-scoped advisory lock: the section reads and
+  // writes the checkpointer, a SEPARATE Postgres pool, and holding a Prisma transaction open across
+  // that is what drained the main pool for everything else in the process (issue #225).
+  const rewrite = await withKeyedQueue(`ingest:${graphThreadId}`, async () => {
+    // The check that actually makes this safe. A graph invoke is a read-modify-write of the WHOLE
+    // message channel — it saves the state it loaded at the start plus its own messages — so a
+    // rewrite that lands while one is running is silently undone the moment it finishes: the raw
+    // turns come back, the memory head disappears, and the next cut summarizes a segment that ends
+    // one message later, writing a SECOND row that says the same thing. Removing messages by id
+    // does not help, because the loser here is this whole checkpoint, not individual writes.
+    //
+    // Turns mark themselves under this same lock (src/graph/runtime.ts, src/graph/nudge.ts), so
+    // reading the registry from inside it is exclusive: either no turn has started reading, or
+    // this attempt stands down and comes back.
+    if (await turnOwnsThread(owner, base)) return "busy" as const;
+    const fresh = await graph.getState(threadCfg);
+    const current = ((fresh.values as { messages?: BaseMessage[] } | undefined)
+      ?.messages ?? []) as BaseMessage[];
+    const consumed = [...(cut.head ? [cut.head] : []), ...cut.closed];
+    // The thread is append-only between the read and this write, so the messages we summarized
+    // must still be its prefix. If they are not, something rewrote the thread underneath us (the
+    // /reset command deletes it outright) and the safe move is to abandon this attempt rather than
+    // delete messages we never read. A shorter thread is covered by the same comparison: past its
+    // end `current[i]` is undefined, which never equals an id.
+    for (let i = 0; i < consumed.length; i++) {
+      if (current[i]?.id !== consumed[i]?.id) return "changed" as const;
+    }
+    // Only what the head can render. The rows are kept forever by design (the head bounds what the
+    // MODEL reads, not what the table stores), so a contact with years of history would otherwise
+    // have every one of them loaded and sorted on every compaction to keep the newest twenty.
+    // Newest-first with a limit, then back to chronological order, which is how the head reads.
+    const rows = (
+      await runScopedOn(base, sysCtx(tenantId), (db) =>
+        db.attendanceSummary.findMany({
           where: {
             tenantId,
             chatwootInstanceId: instanceId,
@@ -676,43 +683,43 @@ export async function runCompaction(
           ],
           take: MEMORY_HEAD_MAX_ATTENDANCES,
           select: { conversationId: true, summary: true, attendanceAt: true },
-        })
-      ).reverse();
-      const head = renderMemoryHead(rows, cfg.timezone);
-      // The update REMOVES BY ID and never clears the channel. REMOVE_ALL_MESSAGES would have been
-      // shorter, and wrong: it replaces the whole list with what this update carries, so a message
-      // appended between the read above and this write would be erased. Ingestion is held off by the
-      // lock, but a graph TURN takes no lock and writes to this same thread, so that window is real
-      // and a customer's message is what falls into it. Naming the ids leaves everything else alone,
-      // whenever it arrived.
-      //
-      // The head reuses the id of the FIRST message it replaces, which is what keeps it at the front:
-      // the reducer replaces a same-id message in place and appends an unknown-id one at the end, and
-      // a memory head sitting after the conversation is not a header, it is a footnote.
-      const survivorId = consumed[0]?.id;
-      const dropped = consumed.filter((m) => m.id !== survivorId);
-      await graph.updateState(
-        threadCfg,
-        {
-          messages: [
-            ...(head && survivorId
-              ? [memoryHeadMessage(contentToText(head.content), survivorId)]
+        }),
+      )
+    ).reverse();
+    const head = renderMemoryHead(rows, cfg.timezone);
+    // The update REMOVES BY ID and never clears the channel. REMOVE_ALL_MESSAGES would have been
+    // shorter, and wrong: it replaces the whole list with what this update carries, so a message
+    // appended between the read above and this write would be erased. Ingestion is held off by the
+    // lock, but a graph TURN takes no lock and writes to this same thread, so that window is real
+    // and a customer's message is what falls into it. Naming the ids leaves everything else alone,
+    // whenever it arrived.
+    //
+    // The head reuses the id of the FIRST message it replaces, which is what keeps it at the front:
+    // the reducer replaces a same-id message in place and appends an unknown-id one at the end, and
+    // a memory head sitting after the conversation is not a header, it is a footnote.
+    const survivorId = consumed[0]?.id;
+    const dropped = consumed.filter((m) => m.id !== survivorId);
+    await graph.updateState(
+      threadCfg,
+      {
+        messages: [
+          ...(head && survivorId
+            ? [memoryHeadMessage(contentToText(head.content), survivorId)]
+            : []),
+          ...dropped.map((m) => new RemoveMessage({ id: m.id as string })),
+          // NOTE: With no head to keep (every summary came back empty), the survivor has nothing
+          // to become, so it is removed like the rest.
+          ...(head
+            ? []
+            : survivorId
+              ? [new RemoveMessage({ id: survivorId })]
               : []),
-            ...dropped.map((m) => new RemoveMessage({ id: m.id as string })),
-            // NOTE: With no head to keep (every summary came back empty), the survivor has nothing
-            // to become, so it is removed like the rest.
-            ...(head
-              ? []
-              : survivorId
-                ? [new RemoveMessage({ id: survivorId })]
-                : []),
-          ],
-        },
-        THREAD_STATE_NODE,
-      );
-      return "ok" as const;
-    }),
-  );
+        ],
+      },
+      THREAD_STATE_NODE,
+    );
+    return "ok" as const;
+  });
   if (rewrite === "busy") {
     return deferForTurn(graphThreadId, "at the rewrite");
   }

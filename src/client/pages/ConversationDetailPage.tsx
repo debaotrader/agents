@@ -53,6 +53,7 @@ import {
 } from "@/client/components";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
+import { apiErrorMessage } from "@/client/lib/apiError";
 import { cn, formatRelativeTime } from "@/client/lib/utils";
 
 // Eden-derived types for the dynamic /conversations/:id routes (metadata shell + the separate
@@ -1428,8 +1429,11 @@ export function ConversationDetailPage() {
       showToast(successMsg, "success");
       void loadMeta({ background: true });
       void loadMessages({ background: true });
-    } catch {
-      showToast(t("conversation.opError", "Action failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("conversation.opError", "Action failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -1440,16 +1444,38 @@ export function ConversationDetailPage() {
   async function returnToAi(successMsg: string) {
     setBusy(true);
     try {
-      const { error: err } = await api.api.v1
+      const { data, error: err } = await api.api.v1
         .conversations({ id })
         .return.post();
-      if (err) throw err;
-      showToast(successMsg, "success");
-      setOfferReengage(true);
+      if (err || !data) throw err ?? new Error("return failed");
+      // The call succeeds either way — the status was set and the mirror corrected — so `error` alone
+      // cannot tell the two apart. "taken-over" means a human claimed the conversation during the
+      // request and still holds it, and the success toast would say the opposite of what the row now
+      // reads. `reengage` below already branches on its outcome for the same reason.
+      if (data.outcome === "taken-over") {
+        showToast(
+          t(
+            "conversation.returnTakenOver",
+            "Someone took the conversation while it was being returned, so it stays with them.",
+          ),
+          "warning",
+        );
+        // Set FALSE, not merely left unset. The offer is page state that survives the action that
+        // raised it, so an earlier successful return leaves it standing and the button is still on
+        // screen — and the server does set the status to `pending` here, so nothing else takes it
+        // down. Omitting the write reads as "do not offer" and means "keep whatever was offered".
+        setOfferReengage(false);
+      } else {
+        showToast(successMsg, "success");
+        setOfferReengage(true);
+      }
       void loadMeta();
       void loadMessages();
-    } catch {
-      showToast(t("conversation.opError", "Action failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) || t("conversation.opError", "Action failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -1500,13 +1526,22 @@ export function ConversationDetailPage() {
       }
       void loadMeta({ background: true });
       void loadMessages({ background: true });
-    } catch {
-      showToast(t("conversation.reengage.error", "Re-engage failed."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("conversation.reengage.error", "Re-engage failed."),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
   }
 
+  // Who HOLDS the conversation, answered by the server. Not `assigneeType === "User"`: a conversation
+  // assigned to ANOTHER persona's agent bot is equally out of this agent's hands — the ownership gate
+  // compares the bot id — and the browser has no way to make that comparison. `isHuman` stays for the
+  // places that genuinely mean a person (the header's assignee line).
+  const heldByOther = conv?.heldByAnotherParty === true;
   const isHuman = conv?.assigneeType === "User";
   // Deep link to this conversation in the operator's Chatwoot (build from the instance origin/account).
   const chatwootUrl = conv
@@ -1630,7 +1665,13 @@ export function ConversationDetailPage() {
                   it, resolved = closed). "Configure agent" stays last so it sits at the right edge. */}
               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:flex-col lg:flex-nowrap lg:items-end lg:gap-2">
                 <div className="contents lg:flex lg:flex-row lg:flex-wrap lg:items-center lg:justify-end lg:gap-2">
-                  {conv.status === "pending" && (
+                  {/* Who HOLDS it, not what the status says. `pending` is the AI's state and also
+                      the state a takeover leaves behind — the hand-back sets it and then finds a
+                      person there — so keying these two buttons on status alone offered "handoff to
+                      human" on a conversation a human already had, and hid "Return to AI" on the one
+                      conversation that needed it. That is the shape of the bug this whole change is
+                      about, reappearing in the console. */}
+                  {conv.status === "pending" && !heldByOther && (
                     <Button
                       variant="secondary"
                       size="sm"
@@ -1662,32 +1703,39 @@ export function ConversationDetailPage() {
                       {t("conversation.reopen", "Reopen")}
                     </Button>
                   )}
-                  {conv.status !== "pending" && conv.status !== "resolved" && (
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      disabled={busy}
-                      onClick={() =>
-                        returnToAi(
-                          t("conversation.returned", "Returned to the AI."),
-                        )
-                      }
-                    >
-                      <Bot className="h-4 w-4" aria-hidden="true" />
-                      {t("conversation.returnToAi", "Return to AI")}
-                    </Button>
-                  )}
-                  {offerReengage && conv.status === "pending" && (
-                    <Button
-                      variant="primary"
-                      size="sm"
-                      disabled={busy}
-                      onClick={reengage}
-                    >
-                      <Sparkles className="h-4 w-4" aria-hidden="true" />
-                      {t("conversation.respondNow", "Respond now")}
-                    </Button>
-                  )}
+                  {/* `resolved` is excluded on BOTH sides: "Reopen" above already runs this exact
+                      operation, so letting the holder clause add "Return to AI" there rendered two
+                      differently labelled buttons for one action. Reopen is the right label for a
+                      closed conversation whoever holds it, so it keeps that state alone. */}
+                  {conv.status !== "resolved" &&
+                    (heldByOther || conv.status !== "pending") && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() =>
+                          returnToAi(
+                            t("conversation.returned", "Returned to the AI."),
+                          )
+                        }
+                      >
+                        <Bot className="h-4 w-4" aria-hidden="true" />
+                        {t("conversation.returnToAi", "Return to AI")}
+                      </Button>
+                    )}
+                  {offerReengage &&
+                    conv.status === "pending" &&
+                    !heldByOther && (
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        disabled={busy}
+                        onClick={reengage}
+                      >
+                        <Sparkles className="h-4 w-4" aria-hidden="true" />
+                        {t("conversation.respondNow", "Respond now")}
+                      </Button>
+                    )}
                   {conv.status !== "resolved" && (
                     <Button
                       variant="secondary"

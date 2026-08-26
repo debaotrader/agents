@@ -13,6 +13,7 @@ import {
   err,
   gate,
   ok,
+  parseMcpId,
   recordMcpAudit,
   truncForAudit,
   type WriteDeps,
@@ -29,14 +30,6 @@ function failOf(e: unknown): WriteResult {
   throw e;
 }
 
-function parseId(raw: string, label: string): bigint | WriteResult {
-  try {
-    return BigInt(raw);
-  } catch {
-    return err(`invalid ${label}`);
-  }
-}
-
 export async function conversationReply(
   principal: VerifiedToken,
   args: {
@@ -50,7 +43,7 @@ export async function conversationReply(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.conversation_id, "conversation_id");
+  const id = parseMcpId(args.conversation_id, "conversation_id");
   if (typeof id !== "bigint") return id;
   const isPrivate = args.private ?? false;
   const target = `conversation:${id}`;
@@ -96,7 +89,7 @@ export async function conversationHandoff(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.conversation_id, "conversation_id");
+  const id = parseMcpId(args.conversation_id, "conversation_id");
   if (typeof id !== "bigint") return id;
   const assigneeId = args.assignee_id ?? null;
   const target = `conversation:${id}`;
@@ -139,7 +132,7 @@ export async function conversationReturn(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.conversation_id, "conversation_id");
+  const id = parseMcpId(args.conversation_id, "conversation_id");
   if (typeof id !== "bigint") return id;
   const target = `conversation:${id}`;
   try {
@@ -153,16 +146,18 @@ export async function conversationReturn(
         note: "Returns the conversation to the bot (unassigns human, status pending). Calls Chatwoot.",
       });
     }
-    await returnConversationToAgent(ctx, id, {}, base);
+    const outcome = await returnConversationToAgent(ctx, id, {}, base);
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
       action: "mcp.conversation_return",
       target,
       before: truncForAudit({ status: current.status }),
-      after: truncForAudit({ status: "pending" }),
+      after: truncForAudit({ status: "pending", outcome }),
     });
-    return ok({ dryRun: false, applied: true, target });
+    // Reported, not swallowed: a takeover during the call leaves the conversation with the human who
+    // claimed it, and an `applied: true` alone would tell the caller the agent has it back.
+    return ok({ dryRun: false, applied: true, target, outcome });
   } catch (e) {
     return failOf(e);
   }
@@ -180,7 +175,7 @@ export async function conversationStatus(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.conversation_id, "conversation_id");
+  const id = parseMcpId(args.conversation_id, "conversation_id");
   if (typeof id !== "bigint") return id;
   const target = `conversation:${id}`;
   try {
@@ -218,7 +213,7 @@ export async function conversationReengage(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.conversation_id, "conversation_id");
+  const id = parseMcpId(args.conversation_id, "conversation_id");
   if (typeof id !== "bigint") return id;
   const target = `conversation:${id}`;
   try {

@@ -1,5 +1,7 @@
+import { z } from "zod";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import { revokeApiKey } from "@/modules/api-keys/service";
 import {
   createBusinessHours,
@@ -12,6 +14,7 @@ import {
   deleteExperiment,
   getExperiment,
   updateExperiment,
+  variantWriteSchema,
 } from "@/modules/experiments/service";
 import {
   getTenantSettings,
@@ -31,6 +34,7 @@ import {
   err,
   gate,
   ok,
+  parseMcpId,
   recordMcpAudit,
   resolveSecretRef,
   truncForAudit,
@@ -48,14 +52,6 @@ function failOf(e: unknown): WriteResult {
   throw e;
 }
 
-function parseId(raw: string, label: string): bigint | WriteResult {
-  try {
-    return BigInt(raw);
-  } catch {
-    return err(`invalid ${label}`);
-  }
-}
-
 // ── A/B prompt experiments ──
 
 interface VariantArg {
@@ -64,12 +60,21 @@ interface VariantArg {
   system_prompt?: string;
 }
 
+// Mapped AND validated here, not only inside the service, because this runs on the DRY RUN too. The
+// service parses through `variantWriteSchema` on the way to the database, which a preview never
+// reaches — so a prompt past the ceiling came back as an approved preview and then failed on the
+// identical call with `dry_run: false`. A preview that approves what the write refuses is worse than
+// no preview: it is the one that gets trusted.
 function mapVariants(variants: VariantArg[]) {
-  return variants.map((v) => ({
-    key: v.key,
-    weight: v.weight,
-    systemPrompt: v.system_prompt,
-  }));
+  return parseInput(
+    z.array(variantWriteSchema),
+    variants.map((v) => ({
+      key: v.key,
+      weight: v.weight,
+      systemPrompt: v.system_prompt,
+    })),
+    "variants",
+  );
 }
 
 export async function experimentCreate(
@@ -86,10 +91,9 @@ export async function experimentCreate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
   let agentId: bigint | undefined;
   if (args.agent_id) {
-    const parsed = parseId(args.agent_id, "agent_id");
+    const parsed = parseMcpId(args.agent_id, "agent_id");
     if (typeof parsed !== "bigint") return parsed;
     agentId = parsed;
   }
@@ -108,7 +112,7 @@ export async function experimentCreate(
       });
     }
     const created = await createExperiment({
-      tenantId,
+      ctx,
       name: args.name,
       agentId,
       variants: mapVariants(args.variants),
@@ -145,8 +149,7 @@ export async function experimentUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -156,11 +159,20 @@ export async function experimentUpdate(
   } = {};
   if (args.name !== undefined) patch.name = args.name;
   if (args.enabled !== undefined) patch.enabled = args.enabled;
-  if (args.variants !== undefined) patch.variants = mapVariants(args.variants);
+  // Inside a catch boundary, like the create path: `mapVariants` VALIDATES now, so it throws on a
+  // variant the write would refuse — and a tool that throws answers the caller with an exception
+  // instead of the `{ ok: false, error }` every other refusal on this surface produces.
+  if (args.variants !== undefined) {
+    try {
+      patch.variants = mapVariants(args.variants);
+    } catch (e) {
+      return failOf(e);
+    }
+  }
   if (args.agent_id !== undefined) {
     if (args.agent_id === null) patch.agentId = null;
     else {
-      const parsed = parseId(args.agent_id, "agent_id");
+      const parsed = parseMcpId(args.agent_id, "agent_id");
       if (typeof parsed !== "bigint") return parsed;
       patch.agentId = parsed;
     }
@@ -171,7 +183,7 @@ export async function experimentUpdate(
     );
   }
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = {
       name: current.name,
@@ -188,7 +200,7 @@ export async function experimentUpdate(
         },
       });
     }
-    const updated = await updateExperiment({ tenantId, id, ...patch, base });
+    const updated = await updateExperiment({ ctx, id, ...patch, base });
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
@@ -215,11 +227,10 @@ export async function experimentDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const tenantId = ctx.tenantId as bigint;
-  const id = parseId(args.experiment_id, "experiment_id");
+  const id = parseMcpId(args.experiment_id, "experiment_id");
   if (typeof id !== "bigint") return id;
   try {
-    const current = await getExperiment(tenantId, id, base);
+    const current = await getExperiment(ctx, id, base);
     const target = `experiment:${id}`;
     const beforeProj = { id: String(current.id), name: current.name };
     if (args.dry_run !== false) {
@@ -230,7 +241,7 @@ export async function experimentDelete(
         current: beforeProj,
       });
     }
-    await deleteExperiment(tenantId, id, base);
+    await deleteExperiment(ctx, id, base);
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
@@ -329,7 +340,7 @@ export async function businessHoursUpdate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   const patch: {
     name?: string;
@@ -396,7 +407,7 @@ export async function businessHoursDelete(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.business_hours_id, "business_hours_id");
+  const id = parseMcpId(args.business_hours_id, "business_hours_id");
   if (typeof id !== "bigint") return id;
   try {
     const current = await getBusinessHours(ctx, id, base);
@@ -694,7 +705,7 @@ export async function apiKeyRevoke(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const id = parseId(args.api_key_id, "api_key_id");
+  const id = parseMcpId(args.api_key_id, "api_key_id");
   if (typeof id !== "bigint") return id;
   const target = `api_key:${id}`;
   try {

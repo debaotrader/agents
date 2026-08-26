@@ -59,6 +59,7 @@ function pendingCredentialError(ref: string): AppError {
     `vault secret "${ref}" has not been filled yet`,
     409,
     "errors.credentialPending",
+    { ref },
   );
 }
 
@@ -243,12 +244,20 @@ export async function resolveVaultRefByName(
 export async function requireVaultRef(
   db: ScopedDb,
   ref: string,
+  // The server's own name for the input this ref arrived in, when the caller has one — a dotted path
+  // into a bag it owns (`settings.tts.normalizeCredentialRef`). Optional because most callers refuse
+  // a column the client already named in the patch it sent; the agent's two bags are the ones that
+  // need it, where a ref can be any of eight fields across three editor tabs and the sentence alone
+  // would leave the console guessing which input to mark. See src/api/lib/refusal.ts.
+  field?: string,
 ): Promise<string> {
   const malformed = () =>
     new AppError(
       `"${ref}" is not a vault reference (expected vault:<id>)`,
       400,
       "errors.invalidVaultRef",
+      { ref },
+      field,
     );
   if (!ref.startsWith(VAULT_REF_PREFIX)) throw malformed();
   const raw = ref.slice(VAULT_REF_PREFIX.length);
@@ -268,6 +277,8 @@ export async function requireVaultRef(
       `vault secret "${ref}" not found`,
       400,
       "errors.vaultRefNotFound",
+      { ref },
+      field,
     );
   }
   return formatVaultRef(entry.id);
@@ -342,6 +353,38 @@ function validateParamName(raw: string, kind: string): string {
   return trimmed;
 }
 
+// A credential is stored as its exact bytes, so a paste artifact is not a detail: an HTTP field
+// value has its surrounding whitespace stripped before any handler sees it, so a token stored with a
+// trailing newline can never be matched by the one that arrives, and the refusal that follows is
+// byte-identical to a wrong token (issue #338).
+//
+// This REFUSES rather than trimming, and the difference is the whole point. Trimming would repair
+// the header case silently while breaking the one where the bytes are shared rather than sent: an
+// HMAC key never travels, both sides hold it, and `createHmac` uses it verbatim — so rewriting ours
+// would fail every signature at the provider instead of here. Refusing changes no secret, needs no
+// per-kind exception, and hands the operator the one fact they could not see.
+// The sentence names the field when there is one, because that is the only place the name survives:
+// `AppError.field` is dropped by the MCP writer (`failOf` sends `e.message`) and by the console's
+// save-error path, so a padded Langfuse key would otherwise refuse with a sentence that cannot say
+// WHICH of the two is padded — for whitespace, of all things, which the operator cannot see.
+function assertNoSurroundingWhitespace(value: string, field?: string): void {
+  if (value === value.trim()) return;
+  if (field !== undefined) {
+    throw new AppError(
+      `value.${field} must not begin or end with whitespace`,
+      400,
+      "errors.vaultFieldWhitespace",
+      { field },
+      field,
+    );
+  }
+  throw new AppError(
+    "vault secret must not begin or end with whitespace",
+    400,
+    "errors.vaultSecretWhitespace",
+  );
+}
+
 // Validates the secret value against the kind's declared shape.
 // - kinds with `fields` declared: must be a Record<string, string> with exactly those keys, all non-empty.
 // - all other kinds: must be a non-empty string.
@@ -375,9 +418,15 @@ function validateVaultValue(kind: string, value: unknown): void {
         throw new AppError(
           `value.${key} must be a non-empty string`,
           400,
-          "errors.invalidVaultValue",
+          "errors.vaultFieldRequired",
+          { field: key },
+          // NOTE: the credential form renders one input per declared field and keys it by exactly this
+          // (`fieldValues[f.key]`, src/client/components/CredentialForm.tsx), so the key IS the
+          // console's name for the input that was refused.
+          key,
         );
       }
+      assertNoSurroundingWhitespace(v, key);
     }
     // Reject extra keys not in the declared field list.
     const declaredKeys = new Set(fields.map((f) => f.key));
@@ -386,7 +435,8 @@ function validateVaultValue(kind: string, value: unknown): void {
         throw new AppError(
           `value has unexpected key: ${k}`,
           400,
-          "errors.invalidVaultValue",
+          "errors.vaultFieldUnknown",
+          { field: k },
         );
       }
     }
@@ -398,6 +448,7 @@ function validateVaultValue(kind: string, value: unknown): void {
         "errors.emptyVaultSecret",
       );
     }
+    assertNoSurroundingWhitespace(value);
   }
 }
 
@@ -814,6 +865,12 @@ export async function testVaultValue(
 ): Promise<SecretTestResult> {
   if (kind && !isSecretTypeId(kind)) {
     throw new AppError("invalid secret type", 400, "errors.invalidSecretType");
+  }
+  // A value the write would refuse is not a connectivity question, and probing it answers the wrong
+  // one: fetch strips the padding out of a header, so a fixed-header kind reports "Connection OK"
+  // and the save then refuses the same bytes.
+  if (value !== value.trim()) {
+    return { testable: true, ok: false, code: "surrounding_whitespace" };
   }
   return runSecretTest({ kind, value, baseURL, paramName }, deps);
 }

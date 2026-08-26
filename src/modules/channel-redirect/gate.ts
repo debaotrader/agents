@@ -1,7 +1,10 @@
+import { randomBytes } from "node:crypto";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
+import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
+import { ChatwootApiError } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import { buildWidgetUrl, normalizeWebsiteUrl } from "./link";
 import {
@@ -39,9 +42,96 @@ export interface ResolveRedirectLinkParams {
   // Stored in the token, injected into the widget on land (the cloned WhatsApp message). Omitted by the
   // proactive WhatsApp follow-up (nothing new to clone — the lead already saw their first message).
   clonedMessage?: string;
+  // The WhatsApp entry conversation the link is being sent on (its chatwootConversationId). Rides in
+  // the token so the fork can stamp it on the widget conversation, which is what turns the episode's
+  // pairing from an inference into a fact (issue #222).
+  originDisplayId: number;
   openWidget: boolean;
   ttlSeconds: number;
   base: PrismaClient;
+}
+
+// Whether an identifier a contact is already carrying is one this gate gave it: the base value, or the
+// base with a suffix. Anything else (no identifier, a WhatsApp LID, another lead's value) is not ours,
+// and the caller takes one instead.
+export function isOurIdentifier(current: string, base: string): boolean {
+  return current === base || current.startsWith(`${base}:`);
+}
+
+// Settle which redirect identifier this contact carries, and return it, because the token has to be
+// minted for whatever the answer is.
+//
+// READ FIRST, and keep what is already there. `fzwa:<X>` is unique per Chatwoot account, so when
+// another contact holds it the stamp is refused with a 422 and, with a fixed value, every later
+// redirect for this lead fails the same way, permanently and in silence (#269). The answer to that
+// refusal is to take `fzwa:<X>:<random>` instead. But an identifier this contact ALREADY carries is
+// the one live tokens were minted for, and links outlive the resend cooldown by design (24h), so
+// re-deriving a value on each delivery would detach the link issued minutes ago. That applies both
+// ways: a contact that moved keeps its suffix even if the base has since become free, because a token
+// is out there carrying the suffix.
+//
+// So this writes only when the contact has no identifier of ours yet, which also means the ordinary
+// path costs one call, a read, instead of a pointless re-stamp of a value already in place.
+//
+// WHY IT MOVES INSTEAD OF TAKING THE VALUE BACK. The alternative is to find the holder and clear it,
+// and that is unbuildable on this API: nothing there answers "who holds exactly this identifier".
+// `/contacts/search` matches a substring across name, email, phone and identifier, 15 rows a page.
+// `/contacts/filter` is exact but case-INSENSITIVE while the unique index is not, is paged the same
+// way, and its `resolved_contacts` base narrows to `contact_type: 'lead'` once `crm_v2` is on, which
+// hides the widget visitor it would be looking for. And there is no conditional write, so even a
+// correct answer can go stale between the read and the PUT and clear an identifier nobody meant to
+// touch. Moving needs none of it: the account cannot refuse a value nobody has, the write stays on OUR
+// contact, and no other contact is read, trusted or modified. Squatting stops working too, since an
+// identifier that does not exist until it is minted cannot be claimed in advance.
+//
+// Serialized per contact because the whole thing is read-then-write over the network: two deliveries
+// for one lead arriving together would otherwise both read "nothing yet", mint two different suffixes
+// and leave one of the two links pointing at a value the contact no longer holds. The queue is
+// process-local, which is the same invariant the rest of the gate already runs under.
+//
+// Keyed by INSTANCE and contact, because a Chatwoot contact id is unique inside one account and not
+// beyond it (schema.prisma says so on `Contact`, and `ChatwootClient.targetKey` scopes its own keys the
+// same way). A bare contact id would put two tenants that happen to share the number behind one queue,
+// so a slow round trip on one Chatwoot server would hold up a redirect on another.
+export function identifierQueueKey(
+  instanceId: bigint,
+  chatwootContactId: number,
+): string {
+  return `redirect-identifier:${instanceId}:${chatwootContactId}`;
+}
+
+async function settleIdentifier(
+  admin: Awaited<ReturnType<typeof loadChatwootClient>>,
+  instanceId: bigint,
+  chatwootContactId: number,
+  base: string,
+): Promise<string> {
+  return withKeyedQueue(
+    identifierQueueKey(instanceId, chatwootContactId),
+    async () => {
+      const current = await admin.getContactIdentifier(chatwootContactId);
+      if (current !== null && isOurIdentifier(current, base)) return current;
+      try {
+        await admin.updateContact(chatwootContactId, { identifier: base });
+        return base;
+      } catch (err) {
+        if (!(err instanceof ChatwootApiError) || err.status !== 422) throw err;
+        // Random rather than a counter: a counter would have to be stored somewhere, and its next value
+        // is as claimable in advance as the first one was.
+        const moved = `${base}:${randomBytes(4).toString("hex")}`;
+        logger.info(
+          "channel-redirect: identifier %s is held by another contact; contact %d takes %s instead",
+          base,
+          chatwootContactId,
+          moved,
+        );
+        // A second refusal is not a collision worth chasing: it means a 1-in-4-billion clash, or a 422
+        // that was never about the identifier. Either belongs to the caller's catch.
+        await admin.updateContact(chatwootContactId, { identifier: moved });
+        return moved;
+      }
+    },
+  );
 }
 
 // Stamp the `fzwa:` identifier on the WhatsApp contact (so the widget-side resolve merges the widget
@@ -52,17 +142,25 @@ export interface ResolveRedirectLinkParams {
 export async function resolveRedirectLink(
   p: ResolveRedirectLinkParams,
 ): Promise<string | null> {
-  const identifier = `fzwa:${p.chatwootContactId}`;
   try {
     const admin = await loadChatwootClient(p.tenantId, p.instanceId, {
       base: p.base,
     });
-    await admin.updateContact(p.chatwootContactId, { identifier });
+    // Minted for whatever this contact actually carries, which is not always the value it would be
+    // asked for: one another contact holds is answered by taking a different one, and one already in
+    // place is kept because a live token was minted for it.
+    const identifier = await settleIdentifier(
+      admin,
+      p.instanceId,
+      p.chatwootContactId,
+      `fzwa:${p.chatwootContactId}`,
+    );
     const { token, websiteUrl } = await admin.mintRedirectToken({
       inboxId: p.widgetInboxId,
       identifier,
       message: p.clonedMessage,
       ttlSeconds: p.ttlSeconds,
+      originDisplayId: p.originDisplayId,
     });
     if (!websiteUrl) {
       logger.warn(
@@ -116,7 +214,9 @@ export function interpolateLink(template: string, url: string): string {
 export interface RunRedirectGateParams {
   tenantId: bigint;
   instanceId: bigint;
-  conversationId: number; // Chatwoot display id, for logging
+  // Chatwoot display id of the conversation the gate is running on — the WhatsApp ENTRY half of the
+  // episode. Load-bearing since #222: it is what the token carries as the redirect's origin.
+  conversationId: number;
   conv: {
     id: bigint;
     contactId: bigint | null;
@@ -169,6 +269,7 @@ export async function runRedirectGate(
     instanceId,
     chatwootContactId: contact.chatwootContactId,
     widgetInboxId,
+    originDisplayId: p.conversationId,
     clonedMessage:
       cfg.cloneWaMessage && p.clonedMessage
         ? clipText(p.clonedMessage, MAX_CLONE_CHARS)

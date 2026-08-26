@@ -3,7 +3,10 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { Semaphore } from "@/lib/semaphore";
+import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
 import {
+  JOB_DEATH_LEVEL,
   JOB_SPENDS_PROVIDER,
   sharedProviderConcurrency,
 } from "@/modules/scheduler/lanes";
@@ -21,13 +24,21 @@ import {
 // Single-replica worker that drains the scheduler. The handler registry decouples the scheduler
 // from feature logic (follow-ups register their handlers); a job kind with no handler fails (and
 // eventually goes DEAD) rather than silently vanishing. `reschedule` is for "not yet" (out of
-// hours) and does not consume an attempt; `fail` retries with backoff up to the cap.
+// hours) and CLEARS the failure budget, because it means the pass completed (issue #287); `fail`
+// retries with backoff up to the cap.
 
 export type JobResult =
   | { outcome: "done" }
   // `payload`, when present, REPLACES the job's payload on reschedule (e.g. a follow-up advancing its
-  // step index on the same row). Omit it to keep the current payload.
-  | { outcome: "reschedule"; runAt: Date; payload?: Record<string, unknown> }
+  // step index on the same row). Omit it to keep the current payload. `payloadPatch` MERGES instead,
+  // which is what a handler wants when it only carries a field forward and another writer may have
+  // stamped the row while it ran (see rescheduleJob). Pass at most one of the two.
+  | {
+      outcome: "reschedule";
+      runAt: Date;
+      payload?: Record<string, unknown>;
+      payloadPatch?: Record<string, unknown>;
+    }
   | { outcome: "fail"; error?: string };
 
 export type JobHandler = (
@@ -43,11 +54,23 @@ export function registerJobHandler(kind: string, handler: JobHandler): void {
 export function getJobHandler(kind: string): JobHandler | undefined {
   return handlers.get(kind);
 }
+// The counterpart, and it exists because the registry is process-global while a Bun worker shares
+// one process across test files: a test that installs a handler for a kind that had none could put
+// nothing back, so the stub outlived the file and the next file's scheduler test inherited it. With
+// this, "install, use, put back" is expressible for both starting states.
+export function unregisterJobHandler(kind: string): void {
+  handlers.delete(kind);
+}
 
 // Called when a job is DEAD-LETTERED, which is the only moment the scheduler can state that this
 // work is definitively lost — a failure is not that statement, because the next attempt may succeed
 // (issue #71). Registered per kind so the scheduler stays ignorant of what a given job's loss means
-// downstream; a kind with no hook simply dies quietly, as before.
+// downstream.
+//
+// OPTIONAL, and what a kind gets by NOT registering one is no longer silence: it is the generic
+// line below. A hook is for a kind whose loss can be said better than "a FOLLOWUP died" — attached
+// to the conversation it belongs to, suppressed when the row was re-armed underneath it — and two
+// kinds have earned one. Ten had not, and before issue #356 all ten died through an early return.
 export type DeadLetterHandler = (
   job: ClaimedJob,
   error: string,
@@ -68,25 +91,95 @@ export function getDeadLetterHandler(
   return deadLetterHandlers.get(kind);
 }
 
+function sysCtx(tenantId: bigint): TenantContext {
+  return { tenantId, userId: null, role: "TENANT_ADMIN" };
+}
+
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-// Best-effort: a hook that throws must not turn a failed job into a failed tick, and it runs AFTER
-// the row is DEAD so it can never be mistaken for part of the attempt.
+// Best-effort, and the guarantee covers the WHOLE function rather than the hook call it started on:
+// nothing in here may turn a failed job into a failed tick. It runs AFTER the row is DEAD, so it can
+// never be mistaken for part of the attempt, and by then the announcement is the only thing left to
+// lose — but losing it is not the worst case. `announceReaped` walks a BATCH, so a throw escaping
+// here takes every later dead job in that batch with it, and no subsequent reap will return them:
+// they are already DEAD, and the reaper only claims rows still CLAIMED. One transient pool timeout
+// would permanently silence a whole tick's worth of deaths.
+//
+// That is why the re-read below is inside the try and not beside it. A guard added to prevent one
+// false report must not be able to destroy a batch of true ones.
+//
+// EVERY kind announces here, which is the whole of issue #356's biggest half. `if (!hook) return`
+// used to be the exit for ten of the twelve kinds, and it was invisible: the hook is optional by
+// design, so nothing anywhere counted how many kinds were leaving through it, and the count only
+// ever went down when somebody happened to write a hook for one more (#196, #71).
+//
+// A registered hook OWNS the announcement, including the decision NOT to write one — both existing
+// hooks re-read the row and stay quiet when it was re-armed underneath them, and a generic line
+// written over that would re-report a loss the hook just established had not happened.
 async function dispatchDeadLetter(
   job: ClaimedJob,
   error: string,
   base: PrismaClient,
 ): Promise<void> {
-  const hook = deadLetterHandlers.get(job.kind);
-  if (!hook) return;
   try {
-    await hook(job, error, base);
+    const hook = deadLetterHandlers.get(job.kind);
+    if (hook) {
+      await hook(job, error, base);
+      return;
+    }
+    // NOTE: RE-READ rather than trust the dead-letter that got us here, which is what both
+    // hand-written hooks do and for the same reason (../memory/compact.ts spells it out). A re-arm
+    // lands on THIS row — `upsertJobRow` keys on (tenant, kind, dedupeKey) — so a FOLLOWUP the
+    // sweep re-arms in the window between the DEAD write and this line is work that is queued
+    // again, and announcing it would page an operator about a loss that did not happen. Suppressing
+    // costs nothing: a cause that is still broken fails the new arm too, and announces then.
+    //
+    // It NARROWS the window and cannot close it: the trail write is fire-and-forget, so a re-arm
+    // landing between this read and that insert still gets announced over. What is left is a line
+    // the next pass's own outcome follows, which is legible; closing it would mean writing the row
+    // inside the job's transaction.
+    //
+    // Any status but DEAD suppresses, and a MISSING row suppresses too: for a kind with
+    // JOB_DELETE_ON_DONE the row is gone precisely because the work completed, and no row is not
+    // evidence that work was lost.
+    //
+    // And the row has to be DEAD for THIS claim. `claimSeq` is the token the claim handed out, and
+    // the module already treats a moved one as "this run was retired" (`isRetired`, ../scheduler
+    // /service.ts): a row re-armed, re-claimed by another drain and dead AGAIN reads as DEAD here
+    // while belonging to a later attempt — which announces its own death with its own error. Status
+    // alone would report the old error and let the new one report a second time.
+    const row = await runScopedOn(base, sysCtx(job.tenantId), (db) =>
+      db.schedulerJob.findUnique({
+        where: { id: job.id },
+        select: { status: true, claimSeq: true },
+      }),
+    );
+    if (row?.status !== "DEAD" || row.claimSeq !== job.claimSeq) return;
+    // NOTE: the attempt count is deliberately absent, for the reason measured in
+    // ../memory/compact.ts: the two roads to DEAD disagree about the number while meaning the same
+    // thing (failJob hands the hook the claim it was given, the reaper increments in SQL). What
+    // tells the roads apart is the error itself, and only the reaper writes "the claim never
+    // finished".
+    emitDeadLetter({
+      tenantId: job.tenantId,
+      unit: "job",
+      level: JOB_DEATH_LEVEL[job.kind],
+      error,
+      detail: {
+        kind: job.kind,
+        jobId: String(job.id),
+        // NOTE: ids by construction (a dedupe key has to be stable), and the only field on this
+        // line an operator can act on: it says WHICH follow-up, WHICH document, WHICH reminder.
+        ...(job.dedupeKey ? { dedupeKey: job.dedupeKey } : {}),
+      },
+      base,
+    });
   } catch (err) {
     logger.warn(
       { err, jobId: String(job.id), kind: job.kind },
-      "scheduler: dead-letter hook failed",
+      "scheduler: dead-letter announcement failed",
     );
   }
 }
@@ -168,6 +261,7 @@ export async function runClaimed(
       result.runAt,
       result.payload,
       base,
+      result.payloadPatch,
     );
     if (!applied) supersededWarning(job, "reschedule");
   } else {

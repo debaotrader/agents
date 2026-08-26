@@ -105,6 +105,8 @@ export interface NormalizedChatwootContact {
 export interface NormalizedChatwootEvent {
   event: string;
   // conversation display_id (per-account) — the id the bot-token API uses, NOT the global PK.
+  // null whenever the event's body is not a conversation and embeds none: the two allowlists in
+  // normalize.ts are where that promise is kept, and issue #257 is what happens without them.
   conversationId: number | null;
   // The native Chatwoot ContactInbox id (conversation.contact_inbox.id). Present on every event the
   // fork emits (EventDataPresenter#push_data embeds the raw contact_inbox association). Keys the
@@ -135,6 +137,29 @@ export interface NormalizedChatwootEvent {
   // has sub-second resolution — so it, not last_activity_at, orders conversation-level state.
   // `null` on a Chatwoot too old to send it.
   conversationUpdatedAt?: number | null;
+  // ── the human half of an attendance, as CHATWOOT already measured it ──
+  //
+  // Chatwoot keeps a first-response SLA of its own and ships it on every conversation payload
+  // (`Conversations::EventDataPresenter`): `created_at`, and `first_reply_created_at` — the moment
+  // of the first message satisfying `Message#valid_first_reply?` (outgoing, not private, not a
+  // reaction, sender outside `['AgentBot', 'Captain::Assistant']`, which is the same predicate this
+  // codebase spells `isNewHumanAgentMessage`).
+  //
+  // Both are computed by Chatwoot FROM THE MESSAGES TABLE, which is what makes them worth mirroring
+  // rather than deriving here: they do not depend on the order its webhooks reach us, they are
+  // already correct for a conversation that predates our mirror, and neither is revised once set.
+  // A retry that arrives late carries the same two values as the delivery it duplicates.
+  //
+  // NOTE on semantics: `first_reply_created_at` is Chatwoot's SLA field, so on a conversation the
+  // BUSINESS opened it marks that opening message — the KPI built on it reports the operator's own
+  // dashboard number, including that bias. Timing the customer's wait instead would mean anchoring
+  // on `waiting_since`, which Chatwoot clears when the reply goes out; that is a different metric,
+  // and a product decision rather than a translation.
+  //
+  // `undefined`/`null` ⇒ the payload did not carry it (a message event whose `conversation` is
+  // absent, or a conversation with no qualifying reply yet) ⇒ the mirror keeps what it stored.
+  conversationCreatedAt?: Date | null;
+  firstReplyCreatedAt?: Date | null;
   // The CONVERSATION's custom attributes (conversation.custom_attributes on EventDataPresenter
   // push_data). Mirrored for the agent's attribute context. `undefined` ⇒ absent from this payload.
   customAttributes?: Record<string, unknown>;
@@ -143,4 +168,17 @@ export interface NormalizedChatwootEvent {
   // Kanban::Task#common_event_data carries `custom_attributes`). `undefined` ⇒ absent (upstream
   // Chatwoot, or a conversation with no card).
   kanbanAttributes?: Record<string, unknown>;
+  // The WhatsApp entry conversation this widget thread was redirected FROM, as its display_id
+  // (conversation.redirect_origin_display_id, which the fork's token resolve writes at the one moment
+  // the pairing is a fact).
+  //
+  // THREE states, and the difference between the last two is load-bearing:
+  //   number    — this is the pairing.
+  //   null      — the payload STATES there is none. The fork clears the pairing when a re-entry's
+  //               token names no origin, and that clear has to reach the row: the consumer holding
+  //               the previous pairing is the one that must stop acting on it.
+  //   undefined — the payload said nothing, which is every event from a Chatwoot without
+  //               fazer-ai/chatwoot#418. Reading it as a clear would wipe every episode's pairing on
+  //               the first ordinary message (issue #222).
+  redirectOriginDisplayId?: number | null;
 }

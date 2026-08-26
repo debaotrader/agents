@@ -7,6 +7,49 @@ import {
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
 
+// EVERY BLOCK THIS SURFACE OWNS IS WRITTEN BACK NORMALIZED, and the check is over the key list
+// rather than over the eighteen assignments that implement it.
+//
+// The merge re-reads the patched bag through the typed readers to clamp and validate it, and then
+// has to STORE what it read. A block that is merged but not written back leaves the raw value in
+// `agent.settings` while every projection shows the normalized one — the two disagree from then on,
+// in the export, in the MCP read and in any diff between two agents. It is silent by construction:
+// the readers normalize again on the way out, so nothing downstream misbehaves.
+//
+// Review found `modelFallback` missing from that list, which was the fourth time in one change that
+// a new behavior block went in with one of its registration points forgotten. So the invariant is
+// asserted per KEY, behaviourally, instead of the eighteenth assignment being reviewed by eye.
+describe("behavior-settings — the merge stores every block it owns", () => {
+  // The two blocks whose stored form is deliberately NOT the read form, each for a reason at its own
+  // assignment: `observability` persists through `storableObservability` because `fullDetail` is
+  // DERIVED and storing it would freeze a mode that is supposed to expire; `grounding` is persisted
+  // only when the patch touched it, so an untouched bag keeps whatever it had.
+  const NOT_THE_READ_SHAPE = new Set(["observability", "grounding"]);
+
+  for (const key of BEHAVIOR_SETTINGS_KEYS) {
+    if (NOT_THE_READ_SHAPE.has(key)) continue;
+    test(`${key} comes back agreeing with its own reader`, () => {
+      const merged = mergeBehaviorSettings({}, { [key]: {} });
+      const stored = (merged as Record<string, unknown>)[key];
+      // The stored bag and the projection of it are the same thing, which is exactly what the
+      // write-back exists to make true.
+      expect(stored).toEqual(
+        (readBehaviorSettings(merged) as unknown as Record<string, unknown>)[
+          key
+        ],
+      );
+    });
+  }
+
+  test("the loop actually covers the blocks, including the newest", () => {
+    const covered = BEHAVIOR_SETTINGS_KEYS.filter(
+      (k) => !NOT_THE_READ_SHAPE.has(k),
+    );
+    expect(covered.length).toBeGreaterThanOrEqual(15);
+    expect(covered).toContain("modelFallback");
+  });
+});
+
 // vision is part of the shared behavior surface (so it is settable via the MCP agent_settings_set
 // partial-merge path, like stt/tts). These cover the wiring without a DB.
 describe("behavior-settings — vision", () => {
@@ -107,6 +150,8 @@ describe("behavior-settings — observability", () => {
     expect(BEHAVIOR_SETTINGS_KEYS).toContain("observability");
     expect(readBehaviorSettings({}).observability).toEqual({
       logToolValues: false,
+      fullDetail: false,
+      fullDetailUntil: null,
     });
   });
 
@@ -115,7 +160,12 @@ describe("behavior-settings — observability", () => {
       { limits: { maxToolCalls: 7 } },
       { observability: { logToolValues: "true" } },
     );
-    expect(next.observability).toEqual({ logToolValues: true });
+    // The STORED shape, not the read shape: `fullDetail` is derived on read and must never be
+    // persisted, or a bag can say "armed" an hour after the window closed.
+    expect(next.observability).toEqual({
+      logToolValues: true,
+      fullDetailUntil: null,
+    });
     // The limits block is re-read through its typed reader, so it comes back normalized in full:
     // the untouched tool-call cap plus the history ceiling explicitly at "off".
     expect(next.limits).toEqual({ maxToolCalls: 7, maxHistoryTokens: null });
@@ -224,5 +274,49 @@ describe("behavior-settings — a patch into a nested block", () => {
     expect(
       (next.attributeContext as Record<string, unknown>).conversation,
     ).toEqual(["a"]);
+  });
+});
+
+// The merge re-reads every block through its typed reader and writes the result back, so a reader
+// that answers a DERIVED field would persist it. `observability.fullDetail` is exactly that field:
+// it is computed from `fullDetailUntil` on every read, and a bag holding it would let the stored
+// answer and the computed one disagree the moment the window closes (issue #58).
+describe("behavior-settings — the merge stores what is stored, not what is derived", () => {
+  const armed = new Date(Date.now() + 3_600_000).toISOString();
+
+  test("an armed window survives a patch to an unrelated block", () => {
+    const next = mergeBehaviorSettings(
+      { observability: { fullDetailUntil: armed } },
+      { limits: { maxToolCalls: 7 } },
+    );
+    expect(next.observability).toEqual({
+      logToolValues: false,
+      fullDetailUntil: armed,
+    });
+  });
+
+  test("the derived flag never reaches the bag", () => {
+    const next = mergeBehaviorSettings(
+      { observability: { fullDetailUntil: armed } },
+      { observability: { logToolValues: true } },
+    );
+    expect(Object.keys(next.observability as object).sort()).toEqual([
+      "fullDetailUntil",
+      "logToolValues",
+    ]);
+  });
+
+  test("a window that closed is written back as off", () => {
+    const next = mergeBehaviorSettings(
+      {
+        observability: {
+          fullDetailUntil: new Date(Date.now() - 1000).toISOString(),
+        },
+      },
+      { limits: { maxToolCalls: 7 } },
+    );
+    expect(
+      (next.observability as { fullDetailUntil: unknown }).fullDetailUntil,
+    ).toBeNull();
   });
 });

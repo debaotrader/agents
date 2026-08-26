@@ -1,8 +1,9 @@
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { isTurnInFlight } from "@/graph/inflight";
 import { parseThreadId, runAgentNudge } from "@/graph/nudge";
+import { isRepairableNudgeRefusal, nextNudgeRetry } from "@/graph/nudge-retry";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { hasLiveAppointment } from "@/modules/appointments/reminders";
@@ -19,8 +20,15 @@ import {
   classifyLastPublicMessage,
   parseChatwootMessagesPage,
 } from "@/modules/chatwoot/messages";
+import { appointmentPauseApplies } from "@/modules/followups/appointment-pause";
 import { isFollowUpLive } from "@/modules/followups/eligibility";
-import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  enqueueJob,
+  jobNotRetiredSql,
+  jobRetired,
+  jobRetiredStrict,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import {
   type FollowUpStep,
@@ -47,16 +55,6 @@ const IN_FLIGHT_BACKOFF_MS = 30_000;
 // cancelled. Coarse (1h) because the sweep already filters these out — this only catches a FOLLOWUP
 // that was in flight before the booking.
 const APPOINTMENT_BACKOFF_MS = 3_600_000;
-// NOTE: Back-off when the nudge could not run to completion without posting anything: the live-state GET
-// failed (fail-closed) or a pending human-in-the-loop interrupt deferred it. Retry the SAME step —
-// nothing was sent, so the watermark must not advance.
-const NUDGE_RETRY_BACKOFF_MS = 900_000;
-// NOTE: Cap on consecutive same-step retries (payload `nudgeRetries`, reset when the step advances).
-// A conversation whose live GET fails forever (e.g. deleted in Chatwoot) must not stay PENDING
-// indefinitely. On exhaustion the CURRENT EPISODE is abandoned by stamping lastFollowUpAt WITHOUT
-// posting — dead-lettering alone would loop, because the sweep re-enqueues any conversation with
-// no stamp; the stamp keeps it away until the customer speaks again (which starts a new episode).
-const NUDGE_RETRY_LIMIT = 8;
 const LAST_PUBLIC_LOOKBACK_PAGES = 5;
 
 function sysCtx(tenantId: bigint): TenantContext {
@@ -107,15 +105,18 @@ async function sweepHandler(
   const agents = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.agent.findMany({
       where: { enabled: true },
-      select: { settings: true },
+      select: { id: true, settings: true },
     }),
   );
+  const configs = agents.map((a) => ({
+    id: a.id,
+    cfg: readFollowUpConfig(a.settings),
+  }));
   // The sweep only ever STARTS a sequence (step 0), so its cutoff is the minimum FIRST-step delay
   // across enabled agents. Later steps are scheduled precisely by the handler, not the sweep.
-  const enabledDelays = agents
-    .map((a) => readFollowUpConfig(a.settings))
-    .filter((cfg) => cfg.enabled)
-    .map((cfg) => cfg.steps[0])
+  const enabledDelays = configs
+    .filter(({ cfg }) => cfg.enabled)
+    .map(({ cfg }) => cfg.steps[0])
     .filter((s): s is FollowUpStep => s !== undefined)
     .map((s) => stepDelayMinutes(s));
   if (enabledDelays.length === 0) {
@@ -126,6 +127,42 @@ async function sweepHandler(
   }
   const cutoffMin = Math.min(...enabledDelays);
   const cutoff = new Date(Date.now() - cutoffMin * 60_000);
+
+  // Agents the appointment fence does not apply to, asked of `appointmentPauseApplies` — the same
+  // function the handler and the console ask — about `cfg.steps[0]`, the only step this sweep ever
+  // starts a sequence with.
+  //
+  // Asked HERE, in TypeScript, and not mirrored in the query. Two JSON predicates used to live in
+  // the SQL, and three review rounds in a row found a way for them to disagree with the reader: raw
+  // index 0 is not the reader's step 0 (non-object entries are dropped BEFORE numbering), `->>`
+  // renders a JSON string and a JSON boolean identically while the reader does not, and an
+  // unbounded `jsonb_array_elements` expands whatever the opaque REST settings write happened to
+  // store, per conversation, every minute. All three are one defect: a second implementation of a
+  // reader that already exists and had already RUN, right above, to compute the cutoff. What is
+  // left in SQL is the liveness of the appointment, which is rows rather than settings.
+  //
+  // NOTE: read one tick before the query, so a settings change lands on the NEXT pass at worst
+  // (60s). Nothing is sent on this read: the handler re-checks against fresh settings before the
+  // nudge, which is where correctness lives.
+  //
+  // NOTE: `cfg.enabled` first, and it is not redundant. An agent whose follow-up is OFF can still
+  // carry a step-0 exemption from when it was on, and `appointmentPauseApplies` would answer about
+  // it — correctly, since it decides the pause and nothing else. Exempting it would lift the fence
+  // for an agent that sends nothing: the sweep's SQL never tests `followUp.enabled` (it tests
+  // `follow_up_armed_at`, which is stamped on the OFF→ON transition and never cleared going back),
+  // so those conversations would be enqueued every minute for the handler to discard on its first
+  // look, each one holding a slot of the LIMIT 500 away from an agent that would actually send.
+  const unfencedAgentIds = configs
+    .filter(
+      ({ cfg }) => cfg.enabled && !appointmentPauseApplies(cfg, cfg.steps[0]),
+    )
+    .map(({ id }) => id);
+  // NOTE: -1 stands in for the empty set. Prisma.join refuses an empty list, and an agent id is a
+  // positive bigint, so the sentinel can never match a row — `<> ALL` then holds for everyone,
+  // which is what "nobody is exempt" has to mean.
+  const unfencedIdsSql = Prisma.sql`ARRAY[${Prisma.join(
+    unfencedAgentIds.length > 0 ? unfencedAgentIds : [-1n],
+  )}]::bigint[]`;
 
   // NOTE: column-to-column comparison (lastInboundAt > lastFollowUpAt) requires raw SQL;
   // Prisma's query builder cannot express it. The filter mirrors the handler's watermark gate
@@ -166,19 +203,20 @@ async function sweepHandler(
         -- NULL = never armed → fail-safe skip.
         AND a.follow_up_armed_at IS NOT NULL
         AND c.last_inbound_at >= a.follow_up_armed_at
-        -- NOTE: Pause re-engagement while the conversation has a LIVE future appointment, unless the
-        -- agent opted out (followUp.pauseWhileAppointment = false). SQL mirror of
-        -- projectAppointmentEvents (appointments/context.ts): a non-tombstoned reminder row counts
-        -- while it is still queued (PENDING/CLAIMED) OR its startISO is still ahead — firing marks
-        -- rows DONE, so after the LAST reminder only the future-start arm keeps suppression on
-        -- (issue #39). The cast is guarded (CASE + pg_input_is_valid; deploy mandates pg17):
-        -- startISO can be all-day (YYYY-MM-DD) or model-supplied garbage, and an unguarded cast
-        -- would abort the WHOLE tenant sweep. Offset-less values are pinned to UTC exactly like
-        -- parseStartMs (all-day → UTC midnight; offset-less datetime → 'Z'), so the SQL and JS
-        -- liveness decisions agree regardless of the session/host time zones.
+        -- NOTE: Pause re-engagement while the conversation has a LIVE future appointment, unless
+        -- this agent is exempt (unfencedAgentIds above, issue #103).
+        --
+        -- SQL mirror of projectAppointmentEvents (appointments/context.ts): a non-tombstoned
+        -- reminder row counts while it is still queued (PENDING/CLAIMED) OR its startISO is still
+        -- ahead — firing marks rows DONE, so after the LAST reminder only the future-start arm
+        -- keeps suppression on (issue #39). The cast is guarded (CASE + pg_input_is_valid; deploy
+        -- mandates pg17): startISO can be all-day (YYYY-MM-DD) or model-supplied garbage, and an
+        -- unguarded cast would abort the WHOLE tenant sweep. Offset-less values are pinned to UTC
+        -- exactly like parseStartMs (all-day → UTC midnight; offset-less datetime → 'Z'), so the
+        -- SQL and JS liveness decisions agree regardless of the session/host time zones.
         -- Invalid/absent start = not-future (fail-safe: only the queued arm suppresses then).
         AND NOT (
-          coalesce(a.settings->'followUp'->>'pauseWhileAppointment', 'true') <> 'false'
+          a.id <> ALL(${unfencedIdsSql})
           AND EXISTS (
             SELECT 1
             FROM scheduler_jobs sj
@@ -235,6 +273,12 @@ async function sweepHandler(
       kind: "FOLLOWUP",
       dedupeKey: `followup:${t.thread_id}`,
       runAt: new Date(),
+      // NOTE: A CLOCK arms this, not the world: the sweep re-enqueues every eligible thread once a
+      // minute, and a thread stays eligible until its follow-up actually goes out. So a re-arm here
+      // is the same episode being pushed again, and clearing the budget would hand a follow-up that
+      // keeps failing five fresh attempts every minute forever. A follow-up that DID go out
+      // completes, which is what clears the count for the next episode.
+      rearm: "same-work",
       payload: { threadId: t.thread_id },
       base,
     });
@@ -319,6 +363,11 @@ export async function followUpHandler(
         testActivatedAt: conv.testActivatedAt,
         status: conv.status,
         assigneeType: conv.assigneeType,
+        // This path never decides WHICH bot holds the conversation from the mirror: `agentNudge`
+        // runs with `requireLiveBotOwnership`, which GETs the real conversation, reconciles the
+        // stale assignee and refuses to send before any model spend. Answering from the mirror here
+        // would drop a follow-up the probe was about to allow (issue #214).
+        mirrorHolder: "not-asked",
       })
     ) {
       return null;
@@ -342,25 +391,6 @@ export async function followUpHandler(
   });
   if (!ctx) return { outcome: "done" };
 
-  // Appointment suppression: hold the follow-up while this conversation has a LIVE appointment —
-  // queued reminder OR already-fired one with the start still ahead (issue #39). Re-check later
-  // instead of nudging OR ending the sequence, so it resumes once the appointment passes / is
-  // cancelled. Defense in depth — the inbound that booked the appointment already cancels any prior
-  // FOLLOWUP, and the sweep won't enqueue a new one meanwhile.
-  if (ctx.followUpCfg.pauseWhileAppointment) {
-    const blockedByAppointment = await hasLiveAppointment(
-      tenantId,
-      threadId,
-      base,
-    );
-    if (blockedByAppointment) {
-      return {
-        outcome: "reschedule",
-        runAt: new Date(Date.now() + APPOINTMENT_BACKOFF_MS),
-      };
-    }
-  }
-
   // Which step of the sequence this job is. The sweep enqueues step 0 (no stepIndex); each fired step
   // reschedules the SAME row with the next index. Out-of-range (config shrank) → end the sequence.
   const steps = ctx.followUpCfg.steps;
@@ -373,36 +403,29 @@ export async function followUpHandler(
   if (!step) return { outcome: "done" };
   const isLast = stepIndex === steps.length - 1;
 
-  const stampEpisode = () =>
-    runScopedOn(base, sysCtx(tenantId), (db) =>
-      db.conversation.update({
-        where: { id: ctx.conv.id },
-        data: { lastFollowUpAt: new Date() },
-      }),
+  // Appointment suppression: hold the follow-up while this conversation has a LIVE appointment —
+  // queued reminder OR already-fired one with the start still ahead (issue #39). Re-check later
+  // instead of nudging OR ending the sequence, so it resumes once the appointment passes / is
+  // cancelled. Defense in depth — the inbound that booked the appointment already cancels any prior
+  // FOLLOWUP, and the sweep won't enqueue a new one meanwhile.
+  //
+  // NOTE: BELOW the step resolution, and that order is the feature: the pair that decides is
+  // (agent, step), and the step is not known any earlier (issue #103). Moving it down costs nothing
+  // the gate used to catch — the only thing between the two positions is the out-of-range check,
+  // which ends the sequence outright, and a sequence that is over has nothing left to suppress.
+  if (appointmentPauseApplies(ctx.followUpCfg, step)) {
+    const blockedByAppointment = await hasLiveAppointment(
+      tenantId,
+      threadId,
+      base,
     );
-  const retryOrAbandon = async (reason: string): Promise<JobResult> => {
-    const priorRetries =
-      typeof job.payload.nudgeRetries === "number" &&
-      Number.isInteger(job.payload.nudgeRetries)
-        ? job.payload.nudgeRetries
-        : 0;
-    if (priorRetries + 1 >= NUDGE_RETRY_LIMIT) {
-      logger.warn(
-        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
-        stepIndex,
-        priorRetries + 1,
-        reason,
-        threadId,
-      );
-      await stampEpisode();
-      return { outcome: "done" };
+    if (blockedByAppointment) {
+      return {
+        outcome: "reschedule",
+        runAt: new Date(Date.now() + APPOINTMENT_BACKOFF_MS),
+      };
     }
-    return {
-      outcome: "reschedule",
-      runAt: new Date(Date.now() + NUDGE_RETRY_BACKOFF_MS),
-      payload: { ...job.payload, nudgeRetries: priorRetries + 1 },
-    };
-  };
+  }
 
   const { lastFollowUpAt, lastInboundAt, lastEventAt } = ctx.conv;
 
@@ -441,6 +464,58 @@ export async function followUpHandler(
     }
   }
 
+  // The tombstone question, asked in this handler and not only inside runAgentNudge. Three writes
+  // below touch the CONVERSATION directly — the never-opening schedule, the retry exhaustion, and the
+  // watermark after the nudge — and `lastFollowUpAt` is exactly the column /reset clears. A stamp
+  // landing after the command puts the sweep's anchor back on a conversation the operator was told
+  // was cleared, and the third one also arms the next step, reviving the sequence the command ended.
+  //
+  // Read immediately before each write rather than once at the top: the command arrives whenever it
+  // arrives, and the interesting moment is precisely while the nudge's model call runs. Returns
+  // whether the stamp landed, so a caller that would continue the sequence can stop instead.
+  //
+  // ONE statement, not a read then a write. Everywhere else the two marks are read to decide whether
+  // to keep going, and the gap between deciding and acting is covered by there being no I/O in it.
+  // Here the gap cannot be closed that way, because the command does two things in ORDER: it retires
+  // the job first and clears `last_follow_up_at` later, so a stamp that reads between them finds the
+  // job live, and writes after the clear. The condition therefore has to be evaluated by the same
+  // statement that writes — then the stamp lands strictly before the retirement or not at all.
+  //
+  // The condition is `jobNotRetiredSql`, the scheduler's own predicate, and not a copy of it written
+  // here: the JS reader and this one are one rule, and they are kept side by side there so a change
+  // to either is a change in front of the other. NOT-retired rather than live, so an absent row
+  // still stamps — an unknown is not a retirement.
+  const stampUnlessRetired = async (): Promise<boolean> => {
+    const stamped = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.$executeRaw(Prisma.sql`
+        UPDATE conversations
+           SET last_follow_up_at = now()
+         WHERE id = ${ctx.conv.id}
+           AND ${jobNotRetiredSql(job)}`),
+    );
+    return stamped > 0;
+  };
+
+  const retryOrAbandon = async (reason: string): Promise<JobResult> => {
+    const retry = nextNudgeRetry(job.payload);
+    if (!retry.retry) {
+      logger.warn(
+        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
+        stepIndex,
+        retry.attempt,
+        reason,
+        threadId,
+      );
+      await stampUnlessRetired();
+      return { outcome: "done" };
+    }
+    return {
+      outcome: "reschedule",
+      runAt: retry.runAt,
+      payload: { ...job.payload, nudgeRetries: retry.attempt },
+    };
+  };
+
   // Business hours: reschedule into the next open window rather than messaging out of hours (same
   // payload — the step index is preserved).
   if (ctx.hours) {
@@ -461,12 +536,7 @@ export async function followUpHandler(
         stepIndex,
         threadId,
       );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
   }
@@ -509,7 +579,7 @@ export async function followUpHandler(
       bot.chatwootAgentBotId,
     );
     if (author.kind === "other") {
-      await stampEpisode();
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
     if (author.kind === "unknown") {
@@ -572,6 +642,13 @@ export async function followUpHandler(
     // conversation was the community-reported incident this gate exists for.
     requireLiveBotOwnership: true,
     beforeDelivery,
+    // NOTE: And the live gate is not enough on its own, because it asks about OWNERSHIP and /reset can
+    // give ownership back. A follow-up already inside the model call has passed the first probe; the
+    // operator resets, which returns the conversation to the agent, and the second probe then finds
+    // it bot-owned again and posts a nudge from the episode that was just erased. The tombstone is
+    // the question the hand-back cannot answer yes to.
+    stillWanted: async ({ strict }) =>
+      !(await (strict ? jobRetiredStrict(job, base) : jobRetired(job, base))),
     base,
     deps,
   });
@@ -580,23 +657,38 @@ export async function followUpHandler(
   // the episode is moot. No watermark, no next step; the reconciled mirror keeps the sweep away.
   if (nudgeOutcome === "stale") return { outcome: "done" };
   if (nudgeOutcome === "superseded") {
-    await stampEpisode();
+    await stampUnlessRetired();
     return { outcome: "done" };
   }
-  // NOTE: Nothing was posted: live state/screening was unavailable, a pending human-in-the-loop
-  // interrupt deferred the nudge, or the model produced no valid terminal decision. Retry the SAME
-  // step instead of stamping success — bounded by NUDGE_RETRY_LIMIT, then abandon with a stamp.
-  if (
-    nudgeOutcome === "live-unavailable" ||
-    nudgeOutcome === "deferred" ||
-    nudgeOutcome === "invalid-output"
-  ) {
-    return retryOrAbandon(nudgeOutcome);
+  // NOTE: Nothing was posted, for a reason that may not hold next time (the shared predicate names the
+  // three). Retry the SAME step later instead of stamping a follow-up that never happened, but
+  // bounded (NUDGE_RETRY_LIMIT): on exhaustion, abandon the episode with a stamp so the sweep stays
+  // away until the customer speaks again. Dead-lettering alone would loop, because the sweep
+  // re-enqueues any conversation with no stamp.
+  if (isRepairableNudgeRefusal(nudgeOutcome)) {
+    const retry = nextNudgeRetry(job.payload);
+    if (!retry.retry) {
+      logger.warn(
+        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
+        stepIndex,
+        retry.attempt,
+        nudgeOutcome,
+        threadId,
+      );
+      await stampUnlessRetired();
+      return { outcome: "done" };
+    }
+    return {
+      outcome: "reschedule",
+      runAt: retry.runAt,
+      payload: { ...job.payload, nudgeRetries: retry.attempt },
+    };
   }
 
   // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
-  // cadence anchors here and the episode-interruption check works.
-  await stampEpisode();
+  // cadence anchors here and the episode-interruption check works. A retire that landed while the
+  // nudge ran ends the episode here instead — no stamp, and no next step.
+  if (!(await stampUnlessRetired())) return { outcome: "done" };
 
   // NOTE: The outside-window fallback note ENDS the sequence: with no usable template, every further step
   // would be equally undeliverable (only a customer reply reopens the 24h window, and that reply
@@ -637,6 +729,11 @@ export async function ensureTenantSweep(
     tenantId,
     kind: "FOLLOWUP_SWEEP",
     dedupeKey: "sweep",
+    // NOTE: One perpetual row per tenant: this call bootstraps or self-heals it, and every pass
+    // reschedules itself, so there is only ever one unit of work. Its budget is cleared by each
+    // completed pass (issue #287); clearing it HERE would mean a restart loop, or an operator
+    // saving an agent, resetting the count of a sweep that is genuinely broken.
+    rearm: "same-work",
     runAt: new Date(Date.now() + SWEEP_INTERVAL_MS),
     base,
   });

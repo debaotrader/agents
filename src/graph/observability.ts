@@ -93,6 +93,22 @@ function clientCache(): Map<string, Langfuse> {
   return g[CACHE_KEY].clients;
 }
 
+// Drains every cached client and drops them, so no queued trace is still owed delivery afterwards.
+// The SDK delivers on a BACKGROUND flush timer, so an event queued here is POSTed at some later
+// moment through whatever `globalThis.fetch` is installed by then — which in a test process is a
+// different file's stub, recording our telemetry as that file's traffic. That is not hypothetical:
+// it is what made `expect(posted).toEqual([])` receive three `POST /api/public/ingestion` in an
+// unrelated client test, roughly once every four CI runs. A caller that builds clients and then
+// ends (a test file, a worker shutting down) has to settle them rather than leave them to a timer.
+export async function shutdownLangfuseClients(): Promise<void> {
+  const cache = clientCache();
+  const clients = [...cache.values()];
+  cache.clear();
+  // shutdownAsync flushes what is queued AND stops the timer; settled, never rejected, because a
+  // client pointed at an unreachable Langfuse is the normal case here and must not fail the caller.
+  await Promise.allSettled(clients.map((c) => c.shutdownAsync()));
+}
+
 // djb2 over the config so a rotated secret/url yields a fresh cache entry (old client is left to
 // its flush timer and GC; not awaited). environment is NOT folded in here — it is appended to the
 // cache key separately below, since it is a closed, low-cardinality set per tenant (one per source).

@@ -32,6 +32,22 @@ import {
   SETTINGS_CREDENTIAL_PATHS,
 } from "@/modules/agents/credential-paths";
 import { clampOversizedTextInPlace } from "@/modules/agents/text-caps";
+import {
+  MAX_SCHEDULE_EXCEPTIONS,
+  MAX_SCHEDULE_WINDOWS,
+  parseExceptions,
+  parseWindows,
+  type ScheduleException,
+  type WindowSpec,
+} from "@/modules/business-hours/hours";
+import { parseDocumentStyle } from "@/modules/documents/blocks";
+import {
+  slugProblem,
+  templateMetadataProblem,
+  templateNameSchema,
+} from "@/modules/documents/templates";
+import { parseAuthoredTemplate } from "@/modules/documents/validate";
+import { disarmFullDetail } from "@/modules/flowlog/settings";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import { assertNoSecrets } from "@/modules/n8n-export/n8n";
@@ -82,6 +98,39 @@ const exportedGrantSchema = z.discriminatedUnion("source", [
     integration: z.string(),
     enabledTools: z.array(z.string()),
   }),
+  // NOTE: by SLUG, not by name and not by id. The id is local to one instance, and the slug is what
+  // the grant is about, since it IS the agent's tool name. It does not survive a rename on the
+  // destination — the slug follows the name there too — so a renamed template no longer answers to
+  // the slug the bundle asks for, and the grant lands as a `documentGrantNotFound` warning naming
+  // it. No enabledTools: a template grant exposes exactly one tool.
+  z.object({ source: z.literal("DOCUMENT"), documentTemplate: z.string() }),
+]);
+
+// A grant whose SOURCE this build does not know — one a newer release added — is dropped with a
+// warning instead of failing the whole bundle. A discriminated union refuses the entire array on one
+// unknown arm, so without this a single grant of a kind we have not heard of makes an otherwise
+// importable agent unimportable, and the operator is told nothing about which part was the problem.
+//
+// This does NOT help an OLDER instance read a bundle written here — nothing in this file can, and
+// bumping the format version would only trade a confusing refusal for a clean one while making every
+// bundle without a document grant refusable too, which is the trade `riskTier` above already
+// rejected for the same reason. What it does is stop the next arm from breaking this direction.
+//
+// Restricted to sources this build has never HEARD of. Without that restriction the fallback also
+// swallowed a malformed grant from a source we do know — `{source:"DOCUMENT"}` with no template —
+// dropping it silently and blaming a newer version for it, when the honest answer is that the
+// bundle is broken and the import should say so.
+const KNOWN_GRANT_SOURCES = new Set(
+  exportedGrantSchema.options.map((o) => o.shape.source.value as string),
+);
+const importedGrantSchema = z.union([
+  exportedGrantSchema,
+  z
+    .object({ source: z.string() })
+    .refine((g) => !KNOWN_GRANT_SOURCES.has(g.source), {
+      message: "malformed grant for a known source",
+    })
+    .transform(() => null),
 ]);
 
 // Full component definitions (opt-in via ?components=true). Each references its credential BY NAME
@@ -139,6 +188,18 @@ const exportedIntegrationSchema = z.object({
   config: z.record(z.string(), z.unknown()),
   credentialRef: z.string().nullable().optional(),
 });
+const exportedDocumentTemplateSchema = z.object({
+  name: z.string(),
+  slug: z.string(),
+  description: z.string().nullable().optional(),
+  blocks: z.array(z.unknown()),
+  fields: z.array(z.unknown()),
+  style: z.record(z.string(), z.unknown()).optional(),
+  numberPrefix: z.string().nullable().optional(),
+  // Optional so a bundle from before this field still imports; absent means enabled, which is the
+  // column default and what every such bundle described.
+  enabled: z.boolean().optional(),
+});
 // One source document of a knowledge base. Only the extracted TEXT travels (content); the destination
 // re-chunks + re-embeds. `sourceType` is a plain string (matches the DB column) so a future source kind
 // does not break import of older/newer exports.
@@ -176,9 +237,19 @@ const exportedComponentsSchema = z.object({
   httpTools: z.array(exportedHttpToolSchema),
   mcpServers: z.array(exportedMcpServerSchema),
   integrations: z.array(exportedIntegrationSchema),
+  // Optional for back-compat: an export written before document templates existed simply has none.
+  documentTemplates: z.array(exportedDocumentTemplateSchema).optional(),
   knowledgeBases: z.array(exportedKnowledgeBaseSchema),
   businessHours: z.array(exportedBusinessHoursSchema).optional(),
 });
+
+// Every component array a bundle can carry, named once. A dry run has to disclose all of them — the
+// apply creates or reuses each before it assigns the grants — and "the preview forgot the array that
+// was just added" is a hole nobody sees, because a preview that omits something looks like a preview
+// of a smaller change. Read from the schema so the list cannot drift from the bundle.
+export const EXPORTED_COMPONENT_KEYS = Object.keys(
+  exportedComponentsSchema.shape,
+) as (keyof z.infer<typeof exportedComponentsSchema>)[];
 
 export const agentExportSchema = z.object({
   version: z.literal(AGENT_EXPORT_VERSION),
@@ -200,7 +271,9 @@ export const agentExportSchema = z.object({
     transferWithSummary: z.boolean(),
     businessHours: z.string().nullable(),
     followUpHours: z.string().nullable(),
-    tools: z.array(exportedGrantSchema),
+    // Tolerant on the way IN: a grant of a source this build does not know is dropped rather than
+    // taking the bundle with it (see importedGrantSchema). Nulls are filtered where they are read.
+    tools: z.array(importedGrantSchema),
     // Metadata for unambiguous import: every credential name referenced in modelConfig/settings
     // (and in the component definitions) carries its kind here, so import resolves by (name, kind)
     // — never by bare name.
@@ -231,6 +304,7 @@ export type ImportWarningTarget =
   | { kind: "tool"; name: string }
   | { kind: "mcp"; name: string }
   | { kind: "integration"; catalogType: string; name: string }
+  | { kind: "document"; name: string }
   | { kind: "knowledge"; name: string };
 
 export interface ImportWarning {
@@ -350,6 +424,25 @@ function blankDocumentContent(data: AgentExport): AgentExport {
       for (const d of kb.documents) d.content = "";
     }
   }
+  // A document template's blocks and style are TENANT PROSE, exactly like a knowledge-base
+  // document's text, and the scanner cannot tell an operator writing "api_key=abcdef" in a quote's
+  // terms from a leaked credential. Left in, that quote makes its own agent unexportable — the
+  // scanner refusing the export it exists to protect. Blanked in the CLONE only; what is returned
+  // still carries the prose.
+  for (const tpl of clone.components?.documentTemplates ?? []) {
+    tpl.blocks = [];
+    tpl.style = {};
+    tpl.description = null;
+    // A field's LABEL and DESCRIPTION are prose too — the description is what the operator writes to
+    // tell the model what to put in the field ("o CNPJ do cliente, ex: 12.345.678/0001-90"), which
+    // is exactly the shape a secret regex reads as a credential. The `name` and `type` stay
+    // scanned: they are the tool contract, identifiers, and no place to hide anything.
+    tpl.fields = (tpl.fields as Record<string, unknown>[]).map((f) => ({
+      ...f,
+      label: "",
+      description: null,
+    }));
+  }
   return clone;
 }
 
@@ -404,9 +497,11 @@ export async function exportAgent(
         toolDefinitionId: true,
         mcpServerConnectionId: true,
         integrationInstanceId: true,
+        documentTemplateId: true,
         toolDefinition: { select: { name: true } },
         mcpServerConnection: { select: { name: true } },
         integrationInstance: { select: { catalogType: true, name: true } },
+        documentTemplate: { select: { slug: true } },
       },
     });
 
@@ -473,6 +568,14 @@ export async function exportAgent(
             });
           }
           break;
+        case "DOCUMENT":
+          if (g.documentTemplate) {
+            tools.push({
+              source: "DOCUMENT",
+              documentTemplate: g.documentTemplate.slug,
+            });
+          }
+          break;
       }
     }
 
@@ -512,6 +615,19 @@ export async function exportAgent(
       const mcpRows = mcpIds.length
         ? await db.mcpServerConnection.findMany({
             where: { id: { in: mcpIds } },
+          })
+        : [];
+      const documentTemplateIds = [
+        ...new Set(
+          grants
+            .filter((g) => g.source === "DOCUMENT")
+            .map((g) => g.documentTemplateId)
+            .filter((x): x is bigint => x != null),
+        ),
+      ];
+      const documentTemplateRows = documentTemplateIds.length
+        ? await db.documentTemplate.findMany({
+            where: { id: { in: documentTemplateIds } },
           })
         : [];
       const integrationRows = integrationIds.length
@@ -620,6 +736,21 @@ export async function exportAgent(
           ),
           credentialRef: r.credentialRef,
         })),
+        // No credential of any kind travels here, which is what makes a document template the
+        // simplest component: blocks, fields and style are plain JSON the destination re-validates.
+        documentTemplates: documentTemplateRows.map((r) => ({
+          name: r.name,
+          slug: r.slug,
+          description: r.description,
+          blocks: (r.blocks ?? []) as unknown[],
+          fields: (r.fields ?? []) as unknown[],
+          style: (r.style ?? {}) as Record<string, unknown>,
+          numberPrefix: r.numberPrefix,
+          // A template the operator turned OFF is off for a reason. Omitted, the import recreates it
+          // with the column default — enabled — and the destination agent can issue a document the
+          // source instance had deliberately made unavailable.
+          enabled: r.enabled,
+        })),
         knowledgeBases: kbRows.map((r) => ({
           name: r.name,
           description: r.description,
@@ -692,6 +823,10 @@ export async function exportAgent(
             credentialRef: refToName(i.credentialRef ?? null),
           })),
           knowledgeBases: componentsRaw.knowledgeBases,
+          // Carried through explicitly, like every other list here: this object is REBUILT rather
+          // than spread, so a component the rebuild forgets is exported as a grant pointing at
+          // nothing and the import can only drop it with a warning.
+          documentTemplates: componentsRaw.documentTemplates,
           businessHours: componentsRaw.businessHours,
         }
       : undefined;
@@ -933,8 +1068,9 @@ export async function importAgent(
         name: exp.name,
         systemPrompt: exp.systemPrompt,
         modelConfig: modelConfig as Prisma.InputJsonValue,
-        settings: (normalizeSettingsForStorage(settings) ??
-          settings) as Prisma.InputJsonValue,
+        settings: disarmFullDetail(
+          normalizeSettingsForStorage(settings) ?? settings,
+        ) as Prisma.InputJsonValue,
         transferWithSummary: exp.transferWithSummary,
         businessHoursId,
         followUpHoursId,
@@ -961,11 +1097,24 @@ export async function importAgent(
       );
     }
 
+    // Grants of a source this build does not know arrive as null (see importedGrantSchema) and are
+    // dropped here, with a warning naming how many — the bundle imports, and the operator learns
+    // that something in it did not.
+    const knownGrants = exp.tools.filter(
+      (g): g is Exclude<typeof g, null> => g !== null,
+    );
+    const unknownGrants = exp.tools.length - knownGrants.length;
+    if (unknownGrants > 0) {
+      warnings.push({
+        code: "unknownGrantSourceSkipped",
+        params: { n: unknownGrants },
+      });
+    }
     const grantRows = await buildGrantRows(
       db,
       tenantId,
       created.id,
-      exp.tools,
+      knownGrants,
       warnings,
     );
     if (grantRows.length > 0) {
@@ -1032,6 +1181,108 @@ async function resolveByName(
 // Recreates the bundled business-hours schedules missing on the target tenant. A same-name schedule is
 // reused (warned, never overwritten) — its windows may differ from the source, so the operator should
 // review it. Runs before the agent's hours/follow-up names are resolved.
+type EntryFate = "dropped" | "altered" | "intact";
+
+// How many bundled entries do not reach the column as written. Three things it has to get right, and
+// each one was a wrong answer first:
+//
+//   - a subtraction of ARRAY LENGTHS misses the entry that survives and still loses something.
+//     `parseExceptions` prunes the RANGES inside an exception it keeps, so a half-day written
+//     backwards (14:00–09:00) loses its only range and lands as `ranges: []`, which means CLOSED ALL
+//     DAY: a different schedule than the bundle asked for, arriving with nothing said;
+//   - the verdict per entry is taken by running the REAL parser over that entry alone, never by a
+//     second copy of its rules, so this cannot drift from what actually gets stored;
+//   - the cap counts SURVIVORS, not positions. A malformed entry does not consume a slot, so testing
+//     the first `cap` raw items over-reports by one for every one of them (measured: one bad window
+//     followed by 200 good ones stores all 200 and would have been reported as two lost). The walk
+//     below therefore tracks how many have been stored so far, which is exactly what decides whether
+//     the next survivor lands or is truncated away.
+function countNotStoredAsWritten(
+  raw: unknown[],
+  cap: number,
+  fateOf: (item: unknown) => EntryFate,
+): number {
+  let stored = 0;
+  let lost = 0;
+  for (const item of raw) {
+    const fate = fateOf(item);
+    if (fate === "dropped" || stored >= cap) {
+      lost++;
+      continue;
+    }
+    stored++;
+    if (fate === "altered") lost++;
+  }
+  return lost;
+}
+
+// The ranges a bundled exception CLAIMS, before any of them is judged. Read off the raw entry, since
+// the parsed one only ever reports the survivors.
+function rangeCount(item: unknown): number {
+  const ranges = (item as { ranges?: unknown })?.ranges;
+  return Array.isArray(ranges) ? ranges.length : 0;
+}
+
+// The half of a bundled schedule this instance can actually read, with everything it dropped named
+// in a warning. Both JSON columns arrive as `z.array(z.unknown())` and this path writes to the table
+// directly rather than through `createBusinessHours`, so the import is the one writer that never
+// answers to `businessHoursCreateSchema`: nothing between a hand-authored file and the column asks
+// whether an entry is readable at all.
+//
+// Storing what the READER surfaces settles that, and the reader is the right authority precisely
+// because it is entry-by-entry and bounded. One unreadable window then costs that window instead of
+// the whole grid, which matters here more than the tidiness suggests: an empty grid is not "closed",
+// it is ALWAYS OPEN, so the as-a-unit reading turned a typo in a bundle into an agent that answers
+// around the clock on the destination tenant (issue #346).
+//
+// The two rejected alternatives fail in that same direction. Refusing the whole BUNDLE over one
+// field is the wrong trade for a bulk restore. SKIPPING just this schedule is worse than it looks:
+// the agent then resolves no business hours at all, which is the very always-open state being fixed.
+// So the schedule always lands, carrying what could be read, and the warning is what keeps the drop
+// from being one more silence.
+function readableSchedule(
+  h: ExportedBusinessHours,
+  warnings: ImportWarning[],
+): { windows: WindowSpec[]; exceptions: ScheduleException[] } {
+  const windows = parseWindows(h.windows ?? []);
+  // `parseExceptions` deliberately does NOT cap (dropping a closure widens availability, so the
+  // reader must never do it to a row already written). The bound is this writer's job, and here it
+  // is safe for the reason it is not there: it applies to a row being created, and it is warned.
+  const exceptions = parseExceptions(h.exceptions ?? []).slice(
+    0,
+    MAX_SCHEDULE_EXCEPTIONS,
+  );
+  const dropped: [string, number][] = [
+    [
+      "hoursWindowsDropped",
+      countNotStoredAsWritten(h.windows ?? [], MAX_SCHEDULE_WINDOWS, (item) =>
+        parseWindows([item]).length === 1 ? "intact" : "dropped",
+      ),
+    ],
+    [
+      "hoursExceptionsDropped",
+      countNotStoredAsWritten(
+        h.exceptions ?? [],
+        MAX_SCHEDULE_EXCEPTIONS,
+        (item) => {
+          const [one] = parseExceptions([item]);
+          if (one === undefined) return "dropped";
+          return one.ranges.length === rangeCount(item) ? "intact" : "altered";
+        },
+      ),
+    ],
+  ];
+  for (const [code, count] of dropped) {
+    if (count <= 0) continue;
+    warnings.push({
+      code,
+      params: { name: h.name, count },
+      target: { kind: "businessHours", name: h.name },
+    });
+  }
+  return { windows, exceptions };
+}
+
 async function createMissingBusinessHours(
   db: ScopedDb,
   tenantId: bigint,
@@ -1051,22 +1302,24 @@ async function createMissingBusinessHours(
       });
       continue;
     }
+    const { windows, exceptions } = readableSchedule(h, warnings);
     await db.businessHours.create({
       data: {
         tenantId,
         name: h.name,
         ...(h.timezone ? { timezone: h.timezone } : {}),
         ...(h.windows != null
-          ? { windows: h.windows as Prisma.InputJsonValue }
+          ? { windows: windows as Prisma.InputJsonValue }
           : {}),
         ...(h.exceptions != null
-          ? { exceptions: h.exceptions as Prisma.InputJsonValue }
+          ? { exceptions: exceptions as Prisma.InputJsonValue }
           : {}),
         ...(h.source ? { source: h.source } : {}),
       },
     });
-    // Creating a fresh schedule is silent: a brand-new bundled schedule is correct by construction.
-    // Only a same-name REUSE warns (above), so the operator verifies it matches the source.
+    // Creating a fresh schedule is silent when it arrived intact: a brand-new bundled schedule is
+    // correct by construction. Only a same-name REUSE warns (above), and a DROP (readableSchedule),
+    // which the operator has no other way to notice.
   }
 }
 
@@ -1107,13 +1360,6 @@ async function createMissingComponents(
     // for a body with no recognized mode, and would switch a `{mode:"raw", …, extra}` tool to the
     // fields assembly — changing what it sends (issue #150).
     const badBody = unsupportedBodyShape(tdef.body);
-    if (badBody) {
-      warnings.push({
-        code: "httpToolBodyIgnored",
-        params: { name: tdef.name },
-        target: { kind: "tool", name: tdef.name },
-      });
-    }
     const { shapes } = normalizeToolShapes({
       urlTemplate: tdef.urlTemplate,
       query: tdef.query ?? {},
@@ -1121,30 +1367,56 @@ async function createMissingComponents(
       body: badBody ? canonicalBodyShape(tdef.body) : tdef.body,
       inputSchema: tdef.inputSchema,
     });
-    await db.toolDefinition.create({
-      data: {
-        tenantId,
-        name: tdef.name,
-        // label is required now; legacy exports without one fall back to the identifier.
-        label: tdef.label ?? tdef.name,
-        description: tdef.description ?? null,
-        method: tdef.method,
-        urlTemplate: (shapes.urlTemplate ?? tdef.urlTemplate) as string,
-        allowedHosts: tdef.allowedHosts,
-        headers: shapes.headers as Prisma.InputJsonValue,
-        inputSchema: shapes.inputSchema as Prisma.InputJsonValue,
-        outputSchema: tdef.outputSchema as Prisma.InputJsonValue,
-        query: shapes.query as Prisma.InputJsonValue,
-        body: shapes.body as Prisma.InputJsonValue,
-        // Normalized like the shapes above, and for the same reason: the import writes straight to
-        // the DB, so a hand-edited bundle would otherwise store a list the service would refuse.
-        expectedStatuses: normalizeExpectedStatuses(tdef.expectedStatuses),
-        ackEnabled: tdef.ackEnabled,
-        ackMessage: tdef.ackMessage ?? null,
-        credentialRef: resolveCredName(tdef.credentialRef),
-        enabled: true,
-      },
+    // `createMany({ skipDuplicates })` rather than `create`, for the reason spelled out on the
+    // document-template loop below: the pre-check above can answer "free" and a concurrent writer
+    // commit before this insert, and a P2002 here does not cost one tool: the whole import runs
+    // inside ONE `runScopedOn` transaction, so it aborts that transaction and every statement after
+    // it fails with "current transaction is aborted" (issue #221).
+    const { count } = await db.toolDefinition.createMany({
+      data: [
+        {
+          tenantId,
+          name: tdef.name,
+          // label is required now; legacy exports without one fall back to the identifier.
+          label: tdef.label ?? tdef.name,
+          description: tdef.description ?? null,
+          method: tdef.method,
+          urlTemplate: (shapes.urlTemplate ?? tdef.urlTemplate) as string,
+          allowedHosts: tdef.allowedHosts,
+          headers: shapes.headers as Prisma.InputJsonValue,
+          inputSchema: shapes.inputSchema as Prisma.InputJsonValue,
+          outputSchema: tdef.outputSchema as Prisma.InputJsonValue,
+          query: shapes.query as Prisma.InputJsonValue,
+          body: shapes.body as Prisma.InputJsonValue,
+          // Normalized like the shapes above, and for the same reason: the import writes straight to
+          // the DB, so a hand-edited bundle would otherwise store a list the service would refuse.
+          expectedStatuses: normalizeExpectedStatuses(tdef.expectedStatuses),
+          ackEnabled: tdef.ackEnabled,
+          ackMessage: tdef.ackMessage ?? null,
+          credentialRef: resolveCredName(tdef.credentialRef),
+          enabled: true,
+        },
+      ],
+      skipDuplicates: true,
     });
+    if (count === 0) {
+      // Lost the race. The name is taken now, which is exactly the reuse the pre-check reports.
+      warnings.push({
+        code: "httpToolReused",
+        params: { name: tdef.name },
+        target: { kind: "tool", name: tdef.name },
+      });
+      continue;
+    }
+    // Both warnings below describe the row that was just written, so they wait for the insert to
+    // report one: the reuse path above says nothing about a body or a credential it did not store.
+    if (badBody) {
+      warnings.push({
+        code: "httpToolBodyIgnored",
+        params: { name: tdef.name },
+        target: { kind: "tool", name: tdef.name },
+      });
+    }
     if (tdef.credentialRef && !resolveCredName(tdef.credentialRef)) {
       warnings.push({
         code: "httpToolCredNotFound",
@@ -1181,17 +1453,30 @@ async function createMissingComponents(
         continue;
       }
     }
-    await db.mcpServerConnection.create({
-      data: {
-        tenantId,
-        name: m.name,
-        transport: m.transport,
-        url: m.url ?? null,
-        command: m.command ?? null,
-        credentialRef: resolveCredName(m.credentialRef),
-        enabled: true,
-      },
+    // `createMany({ skipDuplicates })` for the same reason as the loop above: a lost race on
+    // `@@unique([tenantId, name])` would abort the enclosing transaction and take the whole import
+    // with it (issue #221).
+    const { count } = await db.mcpServerConnection.createMany({
+      data: [
+        {
+          tenantId,
+          name: m.name,
+          transport: m.transport,
+          url: m.url ?? null,
+          command: m.command ?? null,
+          credentialRef: resolveCredName(m.credentialRef),
+          enabled: true,
+        },
+      ],
+      skipDuplicates: true,
     });
+    if (count === 0) {
+      warnings.push({
+        code: "mcpReused",
+        params: { name: m.name },
+        target: { kind: "mcp", name: m.name },
+      });
+    }
   }
 
   for (const i of components.integrations) {
@@ -1222,26 +1507,171 @@ async function createMissingComponents(
     const { hash } = generateRouteToken();
     // Resolve a business-hours reference carried by NAME in the config back to the local id (Google
     // Calendar's businessHoursId — the bundled schedule was recreated by createMissingBusinessHours).
+    //
+    // Collected aside rather than pushed straight through: what it reports is a reference inside the
+    // config THIS iteration built, and that config is discarded if the insert below turns out to be
+    // a reuse. The pre-check path never emitted it (it `continue`s first), and the race path is the
+    // same outcome reached later.
+    const configWarnings: ImportWarning[] = [];
     const config = await remapConfigBusinessHoursNameToId(
       db,
       i.config as Record<string, unknown>,
-      warnings,
+      configWarnings,
     );
-    await db.integrationInstance.create({
-      data: {
-        tenantId,
-        catalogType: i.catalogType,
-        name: i.name,
-        config: config as Prisma.InputJsonValue,
-        credentialRef: resolveCredName(i.credentialRef),
-        inboundAuthStrategy: "NONE",
-        inboundSecretRef: null,
-        routeTokenHash: hash,
-        enabled: true,
-      },
+    // `createMany({ skipDuplicates })` for the same reason as the loops above: a lost race on
+    // `@@unique([tenantId, catalogType, name])` would abort the enclosing transaction and take the
+    // whole import with it (issue #221). `routeTokenHash` is unique too and also covered by the
+    // ON CONFLICT, but it is 32 fresh random bytes hashed, so a skip here is the name, in practice.
+    const { count } = await db.integrationInstance.createMany({
+      data: [
+        {
+          tenantId,
+          catalogType: i.catalogType,
+          name: i.name,
+          config: config as Prisma.InputJsonValue,
+          credentialRef: resolveCredName(i.credentialRef),
+          inboundAuthStrategy: "NONE",
+          inboundSecretRef: null,
+          routeTokenHash: hash,
+          enabled: true,
+        },
+      ],
+      skipDuplicates: true,
     });
+    if (count === 0) {
+      warnings.push({
+        code: "integrationReused",
+        params: { type: i.catalogType, name: i.name },
+        target: {
+          kind: "integration",
+          catalogType: i.catalogType,
+          name: i.name,
+        },
+      });
+      continue;
+    }
+    warnings.push(...configWarnings);
     // Created integrations are silent (only reused ones warn). The fresh inbound token is re-readable
     // any time on the integration page; for a clone the operator wires the external webhook from scratch.
+  }
+
+  for (const tpl of components.documentTemplates ?? []) {
+    const existing = await db.documentTemplate.findFirst({
+      where: { slug: tpl.slug },
+      select: { id: true },
+    });
+    if (existing) {
+      warnings.push({
+        code: "documentTemplateReused",
+        params: { name: tpl.name },
+        target: { kind: "document", name: tpl.slug },
+      });
+      continue;
+    }
+    // Re-validated on the way IN, never trusted as exported: a template written by a newer build can
+    // carry a block this one does not know how to render, and a warning that names the reason is a
+    // better import than a document that renders wrong in front of a customer.
+    //
+    // The SLUG goes through the same gate as a hand-written one. A bundle is user-supplied, and the
+    // slug becomes a tool name: one reading `image` produces `send_image`, which the assembly then
+    // drops as a duplicate of the built-in — the operator would see a granted template whose tool
+    // never appears, with nothing anywhere saying why.
+    // A bundle is hand-editable, and this path writes to the table directly rather than through
+    // createDocumentTemplate — so every rule that write applies has to be applied here too. The
+    // description is the one that bites: it is appended verbatim to the agent's tool description on
+    // every turn, and an oversized one arriving in a bundle would do that on the destination.
+    const metaFault =
+      templateMetadataProblem({
+        name: tpl.name,
+        description: tpl.description ?? null,
+        numberPrefix: tpl.numberPrefix ?? null,
+      }) ?? (slugProblem(tpl.slug) ? `slug: ${slugProblem(tpl.slug)}.` : null);
+    const content = metaFault
+      ? ({ ok: false, reason: metaFault } as const)
+      : parseAuthoredTemplate(tpl.blocks, tpl.fields, tpl.style);
+    if (!content.ok) {
+      warnings.push({
+        code: "documentTemplateInvalid",
+        params: { name: tpl.name, reason: content.reason },
+      });
+      continue;
+    }
+    // The NAME is unique per tenant too, and separately from the slug — so a bundle can arrive with a
+    // free slug and a name this account already uses. Not reused like a slug match: the grant below
+    // resolves by SLUG, so binding it to the template that holds the name would hand the agent a
+    // tool with a different name than the bundle asked for. Skipped and said out loud instead, which
+    // leaves the operator one rename away on either side.
+    //
+    // Asked AFTER the validity gate, and the order is the message: a bundle carrying a template that
+    // is both unreadable and named like an existing one is more usefully told about the first.
+    // not-caller-input: a name read off the template being imported, not a value from this request
+    const approvedName = templateNameSchema.parse(tpl.name);
+    const nameHolder = await db.documentTemplate.findFirst({
+      where: { name: approvedName },
+      select: { slug: true },
+    });
+    if (nameHolder) {
+      warnings.push({
+        code: "documentTemplateNameTaken",
+        params: { name: approvedName, existing: nameHolder.slug },
+        target: { kind: "document", name: tpl.slug },
+      });
+      continue;
+    }
+    // `createMany({ skipDuplicates })` rather than `create`, and the enclosing transaction is the
+    // whole reason. Both pre-checks above can answer "free" and a writer commit before this insert
+    // — a second import, or someone saving a template in the console. A P2002 here does not cost one
+    // template: `importAgent` runs the ENTIRE import inside one `runScopedOn` transaction, so it
+    // aborts that transaction, every statement after it fails with "current transaction is aborted",
+    // and the operator loses the agent, the tools and the knowledge bases to a race over a name.
+    //
+    // A `catch` around the insert is the trap, not the remedy: by the time it runs the transaction
+    // is already dead, so it swallows the one legible error and replaces it with a confusing one.
+    // Only NOT RAISING works, and `ON CONFLICT DO NOTHING` covers BOTH unique indexes on this table,
+    // which is what the two pre-checks were separately trying to do.
+    const { count } = await db.documentTemplate.createMany({
+      data: [
+        {
+          tenantId,
+          // The value the gate APPROVED, not the one it was handed: `templateNameSchema` trims
+          // before it measures, so a name padded with whitespace passes a bound the raw string
+          // fails. The name becomes the tool's title, carried by every granted agent on every turn.
+          name: approvedName,
+          slug: tpl.slug,
+          description: tpl.description ?? null,
+          blocks: content.content.blocks as unknown as Prisma.InputJsonValue,
+          fields: content.content.fields as unknown as Prisma.InputJsonValue,
+          style: parseDocumentStyle(
+            tpl.style,
+          ) as unknown as Prisma.InputJsonValue,
+          numberPrefix: tpl.numberPrefix ?? null,
+          enabled: tpl.enabled ?? true,
+        },
+      ],
+      skipDuplicates: true,
+    });
+    if (count === 0) {
+      // Lost the race. WHICH warning is right depends on which index refused, so it is re-asked
+      // rather than guessed — the row is committed by now, and each statement in a READ COMMITTED
+      // transaction takes a fresh snapshot, so this read sees it.
+      const holder = await db.documentTemplate.findFirst({
+        where: { name: approvedName },
+        select: { slug: true },
+      });
+      warnings.push(
+        holder
+          ? {
+              code: "documentTemplateNameTaken",
+              params: { name: approvedName, existing: holder.slug },
+              target: { kind: "document", name: tpl.slug },
+            }
+          : {
+              code: "documentTemplateReused",
+              params: { name: tpl.name },
+              target: { kind: "document", name: tpl.slug },
+            },
+      );
+    }
   }
 
   for (const kb of components.knowledgeBases) {
@@ -1384,6 +1814,29 @@ async function buildGrantRows(
           source: "MCP",
           mcpServerConnectionId: conn.id,
           enabledTools: g.enabledTools,
+          knowledgeBaseIds: [],
+        });
+        break;
+      }
+      case "DOCUMENT": {
+        const tpl = await db.documentTemplate.findFirst({
+          where: { slug: g.documentTemplate },
+          select: { id: true },
+        });
+        if (!tpl) {
+          warnings.push({
+            code: "documentGrantNotFound",
+            params: { name: g.documentTemplate },
+            target: { kind: "document", name: g.documentTemplate },
+          });
+          break;
+        }
+        rows.push({
+          tenantId,
+          agentId,
+          source: "DOCUMENT",
+          documentTemplateId: tpl.id,
+          enabledTools: [],
           knowledgeBaseIds: [],
         });
         break;

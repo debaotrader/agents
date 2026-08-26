@@ -1,11 +1,21 @@
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import logger from "@/api/lib/logger";
-import { failableTool, toolFailure } from "@/graph/tools/failure";
+import { failableTool, ToolFailure, toolFailure } from "@/graph/tools/failure";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { xmlAttr } from "@/lib/xml";
 import { readAppointmentReminderConfig } from "@/modules/appointments/settings";
-import { type CalendarSource, computeAggregatedSlots } from "./calendar-slots";
+import type { Schedule } from "@/modules/business-hours/hours";
+import {
+  bookingWindow,
+  type CalendarSource,
+  computeAggregatedSlots,
+  judgeBooking,
+  type Slot,
+  subtractWindow,
+  zonedMidnightMs,
+  zonedWallClock,
+} from "./calendar-slots";
 import {
   type IntegrationSelection,
   registerToolpack,
@@ -179,6 +189,21 @@ function calendarArgSchema(
   return pinnedCalendarId(allowed) ? schema.omit({ calendarId: true }) : schema;
 }
 
+// The appointment length as the MODEL sees it, the same shape calendarArgSchema gives calendarId.
+// Pinned ⇒ slotDurationMinutes is REMOVED: the console's "Let the AI choose" is what delegates the
+// length, so a fixed one is a business rule the model must not restate per call — a 1h school visit
+// was offered at 14:15 because the arg was still there to send. Zod strips a residual key from an
+// older turn before the body runs, so the pinned length is used either way. Not pinned ⇒ the arg
+// stays and the model chooses (a clinic whose appointments genuinely vary).
+function slotDurationArgSchema(
+  schema: z.ZodObject<z.ZodRawShape>,
+  config: Record<string, unknown>,
+): z.ZodObject<z.ZodRawShape> {
+  return configuredSlotDuration(config) === null
+    ? schema
+    : schema.omit({ slotDurationMinutes: true });
+}
+
 // The configured appointment length as an XML element for calendar_check_availability: preset="true"
 // with the pinned minutes when the operator fixed a duration, otherwise preset="false" (the model
 // chooses per request via the slotDurationMinutes arg). Always non-empty.
@@ -322,12 +347,14 @@ function resolveSlotDuration(
   );
 }
 
-function resolveSlotGranularity(
-  config: Record<string, unknown>,
-  override?: number,
-): number {
+// The spacing between candidate start times is the OPERATOR's, always: it takes no argument, because
+// unlike the duration there is no "let the AI choose" for it in the console — a config without the key
+// means the operator never made the choice, not that they delegated it. A grid the model redefines per
+// call offers a start time the business does not sell (a school running 1h visits on the half hour had
+// 14:15 offered, and honoured, because the model sent granularityMinutes: 15).
+function resolveSlotGranularity(config: Record<string, unknown>): number {
   return clampMinutes(
-    override ?? config.slotGranularityMinutes,
+    config.slotGranularityMinutes,
     MIN_GRAIN_MINUTES,
     MAX_GRANULARITY_MINUTES,
     DEFAULT_GRANULARITY_MINUTES,
@@ -364,63 +391,31 @@ function eventStamp(ev: Record<string, unknown>): string | null {
   return typeof v === "string" ? v : null;
 }
 
-// A Calendar start/end: a bare date (YYYY-MM-DD) is an all-day event; anything else is treated as a
-// timed RFC3339 `dateTime` (carrying the config/default timeZone).
+// A Calendar start/end, always a timed RFC3339 `dateTime` carrying the config/default timeZone.
+// All-day has no shape here since #345: an appointment is judged against the bookable slots of a
+// day, a whole day is never one of them, and the write tools refuse a bare date before reaching this.
 function toEventTime(value: string, timeZone: string): Record<string, string> {
-  const v = value.trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return { date: v };
-  return { dateTime: v, timeZone };
+  return { dateTime: value.trim(), timeZone };
 }
 
 // PATCH merges what we send, so a patch carrying only `dateTime` leaves the event's existing `date`
-// in place — and Google rejects an event holding both (HTTP 400), which makes every all-day ⇄ timed
-// conversion fail. Sending the opposite field as null clears it, so the patch replaces the time
-// representation instead of mixing the two.
+// in place — and Google rejects an event holding both (HTTP 400). An all-day event created before
+// #345 can still be MOVED onto a bookable slot, so the patch has to clear the `date` it replaces.
 function toEventTimePatch(
   value: string,
   timeZone: string,
 ): Record<string, string | null> {
-  const t = toEventTime(value, timeZone);
-  return "date" in t ? { ...t, dateTime: null } : { ...t, date: null };
+  return { ...toEventTime(value, timeZone), date: null };
 }
 
-// The timezone's UTC offset (ms) at an instant, via Intl (Temporal is unavailable in Bun).
-function tzOffsetMs(at: number, tz: string): number {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).formatToParts(new Date(at));
-  const get = (type: string) =>
-    Number(parts.find((p) => p.type === type)?.value ?? "0");
-  const asUtc = Date.UTC(
-    get("year"),
-    get("month") - 1,
-    get("day"),
-    get("hour") % 24,
-    get("minute"),
-    get("second"),
-  );
-  return asUtc - at;
-}
-
-// The UTC instant of local midnight for a YYYY-MM-DD in an IANA timezone (DST-correct: one
-// refinement pass covers an offset shift between the UTC guess and the target instant).
-function zonedMidnightMs(date: string, tz: string): number {
-  const utcGuess = Date.parse(`${date}T00:00:00Z`);
-  const first = utcGuess - tzOffsetMs(utcGuess, tz);
-  return utcGuess - tzOffsetMs(first, tz);
-}
-
-// A blocking-calendar event as a busy window. Timed events parse as-is; an all-day `date` widens to
-// local midnight in the integration timezone (Google's all-day end.date is already exclusive).
-// Unparseable shapes → null (skipped defensively).
-function blockingBusyWindow(
+// The span an event OCCUPIES. Timed events parse as-is; an all-day `date` widens to local midnight
+// in the integration timezone (Google's all-day end.date is already exclusive). Unparseable shapes
+// → null (skipped defensively).
+//
+// Two callers, and the all-day half is load-bearing for both: a holiday is the all-day shape, and
+// so is a legacy appointment being converted to a timed slot, whose own day-long busy window has to
+// come out of its way or every same-day conversion collides with itself.
+function eventBusyWindow(
   ev: Record<string, unknown>,
   timeZone: string,
 ): { start: string; end: string } | null {
@@ -581,15 +576,7 @@ const CHECK_AVAILABILITY_SCHEMA = z.object({
     .positive()
     .optional()
     .describe(
-      "Appointment length in minutes. Optional; defaults to the integration's setting (e.g. 30 or 60).",
-    ),
-  granularityMinutes: z
-    .number()
-    .int()
-    .positive()
-    .optional()
-    .describe(
-      "Spacing between candidate start times, in minutes. Optional; defaults to the integration's setting (e.g. 15 ⇒ 09:00 and 09:15 are both offered).",
+      "Appointment length in minutes. Pick it per request (e.g. 30 for a standard appointment, 60 for a longer one).",
     ),
   calendarId: z.string().optional().describe(AVAILABILITY_CALENDAR_ID_DESC),
 });
@@ -599,7 +586,9 @@ const CREATE_EVENT_SCHEMA = z.object({
   start: z
     .string()
     .min(1)
-    .describe("Start, ISO 8601 datetime (timed) or YYYY-MM-DD (all-day)."),
+    .describe(
+      "Start, ISO 8601 datetime with an offset (e.g. 2026-06-20T14:00:00-03:00). A bare date is refused: an appointment occupies a slot, not a whole day.",
+    ),
   end: z.string().min(1).describe("End, same format as start."),
   description: z.string().max(2000).optional().describe("Event details."),
   calendarId: z.string().optional().describe(CALENDAR_ID_DESC),
@@ -608,8 +597,8 @@ const CREATE_EVENT_SCHEMA = z.object({
 const UPDATE_EVENT_SCHEMA = z.object({
   eventId: z.string().min(1).describe("The event id to update."),
   summary: z.string().min(1).optional().describe("New title."),
-  start: z.string().optional().describe("New start (ISO 8601 or date)."),
-  end: z.string().optional().describe("New end (ISO 8601 or date)."),
+  start: z.string().optional().describe("New start, ISO 8601 with an offset."),
+  end: z.string().optional().describe("New end, same format as start."),
   description: z.string().max(2000).optional().describe("New details."),
   calendarId: z.string().optional().describe(CALENDAR_ID_DESC),
 });
@@ -720,6 +709,242 @@ function buildListEventsTool(
   );
 }
 
+// A busy interval, as both the freeBusy answer and the blocking-calendar reader express it.
+type BusyWindow = { start: string; end: string };
+
+// The availability read, shared by the tool that ANSWERS "when can I come?" and the tools that WRITE
+// the answer down. Extracted for issue #345: the write path has to judge a requested time against
+// the same busy windows the availability path uses, and a second copy of this reader is how the two
+// would start disagreeing about what "busy" means.
+type BusySources =
+  | { ok: true; sources: CalendarSource[]; unreadable: string[] }
+  | { ok: false; refusal: string | ToolFailure };
+
+async function readBusySources(
+  calendarIds: string[],
+  labels: Record<string, string>,
+  timeMin: string,
+  timeMax: string,
+  timeZone: string,
+  token: string,
+  ctx: ToolpackCtx,
+): Promise<BusySources> {
+  // NOTE: freeBusy takes N calendars per request and keys the answer by id, so the whole clinic
+  // costs at most five requests (see FREEBUSY_BATCH_SIZE and MAX_AGGREGATE_CALENDARS), not one
+  // per professional the way the model had to do it before.
+  const batches: string[][] = [];
+  for (let i = 0; i < calendarIds.length; i += FREEBUSY_BATCH_SIZE) {
+    batches.push(calendarIds.slice(i, i + FREEBUSY_BATCH_SIZE));
+  }
+  // NOTE: allSettled, not all: gcalFetch THROWS on a timeout or a network error, and a single
+  // rejection would discard every batch that answered fine. Non-2xx already degraded per batch;
+  // a thrown one has to degrade the same way or the contract is a coin flip on failure mode.
+  // Concurrency needs no separate bound: MAX_AGGREGATE_CALENDARS caps this at five requests.
+  const batchRes = await Promise.allSettled(
+    batches.map((ids) =>
+      gcalFetch(
+        "/freeBusy",
+        {
+          method: "POST",
+          token,
+          body: {
+            timeMin,
+            timeMax,
+            timeZone,
+            items: ids.map((id) => ({ id })),
+          },
+        },
+        ctx,
+      ),
+    ),
+  );
+  // NOTE: A batch that failed contributes no entries, so its calendars fall through the same
+  // "unreadable" path as a calendar Google refused individually. Only a total failure surfaces
+  // the HTTP status, which keeps the single-batch case answering exactly as it always did.
+  const calendars: Record<string, unknown> = {};
+  let lastStatus: number | null = null;
+  let threw = false;
+  for (const r of batchRes) {
+    if (r.status === "rejected") {
+      logger.warn({ err: r.reason }, "gcal: freeBusy batch failed");
+      threw = true;
+      continue;
+    }
+    if (r.value.status < 200 || r.value.status >= 300) {
+      lastStatus = r.value.status;
+      continue;
+    }
+    const d = (r.value.json ?? {}) as Record<string, unknown>;
+    Object.assign(calendars, (d.calendars ?? {}) as Record<string, unknown>);
+  }
+  // NOTE: Nothing came back at all, and the three ways that happens stay distinguishable, exactly
+  // as the single-batch path always reported them. The last one is a 2xx whose body was empty,
+  // malformed, or truncated by MAX_RESPONSE_CHARS before parsing: there is no status to quote
+  // (saying "HTTP null" is worse than saying nothing), and it is retriable, so it reads as such.
+  if (Object.keys(calendars).length === 0) {
+    if (lastStatus !== null) {
+      return {
+        ok: false,
+        refusal: toolFailure(`Google Calendar returned HTTP ${lastStatus}.`),
+      };
+    }
+    return {
+      ok: false,
+      refusal: toolFailure(
+        threw
+          ? "Failed to reach Google Calendar. Try again shortly."
+          : "Google Calendar's availability response could not be read. Try again shortly.",
+      ),
+    };
+  }
+  // NOTE: Per-calendar outcome. freeBusy answers 200 and reports a calendar it could not read as a
+  // per-calendar `errors` array (a revoked share, a deleted calendar), so the failure is INSIDE a
+  // successful response. Such a calendar is dropped, never carried with an empty busy list: empty
+  // busy means "free all day", and offering a professional whose bookings we cannot see is a
+  // double booking. Dropping it only under-offers, and the caller is told which ones went missing
+  // so the reply can say so instead of pretending the clinic is smaller than it is.
+  const sources: CalendarSource[] = [];
+  const unreadable: string[] = [];
+  for (const id of calendarIds) {
+    const entry = (calendars[id] ?? null) as Record<string, unknown> | null;
+    const errors = entry && Array.isArray(entry.errors) ? entry.errors : [];
+    if (!entry || errors.length > 0) {
+      unreadable.push(labels[id] ?? id);
+      continue;
+    }
+    const busy = (Array.isArray(entry.busy) ? entry.busy : [])
+      .map((b) => (b ?? {}) as Record<string, unknown>)
+      .filter((b) => typeof b.start === "string" && typeof b.end === "string")
+      .map((b) => ({ start: b.start as string, end: b.end as string }));
+    sources.push({
+      calendarId: id,
+      calendarLabel: labels[id] ?? null,
+      busy,
+    });
+  }
+  // NOTE: Nothing readable at all: an empty slot list would read as "fully booked", which sends the
+  // customer away from a clinic that is open. Say we could not check instead.
+  if (sources.length === 0) {
+    return {
+      ok: false,
+      refusal: toolFailure(
+        `Availability cannot be verified right now: no configured calendar could be read (${unreadable.join(", ")}).`,
+      ),
+    };
+  }
+  return { ok: true, sources, unreadable };
+}
+
+type BlockingRead =
+  | { ok: true; windows: Array<{ id: string; windows: BusyWindow[] }> }
+  | { ok: false; refusal: string | ToolFailure };
+
+// Blocking calendars (holidays, closures) count as busy too, read via events.list, NOT
+// freeBusy: all-day events (the typical holiday shape) default to transparency "transparent"
+// ("Free") and freeBusy silently ignores them, which is exactly the calendar the operator
+// expects to block. Only start/end are requested (no titles or attendees reach the model).
+// Fail-closed: a blocking calendar we cannot read could be hiding a closure, so refusing
+// beats offering a slot the operator explicitly blocked.
+async function readBlockingWindows(
+  blockingIds: string[],
+  sources: CalendarSource[],
+  timeMin: string,
+  timeMax: string,
+  timeZone: string,
+  token: string,
+  ctx: ToolpackCtx,
+): Promise<BlockingRead> {
+  // Which blocking calendars have to be READ. A blocker is skipped only when the query covers
+  // nothing but that same calendar: its own bookings already arrive via freeBusy, and reading it
+  // as a blocker would turn its transparent events into blocks of itself. With siblings in the
+  // query it MUST be read, because a calendar can be operable and still carry closures its
+  // siblings have to respect. Dropping it whenever it appeared in the query (an earlier revision
+  // of this change) made an all-day closure on a doubly-listed calendar invisible to everyone.
+  const out: Array<{ id: string; windows: BusyWindow[] }> = [];
+  const blocking = blockingIds.filter((id) =>
+    sources.some((s) => s.calendarId !== id),
+  );
+  if (blocking.length > MAX_BLOCKING_CALENDARS) {
+    return {
+      ok: false,
+      refusal: `Too many blocking calendars are configured (${blocking.length}; the limit is ${MAX_BLOCKING_CALENDARS}), so availability cannot be verified. Reduce the blocking calendars in the integration settings.`,
+    };
+  }
+  if (blocking.length === 0) return { ok: true, windows: out };
+  const evParams = new URLSearchParams({
+    singleEvents: "true",
+    timeMin,
+    timeMax,
+    maxResults: "50",
+    fields: "items(start,end),nextPageToken",
+  });
+  let blockingRes: GcalResponse[];
+  try {
+    blockingRes = await Promise.all(
+      blocking.map((id) =>
+        gcalFetch(
+          `/calendars/${encodeURIComponent(id)}/events?${evParams.toString()}`,
+          { method: "GET", token },
+          ctx,
+        ),
+      ),
+    );
+  } catch (err) {
+    logger.warn({ err }, "gcal: blocking calendars request failed");
+    return {
+      ok: false,
+      refusal: toolFailure(
+        "Failed to read a blocking calendar (holidays/closures), so availability cannot be verified right now. Try again shortly.",
+      ),
+    };
+  }
+  for (const [i, r] of blockingRes.entries()) {
+    if (r.status < 200 || r.status >= 300) {
+      return {
+        ok: false,
+        refusal: toolFailure(
+          `Google Calendar returned HTTP ${r.status} for a blocking calendar, so availability cannot be verified right now.`,
+        ),
+      };
+    }
+    const evData = (r.json ?? {}) as Record<string, unknown>;
+    // A nextPageToken means the window holds more events than the cap covers; treating the
+    // partial page as complete could offer a slot the operator explicitly blocked.
+    if (typeof evData.nextPageToken === "string") {
+      return {
+        ok: false,
+        refusal:
+          "A blocking calendar has more events in this range than can be checked at once, so availability cannot be verified right now. Try a narrower range.",
+      };
+    }
+    const items = Array.isArray(evData.items) ? evData.items : [];
+    const windows: BusyWindow[] = [];
+    for (const ev of items) {
+      const w = eventBusyWindow(
+        (ev ?? {}) as Record<string, unknown>,
+        timeZone,
+      );
+      if (w) windows.push(w);
+    }
+    out.push({ id: blocking[i] as string, windows });
+  }
+  return { ok: true, windows: out };
+}
+
+// Everything that counts as busy for ONE calendar over one range: its own bookings plus every
+// blocking calendar except itself.
+function busyForSource(
+  source: CalendarSource,
+  blockingWindows: Array<{ id: string; windows: BusyWindow[] }>,
+): BusyWindow[] {
+  return [
+    ...source.busy,
+    ...blockingWindows
+      .filter((b) => b.id !== source.calendarId)
+      .flatMap((b) => b.windows),
+  ];
+}
+
 function buildCheckAvailabilityTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
@@ -735,7 +960,6 @@ function buildCheckAvailabilityTool(
       timeMin: string;
       timeMax: string;
       slotDurationMinutes?: number;
-      granularityMinutes?: number;
       calendarId?: string;
     }) => {
       const minMs = Date.parse(input.timeMin);
@@ -754,176 +978,28 @@ function buildCheckAvailabilityTool(
       if (calendarIds.length > MAX_AGGREGATE_CALENDARS) {
         return `Too many calendars are configured to search at once (${calendarIds.length}; the limit is ${MAX_AGGREGATE_CALENDARS}). Pass calendarId to check one calendar, or reduce the calendars in the integration settings.`;
       }
-      // NOTE: freeBusy takes N calendars per request and keys the answer by id, so the whole clinic
-      // costs at most five requests (see FREEBUSY_BATCH_SIZE and MAX_AGGREGATE_CALENDARS), not one
-      // per professional the way the model had to do it before.
-      const batches: string[][] = [];
-      for (let i = 0; i < calendarIds.length; i += FREEBUSY_BATCH_SIZE) {
-        batches.push(calendarIds.slice(i, i + FREEBUSY_BATCH_SIZE));
-      }
-      // NOTE: allSettled, not all: gcalFetch THROWS on a timeout or a network error, and a single
-      // rejection would discard every batch that answered fine. Non-2xx already degraded per batch;
-      // a thrown one has to degrade the same way or the contract is a coin flip on failure mode.
-      // Concurrency needs no separate bound: MAX_AGGREGATE_CALENDARS caps this at five requests.
-      const batchRes = await Promise.allSettled(
-        batches.map((ids) =>
-          gcalFetch(
-            "/freeBusy",
-            {
-              method: "POST",
-              token,
-              body: {
-                timeMin: input.timeMin,
-                timeMax: input.timeMax,
-                timeZone,
-                items: ids.map((id) => ({ id })),
-              },
-            },
-            ctx,
-          ),
-        ),
+      const read = await readBusySources(
+        calendarIds,
+        labels,
+        input.timeMin,
+        input.timeMax,
+        timeZone,
+        token,
+        ctx,
       );
-      // NOTE: A batch that failed contributes no entries, so its calendars fall through the same
-      // "unreadable" path as a calendar Google refused individually. Only a total failure surfaces
-      // the HTTP status, which keeps the single-batch case answering exactly as it always did.
-      const calendars: Record<string, unknown> = {};
-      let lastStatus: number | null = null;
-      let threw = false;
-      for (const r of batchRes) {
-        if (r.status === "rejected") {
-          logger.warn({ err: r.reason }, "gcal: freeBusy batch failed");
-          threw = true;
-          continue;
-        }
-        if (r.value.status < 200 || r.value.status >= 300) {
-          lastStatus = r.value.status;
-          continue;
-        }
-        const d = (r.value.json ?? {}) as Record<string, unknown>;
-        Object.assign(
-          calendars,
-          (d.calendars ?? {}) as Record<string, unknown>,
-        );
-      }
-      // NOTE: Nothing came back at all, and the three ways that happens stay distinguishable, exactly
-      // as the single-batch path always reported them. The last one is a 2xx whose body was empty,
-      // malformed, or truncated by MAX_RESPONSE_CHARS before parsing: there is no status to quote
-      // (saying "HTTP null" is worse than saying nothing), and it is retriable, so it reads as such.
-      if (Object.keys(calendars).length === 0) {
-        if (lastStatus !== null) {
-          return toolFailure(`Google Calendar returned HTTP ${lastStatus}.`);
-        }
-        return toolFailure(
-          threw
-            ? "Failed to reach Google Calendar. Try again shortly."
-            : "Google Calendar's availability response could not be read. Try again shortly.",
-        );
-      }
-      // NOTE: Per-calendar outcome. freeBusy answers 200 and reports a calendar it could not read as a
-      // per-calendar `errors` array (a revoked share, a deleted calendar), so the failure is INSIDE a
-      // successful response. Such a calendar is dropped, never carried with an empty busy list: empty
-      // busy means "free all day", and offering a professional whose bookings we cannot see is a
-      // double booking. Dropping it only under-offers, and the caller is told which ones went missing
-      // so the reply can say so instead of pretending the clinic is smaller than it is.
-      const sources: CalendarSource[] = [];
-      const unreadable: string[] = [];
-      for (const id of calendarIds) {
-        const entry = (calendars[id] ?? null) as Record<string, unknown> | null;
-        const errors = entry && Array.isArray(entry.errors) ? entry.errors : [];
-        if (!entry || errors.length > 0) {
-          unreadable.push(labels[id] ?? id);
-          continue;
-        }
-        const busy = (Array.isArray(entry.busy) ? entry.busy : [])
-          .map((b) => (b ?? {}) as Record<string, unknown>)
-          .filter(
-            (b) => typeof b.start === "string" && typeof b.end === "string",
-          )
-          .map((b) => ({ start: b.start as string, end: b.end as string }));
-        sources.push({
-          calendarId: id,
-          calendarLabel: labels[id] ?? null,
-          busy,
-        });
-      }
-      // NOTE: Nothing readable at all: an empty slot list would read as "fully booked", which sends the
-      // customer away from a clinic that is open. Say we could not check instead.
-      if (sources.length === 0) {
-        return toolFailure(
-          `Availability cannot be verified right now: no configured calendar could be read (${unreadable.join(", ")}).`,
-        );
-      }
-      // Blocking calendars (holidays, closures) count as busy too, read via events.list, NOT
-      // freeBusy: all-day events (the typical holiday shape) default to transparency "transparent"
-      // ("Free") and freeBusy silently ignores them, which is exactly the calendar the operator
-      // expects to block. Only start/end are requested (no titles or attendees reach the model).
-      // Fail-closed: a blocking calendar we cannot read could be hiding a closure, so refusing
-      // beats offering a slot the operator explicitly blocked.
-      // Which blocking calendars have to be READ. A blocker is skipped only when the query covers
-      // nothing but that same calendar: its own bookings already arrive via freeBusy, and reading it
-      // as a blocker would turn its transparent events into blocks of itself. With siblings in the
-      // query it MUST be read, because a calendar can be operable and still carry closures its
-      // siblings have to respect. Dropping it whenever it appeared in the query (an earlier revision
-      // of this change) made an all-day closure on a doubly-listed calendar invisible to everyone.
-      const blockingWindows: Array<{
-        id: string;
-        windows: { start: string; end: string }[];
-      }> = [];
-      const blocking = blockingIds.filter((id) =>
-        sources.some((s) => s.calendarId !== id),
+      if (!read.ok) return read.refusal;
+      const { sources, unreadable } = read;
+      const blocked = await readBlockingWindows(
+        blockingIds,
+        sources,
+        input.timeMin,
+        input.timeMax,
+        timeZone,
+        token,
+        ctx,
       );
-      if (blocking.length > MAX_BLOCKING_CALENDARS) {
-        return `Too many blocking calendars are configured (${blocking.length}; the limit is ${MAX_BLOCKING_CALENDARS}), so availability cannot be verified. Reduce the blocking calendars in the integration settings.`;
-      }
-      if (blocking.length > 0) {
-        const evParams = new URLSearchParams({
-          singleEvents: "true",
-          timeMin: input.timeMin,
-          timeMax: input.timeMax,
-          maxResults: "50",
-          fields: "items(start,end),nextPageToken",
-        });
-        let blockingRes: GcalResponse[];
-        try {
-          blockingRes = await Promise.all(
-            blocking.map((id) =>
-              gcalFetch(
-                `/calendars/${encodeURIComponent(id)}/events?${evParams.toString()}`,
-                { method: "GET", token },
-                ctx,
-              ),
-            ),
-          );
-        } catch (err) {
-          logger.warn({ err }, "gcal: blocking calendars request failed");
-          return toolFailure(
-            "Failed to read a blocking calendar (holidays/closures), so availability cannot be verified right now. Try again shortly.",
-          );
-        }
-        for (const [i, r] of blockingRes.entries()) {
-          if (r.status < 200 || r.status >= 300) {
-            return toolFailure(
-              `Google Calendar returned HTTP ${r.status} for a blocking calendar, so availability cannot be verified right now.`,
-            );
-          }
-          const evData = (r.json ?? {}) as Record<string, unknown>;
-          // A nextPageToken means the window holds more events than the cap covers; treating the
-          // partial page as complete could offer a slot the operator explicitly blocked.
-          if (typeof evData.nextPageToken === "string") {
-            return "A blocking calendar has more events in this range than can be checked at once, so availability cannot be verified right now. Try a narrower range.";
-          }
-          const items = Array.isArray(evData.items) ? evData.items : [];
-          const windows: { start: string; end: string }[] = [];
-          for (const ev of items) {
-            const w = blockingBusyWindow(
-              (ev ?? {}) as Record<string, unknown>,
-              timeZone,
-            );
-            if (w) windows.push(w);
-          }
-          blockingWindows.push({ id: blocking[i] as string, windows });
-        }
-      }
+      if (!blocked.ok) return blocked.refusal;
+      const blockingWindows = blocked.windows;
       // The service hours bounding bookable slots: the integration's chosen BusinessHours (windows +
       // its own timezone). Unset/missing ⇒ no time-of-day filter ("always on"); we then fall back to
       // the integration's display timezone for the slot labels.
@@ -941,22 +1017,12 @@ function buildCheckAvailabilityTool(
           exceptions: [],
           timezone: timeZone,
         },
-        // NOTE: Each source's busy list is assembled HERE: its own bookings plus every blocking calendar
-        // except itself.
         sources: sources.map((src) => ({
           ...src,
-          busy: [
-            ...src.busy,
-            ...blockingWindows
-              .filter((b) => b.id !== src.calendarId)
-              .flatMap((b) => b.windows),
-          ],
+          busy: busyForSource(src, blockingWindows),
         })),
         slotMinutes: resolveSlotDuration(sel.config, input.slotDurationMinutes),
-        granularityMinutes: resolveSlotGranularity(
-          sel.config,
-          input.granularityMinutes,
-        ),
+        granularityMinutes: resolveSlotGranularity(sel.config),
         minLeadMinutes,
         // NOTE: Only when aggregating. The multiplication this bounds does not exist with one calendar,
         // and what a single-calendar instance returns is not this change's to alter: capping it would
@@ -977,13 +1043,174 @@ function buildCheckAvailabilityTool(
     {
       name: "calendar_check_availability",
       description: withCalendarContext(
-        `Return ALL bookable appointment start times within a range, already honoring the service hours, existing bookings and any operator-designated blocking calendars such as holidays or closures (no appointment details are exposed). Each slot has start, end, a human-readable label, and the calendarId (plus calendarLabel) that can actually take it. With several calendars configured, OMIT calendarId to search all of them at once and answer "who is available first?" in a single call; pass calendarId only to restrict the search to one. Offer these to the customer and confirm one before creating the appointment, then pass that slot's calendarId when booking. If \`unavailableCalendars\` comes back, those calendars could not be read and their slots are missing from the list. If \`coveredUntil\` comes back, the search stopped early and that timestamp is the FIRST start time it did not cover: the list is NOT the whole range, so never conclude that later times are unavailable, and call again with timeMin set to that value to continue. Pass ISO 8601 timestamps for the range, and search AT MOST 24 hours per call (one day at a time — call again for other days). The configured appointment length is shown in \`<slot_duration>\` below — when preset="false", choose it yourself per request and pass slotDurationMinutes (e.g. 30 for a standard appointment, 60 for a longer one); when preset="true", pass slotDurationMinutes only to override it.`,
+        `Return ALL bookable appointment start times within a range, already honoring the service hours, existing bookings and any operator-designated blocking calendars such as holidays or closures (no appointment details are exposed). Each slot has start, end, a human-readable label, and the calendarId (plus calendarLabel) that can actually take it. With several calendars configured, OMIT calendarId to search all of them at once and answer "who is available first?" in a single call; pass calendarId only to restrict the search to one. Offer these to the customer and confirm one before creating the appointment, then pass that slot's calendarId when booking. If \`unavailableCalendars\` comes back, those calendars could not be read and their slots are missing from the list. If \`coveredUntil\` comes back, the search stopped early and that timestamp is the FIRST start time it did not cover: the list is NOT the whole range, so never conclude that later times are unavailable, and call again with timeMin set to that value to continue. Pass ISO 8601 timestamps for the range, and search AT MOST 24 hours per call (one day at a time — call again for other days). The configured appointment length is shown in \`<slot_duration>\` below — when preset="false", choose it yourself per request and pass slotDurationMinutes (e.g. 30 for a standard appointment, 60 for a longer one); when preset="true" the length is fixed by the business and there is no arg to change it. Offer the returned start times EXACTLY as they come back: never round them, shift them or invent times in between.`,
         slotDurationXml(sel.config),
         calendarContextXml(allowed, labels),
       ),
-      schema: calendarArgSchema(CHECK_AVAILABILITY_SCHEMA, allowed),
+      schema: calendarArgSchema(
+        slotDurationArgSchema(CHECK_AVAILABILITY_SCHEMA, sel.config),
+        allowed,
+      ),
     },
   );
+}
+
+const ALL_DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const HAS_OFFSET_RE = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+// The instant a Calendar start/end names, or null when it names a whole DAY or nothing readable.
+//
+// A value WITHOUT an offset is a local wall clock, and the zone that resolves it has to be the zone
+// GOOGLE resolves it with: the event's own `timeZone`, which toEventTime always sets to the
+// integration's. `Date.parse` would read it in the SERVER's zone instead, so a UTC deployment
+// serving a São Paulo calendar judges "18:00" as 15:00 and stores it as 18:00 — three hours of
+// service hours and bookings the rule never looked at.
+function timedInstantMs(value: string, timeZone: string): number | null {
+  const v = value.trim();
+  if (ALL_DAY_RE.test(v)) return null;
+  if (HAS_OFFSET_RE.test(v)) {
+    const ms = Date.parse(v);
+    return Number.isNaN(ms) ? null : ms;
+  }
+  // A wall clock the timezone SKIPS (the spring-forward hour) names no instant. Refusing it is the
+  // same rule as everywhere else here: this tool does not guess a timestamp, and an explicit offset
+  // is always available to say exactly which side of the shift was meant.
+  const { ms, exists } = zonedWallClock(v, timeZone);
+  return exists && !Number.isNaN(ms) ? ms : null;
+}
+
+// A Calendar start/end the booking rule can judge: a real instant, not an all-day date. All-day is
+// refused rather than exempted — availability never offers a whole day, so exempting it would leave
+// the one shape of write that skips the rule entirely (issue #345).
+const NOT_A_TIMED_EVENT =
+  "An appointment needs a start and end time, not a whole day. Pass ISO 8601 timestamps with an offset (e.g. 2026-06-20T14:00:00-03:00).";
+const UNREADABLE_TIME =
+  "Start and end must be ISO 8601 timestamps with an offset (e.g. 2026-06-20T14:00:00-03:00).";
+
+// The requested time is not one availability would have offered. The times that ARE bookable travel
+// with the refusal: a bare "unavailable" makes the agent apologise and end the turn, while a list of
+// real starts lets it propose one, and they cost nothing extra because the read that answered the
+// question already covered the whole day.
+function notBookableMessage(alternatives: Slot[]): string {
+  if (alternatives.length === 0) {
+    return "That time is not a bookable appointment slot, and nothing else is bookable that day. Call calendar_check_availability for another day and offer the customer a time from it.";
+  }
+  // The exact start/end travel with the label, in the same shape calendar_check_availability
+  // returns. A label alone carries no year and no offset, and across a DST fallback two different
+  // slots wear the same one — so a refusal that only named them would be asking the model to
+  // reconstruct a timestamp this very tool refuses to guess at.
+  return `That time is not a bookable appointment slot. These are: ${JSON.stringify(
+    alternatives,
+  )}. Offer one to the customer and pass its start and end back unchanged.`;
+}
+
+// The availability read failed, so whether the time is free is unknown. Writing anyway is the double
+// booking this rule exists to prevent, so the write is refused and the reason is carried through.
+function unverifiableMessage(
+  refusal: string | ToolFailure,
+): string | ToolFailure {
+  const detail = refusal instanceof ToolFailure ? refusal.message : refusal;
+  const text = `The appointment was not saved: availability cannot be verified right now. ${detail}`;
+  return refusal instanceof ToolFailure ? toolFailure(text) : text;
+}
+
+// Judges a requested appointment against the same availability the read tool answers with, for ONE
+// calendar over the local day that holds it. `excludeBusy` is the appointment being moved: its own
+// booking comes back in freeBusy, and a reschedule that did not remove it would collide with itself.
+async function judgeWrite(opts: {
+  sel: IntegrationSelection;
+  ctx: ToolpackCtx;
+  token: string;
+  calendarId: string;
+  labels: Record<string, string>;
+  timeZone: string;
+  blockingIds: string[];
+  businessHoursId: string | null;
+  start: string;
+  end: string;
+  excludeBusy: BusyWindow | null;
+}): Promise<{ ok: true } | { ok: false; refusal: string | ToolFailure }> {
+  const startMs = timedInstantMs(opts.start, opts.timeZone);
+  const endMs = timedInstantMs(opts.end, opts.timeZone);
+  if (startMs === null || endMs === null) {
+    const wholeDay =
+      ALL_DAY_RE.test(opts.start.trim()) || ALL_DAY_RE.test(opts.end.trim());
+    return {
+      ok: false,
+      refusal: wholeDay ? NOT_A_TIMED_EVENT : UNREADABLE_TIME,
+    };
+  }
+  if (endMs <= startMs) {
+    return {
+      ok: false,
+      refusal: "The appointment must end after it starts.",
+    };
+  }
+  const schedule =
+    opts.businessHoursId && opts.ctx.resolveBusinessHours
+      ? await opts.ctx.resolveBusinessHours(opts.businessHoursId)
+      : null;
+  // No schedule ⇒ always on, judged in the integration's display timezone, exactly as the
+  // availability tool treats an unset businessHoursId.
+  const effective: Schedule = schedule ?? {
+    windows: [],
+    exceptions: [],
+    timezone: opts.timeZone,
+  };
+  // The appointment length the operator sells: pinned by config when there is one, otherwise the
+  // length the model asked for. Both go through resolveSlotDuration so the write is judged against
+  // the very same clamping the availability answer was built with. Resolved BEFORE the read,
+  // because it is what bounds the range the read asks Google for.
+  const preset = configuredSlotDuration(opts.sel.config);
+  const slotMinutes = resolveSlotDuration(
+    opts.sel.config,
+    preset === null ? (endMs - startMs) / 60_000 : undefined,
+  );
+  const window = bookingWindow(
+    startMs,
+    slotMinutes * 60_000,
+    effective.timezone,
+  );
+  const read = await readBusySources(
+    [opts.calendarId],
+    opts.labels,
+    window.timeMin,
+    window.timeMax,
+    opts.timeZone,
+    opts.token,
+    opts.ctx,
+  );
+  if (!read.ok)
+    return { ok: false, refusal: unverifiableMessage(read.refusal) };
+  const blocked = await readBlockingWindows(
+    opts.blockingIds,
+    read.sources,
+    window.timeMin,
+    window.timeMax,
+    opts.timeZone,
+    opts.token,
+    opts.ctx,
+  );
+  if (!blocked.ok) {
+    return { ok: false, refusal: unverifiableMessage(blocked.refusal) };
+  }
+  const source = read.sources[0] as CalendarSource;
+  const busy = busyForSource(
+    { ...source, busy: subtractWindow(source.busy, opts.excludeBusy) },
+    blocked.windows,
+  );
+  const verdict = judgeBooking({
+    startMs,
+    endMs,
+    now: new Date(),
+    schedule: effective,
+    busy,
+    slotMinutes,
+    granularityMinutes: resolveSlotGranularity(opts.sel.config),
+    minLeadMinutes: resolveMinLead(opts.sel.config),
+  });
+  if (verdict.bookable) return { ok: true };
+  return { ok: false, refusal: notBookableMessage(verdict.alternatives) };
 }
 
 function buildCreateEventTool(
@@ -994,6 +1221,8 @@ function buildCreateEventTool(
   const labels = resolveCalendarLabels(sel.config);
   const timeZone = resolveTimeZone(sel.config);
   const meetEnabled = resolveCreateMeetLink(sel.config);
+  const blockingIds = resolveBlockingCalendarIds(sel.config);
+  const businessHoursId = resolveBusinessHoursId(sel.config);
   return failableTool(
     async (input: {
       summary: string;
@@ -1009,6 +1238,20 @@ function buildCreateEventTool(
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
+      const judged = await judgeWrite({
+        sel,
+        ctx,
+        token,
+        calendarId,
+        labels,
+        timeZone,
+        blockingIds,
+        businessHoursId,
+        start: input.start,
+        end: input.end,
+        excludeBusy: null,
+      });
+      if (!judged.ok) return judged.refusal;
       const body: Record<string, unknown> = {
         summary: input.summary,
         start: toEventTime(input.start, timeZone),
@@ -1099,7 +1342,7 @@ function buildCreateEventTool(
     {
       name: "calendar_create_event",
       description: withCalendarContext(
-        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end. Use ISO 8601 with an offset for timed events (e.g. 2026-06-20T14:00:00-03:00) or a bare date (2026-06-20) for an all-day event. Returns the created appointment's id and links${meetEnabled ? "; share meetLink (the Google Meet room) with the customer — htmlLink is only the calendar page" : ""}.`,
+        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end, as ISO 8601 with an offset (e.g. 2026-06-20T14:00:00-03:00). The requested time is CHECKED against the same availability calendar_check_availability answers with — the service hours, the appointment length, the start times the business offers, the minimum notice and the existing bookings — and a time that tool would not have offered is refused, with the bookable times of that day in the refusal so you can offer one instead. So book a slot exactly as availability returned it: never round it, shift it or invent a time in between. Returns the created appointment's id and links${meetEnabled ? "; share meetLink (the Google Meet room) with the customer — htmlLink is only the calendar page" : ""}.`,
         calendarContextXml(allowed, labels),
       ),
       schema: calendarArgSchema(CREATE_EVENT_SCHEMA, allowed),
@@ -1114,6 +1357,8 @@ function buildUpdateEventTool(
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
   const timeZone = resolveTimeZone(sel.config);
+  const blockingIds = resolveBlockingCalendarIds(sel.config);
+  const businessHoursId = resolveBusinessHoursId(sel.config);
   return failableTool(
     async (input: {
       eventId: string;
@@ -1133,11 +1378,12 @@ function buildUpdateEventTool(
       const body: Record<string, unknown> = {};
       if (input.summary !== undefined) body.summary = input.summary;
       if (input.description !== undefined) body.description = input.description;
-      if (input.start !== undefined)
-        body.start = toEventTimePatch(input.start, timeZone);
-      if (input.end !== undefined)
-        body.end = toEventTimePatch(input.end, timeZone);
-      if (Object.keys(body).length === 0) {
+      if (
+        input.summary === undefined &&
+        input.description === undefined &&
+        input.start === undefined &&
+        input.end === undefined
+      ) {
         return "No fields provided. Set at least one of summary, start, end or description.";
       }
       // Ownership gate: re-fetch the event and refuse unless it carries THIS customer's stamp, so the
@@ -1145,7 +1391,7 @@ function buildUpdateEventTool(
       let owner: GcalResponse;
       try {
         owner = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties`,
+          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties,start,end`,
           { method: "GET", token },
           ctx,
         );
@@ -1161,6 +1407,68 @@ function buildUpdateEventTool(
       }
       const ownerEv = (owner.json ?? {}) as Record<string, unknown>;
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
+      // A move is judged by the same rule a create is (issue #345). Only a move: an edit that leaves
+      // start and end alone changes nothing availability has an opinion about, and paying a read to
+      // rename an appointment would be a request for nothing.
+      //
+      // "A move" is the INSTANTS differing, not the fields being present. A caller that resends the
+      // times it already has while changing the summary is renaming, and judging that would refuse
+      // the rename because the appointment is now in the past, or inside the minimum notice, or
+      // outside service hours the operator changed after it was booked.
+      const currentStart = flattenTime(ownerEv.start);
+      const currentEnd = flattenTime(ownerEv.end);
+      const nextStart = input.start ?? currentStart;
+      const nextEnd = input.end ?? currentEnd;
+      const at = (v: string | null) =>
+        v === null ? null : timedInstantMs(v, timeZone);
+      // Two values are the same time when they resolve to the same INSTANT, or, for a shape that
+      // has no instant (a legacy all-day date), when they are the same string. Comparing instants
+      // alone makes every all-day value equal to every other, so moving an appointment from
+      // 2099-06-22 to 2099-06-23 read as "nothing changed" and was dropped without a word.
+      const sameTime = (a: string | null, b: string | null) => {
+        if (a === b) return true;
+        const ai = at(a);
+        return ai !== null && ai === at(b);
+      };
+      const moved =
+        (input.start !== undefined || input.end !== undefined) &&
+        (!sameTime(nextStart, currentStart) || !sameTime(nextEnd, currentEnd));
+      // The times go in the patch only when they MOVED, which is the same condition that decides
+      // whether to judge them. Echoing an unchanged value back would rewrite its representation for
+      // no reason, and for a legacy all-day appointment that rewrite is invalid: `toEventTimePatch`
+      // emits the timed shape, so a bare `YYYY-MM-DD` resent alongside a rename would reach Google
+      // as a `dateTime` of "2099-06-22" with the `date` cleared, and be rejected.
+      if (moved) {
+        if (input.start !== undefined)
+          body.start = toEventTimePatch(input.start, timeZone);
+        if (input.end !== undefined)
+          body.end = toEventTimePatch(input.end, timeZone);
+        if (nextStart === null || nextEnd === null) {
+          return toolFailure(
+            "Google Calendar did not return the appointment's current times, so the new time cannot be checked. Try again shortly.",
+          );
+        }
+        const judged = await judgeWrite({
+          sel,
+          ctx,
+          token,
+          calendarId,
+          labels,
+          timeZone,
+          blockingIds,
+          businessHoursId,
+          start: nextStart,
+          end: nextEnd,
+          // The appointment being moved: its own booking comes back as busy, and leaving it in
+          // place would make every reschedule collide with itself. Read from the EVENT, not from
+          // the request, so a legacy all-day appointment contributes the days it really occupies.
+          excludeBusy: eventBusyWindow(ownerEv, timeZone),
+        });
+        if (!judged.ok) return judged.refusal;
+      }
+      if (Object.keys(body).length === 0) {
+        return "The appointment already has those times, and nothing else was given to change.";
+      }
       let res: GcalResponse;
       try {
         res = await gcalFetch(
@@ -1212,7 +1520,7 @@ function buildUpdateEventTool(
     {
       name: "calendar_update_event",
       description: withCalendarContext(
-        `Reschedule or edit THIS customer's appointment (by its id, e.g. from calendar_list_events). Only an appointment belonging to this customer can be changed. Provide ONLY the fields to change. Dates use the same ISO 8601 / all-day format as create.`,
+        `Reschedule or edit THIS customer's appointment (by its id, e.g. from calendar_list_events). Only an appointment belonging to this customer can be changed. Provide ONLY the fields to change; times use the same ISO 8601 format as create. A new start or end is checked against availability exactly as a create is, so a time it would not have offered is refused — an edit that leaves the time alone is never checked.`,
         calendarContextXml(allowed, labels),
       ),
       schema: calendarArgSchema(UPDATE_EVENT_SCHEMA, allowed),

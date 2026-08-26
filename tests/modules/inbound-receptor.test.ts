@@ -6,6 +6,7 @@ import {
   PrismaClient,
 } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import type { TenantContext } from "@/lib/tenancy";
 import { createIntegrationInstance } from "@/modules/integrations/service";
 import {
   DEFAULT_SIGNATURE_HEADER,
@@ -24,6 +25,14 @@ import {
   type ReceiveParams,
   receiveInbound,
 } from "@/modules/webhooks/inbound/service";
+
+// The context these calls take: the tenant id came from a row this test created, so it carries
+// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+const ctxOf = (tenantId: bigint): TenantContext => ({
+  tenantId,
+  userId: null,
+  role: "TENANT_ADMIN",
+});
 
 // ── route token (unit) ──
 describe("inbound route token", () => {
@@ -87,6 +96,17 @@ describe("inbound auth header resolution", () => {
       authHeader: "asaas-access-token",
       signatureHeader: DEFAULT_SIGNATURE_HEADER,
     },
+    // Review round 1 of #370. An empty override IS a configured name, and dropping it here sent the
+    // gate the DEFAULT — which is the one thing the refusal exists to prevent: comparing the secret
+    // against `x-webhook-token` on an instance whose operator asked for something else. The write
+    // refuses `""` like any other unusable name; this is the row already written.
+    {
+      name: "an empty override reaches the gate rather than falling back",
+      catalogType: "ASAAS",
+      config: { authHeader: "" },
+      authHeader: "",
+      signatureHeader: DEFAULT_SIGNATURE_HEADER,
+    },
     {
       name: "the signature header is overridable per instance too",
       catalogType: "ASAAS",
@@ -121,6 +141,23 @@ describe("inbound auth", () => {
     (h: Record<string, string>) =>
     (n: string): string | null =>
       h[n] ?? null;
+  // The record lookup above answers every name, including ones no HTTP stack accepts. The receptor's
+  // real reader is `request.headers.get`, which THROWS on a name outside the RFC 7230 token — issue
+  // #362 — so the cases about an unusable name have to go through the real thing or they prove
+  // nothing about the caller.
+  //
+  // And the global `Headers` here is NOT the real thing: happy-dom replaces it, and its version
+  // accepts every name and answers null, so the first version of these two cases failed on the
+  // expected value rather than on the throw they exist to pin. `globalThis.BunRequest` is the native
+  // constructor tests/dom-setup.ts stashes before the replacement, which is what the route holds.
+  const nativeRequest = (globalThis as { BunRequest?: typeof Request })
+    .BunRequest;
+  const realHdr =
+    (h: Record<string, string>) =>
+    (n: string): string | null => {
+      const R = nativeRequest ?? Request;
+      return new R("https://example.com/", { headers: h }).headers.get(n);
+    };
   const none = (): string | null => null;
 
   const cases: Array<{
@@ -128,6 +165,7 @@ describe("inbound auth", () => {
     strategy: InboundAuthStrategy;
     secret: InboundSecretResolution;
     getHeader: (name: string) => string | null;
+    config?: { authHeader?: string; signatureHeader?: string };
     expected: InboundAuthOutcome;
   }> = [
     // NONE never consults the secret, in any state.
@@ -248,6 +286,40 @@ describe("inbound auth", () => {
       getHeader: hdr({ [DEFAULT_SIGNATURE_HEADER]: sig }),
       expected: { ok: true },
     },
+    // Issue #362. `config.authHeader` is operator text that becomes a header NAME, and a value with a
+    // space around it made `Headers.get` throw inside the gate — answering the delivery 500 where
+    // every other refusal gives 401, which is itself the oracle the uniform 401 exists to deny. The
+    // refusal has to be a refusal, on both strategies, and it must NOT fall back to the default name:
+    // comparing against a header the operator never chose is a worse failure than refusing.
+    {
+      name: "STATIC_HEADER refuses a configured name no HTTP stack accepts",
+      strategy: "STATIC_HEADER",
+      secret: filled(token),
+      config: { authHeader: "asaas-access-token " },
+      getHeader: realHdr({
+        "asaas-access-token": token,
+        [DEFAULT_STATIC_HEADER]: token,
+      }),
+      expected: { ok: false, reason: "header_name_unusable" },
+    },
+    {
+      name: "HMAC_SHA256 refuses a configured signature name no HTTP stack accepts",
+      strategy: "HMAC_SHA256",
+      secret: filled(token),
+      config: { signatureHeader: "x-sig " },
+      getHeader: realHdr({ "x-sig": sig, [DEFAULT_SIGNATURE_HEADER]: sig }),
+      expected: { ok: false, reason: "header_name_unusable" },
+    },
+    // The control, and it is the one that says the refusal is about the NAME and not about custom
+    // names at all: a legal one the provider dictates still reads, through the same real reader.
+    {
+      name: "STATIC_HEADER reads a legal custom name through a real Headers",
+      strategy: "STATIC_HEADER",
+      secret: filled(token),
+      config: { authHeader: "asaas-access-token" },
+      getHeader: realHdr({ "asaas-access-token": token }),
+      expected: { ok: true },
+    },
     {
       name: "HMAC_SHA256 accepts the sha256= prefix",
       strategy: "HMAC_SHA256",
@@ -265,6 +337,7 @@ describe("inbound auth", () => {
           secret: c.secret,
           rawBody: body,
           getHeader: c.getHeader,
+          config: c.config,
         }),
       ).toEqual(c.expected);
     });
@@ -341,7 +414,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("queues, correlates and records a conversion end to end", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-conv",
@@ -403,7 +476,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("notifies the customer on a confirmed payment (default on), on the SAME thread (no bleed)", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-notify-on",
@@ -472,7 +545,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("does not notify when notifyOnPayment is false (silent conversion)", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-notify-off",
@@ -529,7 +602,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("is idempotent on dedupeKey (no second delivery, safe reprocess)", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       { catalogType: "ASAAS", name: "asaas-idem", inboundAuthStrategy: "NONE" },
       appDb,
     );
@@ -584,7 +657,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       select: { id: true },
     });
     const { routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-static",
@@ -631,7 +704,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("queues and converts the real Asaas direct-charge payload (paymentLink null) end to end", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-direct",
@@ -689,9 +762,280 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
     expect(conv?.value?.toString()).toBe("500");
   });
 
+  // ── characters Postgres refuses to store (issue #218) ──
+  // A body that is valid JSON, passes the mapper's schema, and that the column then refuses. The
+  // two characters and BOTH destinations of the normalized event, measured against this database:
+  //   jsonb payload + lone surrogate -> invalid input syntax for type json
+  //   jsonb payload + NUL            -> 22P05 unsupported Unicode escape sequence
+  //   text  column  + lone surrogate -> 22021 invalid byte sequence for encoding "UTF8": 0xef 0xbf
+  //   text  column  + NUL            -> 22021 invalid byte sequence for encoding "UTF8": 0x00
+  // Each one used to throw out of `receiveInbound`, which nothing above catches: a 500 with no
+  // delivery row and no FAILED record either, and a sender retrying a body that can never succeed.
+  // The two halves get OPPOSITE treatment, which is what the second group below pins.
+  const NUL = String.fromCharCode(0);
+
+  // The payload is display and diagnostics: repaired, and the delivery is kept.
+  const repaired: Array<{
+    name: string;
+    payment: Record<string, unknown>;
+    status: string;
+    metadata?: unknown;
+  }> = [
+    {
+      name: "a lone surrogate in metadata (jsonb)",
+      payment: { id: "u1", externalReference: "r1", paymentLink: "l\ud800k" },
+      status: "RECEIVED",
+      metadata: { paymentLink: "l�k" },
+    },
+    {
+      name: "a NUL in metadata (jsonb)",
+      payment: { id: "u2", externalReference: "r2", paymentLink: `l${NUL}k` },
+      status: "RECEIVED",
+      metadata: { paymentLink: "lk" },
+    },
+    {
+      name: "a lone surrogate in the provider's status (jsonb)",
+      payment: { id: "u3", externalReference: "r3", status: "RECEIVED\ud800" },
+      status: "RECEIVED�",
+    },
+  ];
+
+  for (const [i, c] of repaired.entries()) {
+    test(`repairs and keeps the delivery when the body carries ${c.name}`, async () => {
+      const { routeToken } = await createIntegrationInstance(
+        ctxOf(tenantId),
+        {
+          catalogType: "ASAAS",
+          name: `asaas-repaired-${i}`,
+          inboundAuthStrategy: "NONE",
+          config: { notifyOnPayment: false },
+        },
+        appDb,
+      );
+      const r = await receiveInbound({
+        routeToken: routeToken as string,
+        rawBody: JSON.stringify({
+          event: "PAYMENT_RECEIVED",
+          payment: { value: 10, status: "RECEIVED", ...c.payment },
+        }),
+        getHeader: () => null,
+        base: appDb,
+      });
+      expect(r.outcome).toBe("queued");
+
+      const delivery = await suDb.inboundDelivery.findUniqueOrThrow({
+        where: { id: r.deliveryId as bigint },
+      });
+      expect(delivery.status).toBe("PENDING");
+      const payload = delivery.payload as Record<string, unknown>;
+      expect(payload.status).toBe(c.status);
+      if (c.metadata) expect(payload.metadata).toEqual(c.metadata);
+    });
+  }
+
+  // An identity field is NOT repaired. Repairing is lossy, and lossy on an identity is how a
+  // payment lands in someone else's conversation (`ref<NUL>` becomes `ref`, which is a reference
+  // another conversation registered) or how two distinct provider ids collapse into one dedupe key.
+  // The delivery takes the fail-closed path instead: a durable FAILED row and a 2xx, which is what
+  // stops the retry loop without inventing an identity.
+  const refused: Array<{ name: string; payment: Record<string, unknown> }> = [
+    {
+      name: "a lone surrogate in the provider's id (text dedupe_key)",
+      payment: { id: "u4\ud800", externalReference: "r4" },
+    },
+    {
+      name: "a NUL in the provider's id (text dedupe_key)",
+      payment: { id: `u5${NUL}x`, externalReference: "r5" },
+    },
+    {
+      name: "a lone surrogate in the correlation reference (text external_id)",
+      payment: { id: "u6", externalReference: "r6\ud800" },
+    },
+  ];
+
+  for (const [i, c] of refused.entries()) {
+    test(`records a durable FAILED delivery when the body carries ${c.name}`, async () => {
+      const { routeToken } = await createIntegrationInstance(
+        ctxOf(tenantId),
+        {
+          catalogType: "ASAAS",
+          name: `asaas-refused-${i}`,
+          inboundAuthStrategy: "NONE",
+          config: { notifyOnPayment: false },
+        },
+        appDb,
+      );
+      const r = await receiveInbound({
+        routeToken: routeToken as string,
+        rawBody: JSON.stringify({
+          event: "PAYMENT_RECEIVED",
+          payment: { value: 10, status: "RECEIVED", ...c.payment },
+        }),
+        getHeader: () => null,
+        base: appDb,
+      });
+      // The sender still gets its 2xx: the point of the fail-closed path is that the retry loop
+      // ends, not that the caller learns anything it could act on.
+      expect(r.ack).toBe(true);
+      expect(r.outcome).toBe("invalid");
+
+      const delivery = await suDb.inboundDelivery.findUniqueOrThrow({
+        where: { id: r.deliveryId as bigint },
+      });
+      expect(delivery.status).toBe("FAILED");
+      expect(delivery.externalId).toBeNull();
+      expect(delivery.dedupeKey).toMatch(/^raw:[0-9a-f]{64}$/);
+      expect(delivery.payload).toMatchObject({ reason: "unstorable-identity" });
+    });
+  }
+
+  test("records a durable FAILED delivery when the identity is too long for its own index", async () => {
+    const { routeToken } = await createIntegrationInstance(
+      ctxOf(tenantId),
+      {
+        catalogType: "ASAAS",
+        name: "asaas-identity-long",
+        inboundAuthStrategy: "NONE",
+        config: { notifyOnPayment: false },
+      },
+      appDb,
+    );
+    // Incompressible on purpose: a run of one character compresses inside the index and slips past
+    // the limit, so a probe built from `repeat("x", n)` would prove nothing. Measured on this
+    // database, an incompressible dedupe key fails its unique index at ~2704 bytes with "index row
+    // size 6432 exceeds btree version 4 maximum 2704", which is the same 500-with-no-record this
+    // PR exists to remove. The mapper puts `payment.id` straight into the key and its schema caps
+    // neither that nor `event`.
+    const longId = Array.from({ length: 3000 }, (_, i) =>
+      String.fromCharCode(97 + ((i * 7 + (i % 13)) % 26)),
+    ).join("");
+    const r = await receiveInbound({
+      routeToken: routeToken as string,
+      rawBody: JSON.stringify({
+        event: "PAYMENT_RECEIVED",
+        payment: {
+          id: longId,
+          value: 10,
+          status: "RECEIVED",
+          externalReference: "r-long",
+        },
+      }),
+      getHeader: () => null,
+      base: appDb,
+    });
+    expect(r.ack).toBe(true);
+    expect(r.outcome).toBe("invalid");
+
+    const delivery = await suDb.inboundDelivery.findUniqueOrThrow({
+      where: { id: r.deliveryId as bigint },
+    });
+    expect(delivery.status).toBe("FAILED");
+    expect(delivery.payload).toMatchObject({ reason: "unstorable-identity" });
+  });
+
+  test("a malformed reference never correlates onto the conversation the clean one owns", async () => {
+    const { id: instanceId, routeToken } = await createIntegrationInstance(
+      ctxOf(tenantId),
+      {
+        catalogType: "ASAAS",
+        name: "asaas-identity-bleed",
+        inboundAuthStrategy: "NONE",
+        // notifyOnPayment stays ON: the wrong-thread nudge is half of what this guards against.
+        config: {},
+      },
+      appDb,
+    );
+    // A real conversation owns the reference `corr_bleed`.
+    await suDb.integrationExternalRef.create({
+      data: {
+        tenantId,
+        integrationInstanceId: instanceId,
+        externalId: "corr_bleed",
+        threadId: "1:1:777",
+        kind: "asaas_payment",
+      },
+    });
+    // A different payment arrives carrying that same reference with a NUL glued to it. Repairing
+    // it would produce `corr_bleed` exactly, and credit this payment to thread 1:1:777.
+    const r = await receiveInbound({
+      routeToken: routeToken as string,
+      rawBody: JSON.stringify({
+        event: "PAYMENT_RECEIVED",
+        payment: {
+          id: "pay_bleed",
+          value: 999,
+          status: "RECEIVED",
+          externalReference: `corr_bleed${NUL}`,
+        },
+      }),
+      getHeader: () => null,
+      base: appDb,
+    });
+    expect(r.outcome).toBe("invalid");
+    if (r.outcome !== "invalid") return;
+    await processInboundDelivery({
+      deliveryId: r.deliveryId as bigint,
+      tenantId,
+      base: appDb,
+    });
+    const conv = await suDb.conversionEvent.findFirst({
+      where: { tenantId, threadId: "1:1:777", source: "ASAAS" },
+    });
+    expect(conv).toBeNull();
+  });
+
+  test("a repaired payload still converts end to end (the payment is not lost)", async () => {
+    const { id: instanceId, routeToken } = await createIntegrationInstance(
+      ctxOf(tenantId),
+      {
+        catalogType: "ASAAS",
+        name: "asaas-repaired-e2e",
+        inboundAuthStrategy: "NONE",
+        config: { notifyOnPayment: false },
+      },
+      appDb,
+    );
+    await suDb.integrationExternalRef.create({
+      data: {
+        tenantId,
+        integrationInstanceId: instanceId,
+        externalId: "corr_repaired",
+        threadId: "1:1:218",
+        kind: "asaas_payment",
+      },
+    });
+    const r = await receiveInbound({
+      routeToken: routeToken as string,
+      rawBody: JSON.stringify({
+        event: "PAYMENT_RECEIVED",
+        payment: {
+          id: "pay_repaired",
+          value: 42,
+          status: "RECEIVED",
+          externalReference: "corr_repaired",
+          paymentLink: `link${NUL}\ud800abc`,
+        },
+      }),
+      getHeader: () => null,
+      base: appDb,
+    });
+    expect(r.outcome).toBe("queued");
+
+    const proc = await processInboundDelivery({
+      deliveryId: r.deliveryId as bigint,
+      tenantId,
+      base: appDb,
+    });
+    expect(proc).toBe("processed");
+    const conv = await suDb.conversionEvent.findFirst({
+      where: { tenantId, threadId: "1:1:218", source: "ASAAS" },
+    });
+    expect(conv?.value?.toString()).toBe("42");
+  });
+
   test("records an unparseable payload as invalid (durable FAILED delivery)", async () => {
     const { routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       { catalogType: "ASAAS", name: "asaas-bad", inboundAuthStrategy: "NONE" },
       appDb,
     );
@@ -712,7 +1056,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("invalid deliveries dedupe on the raw-body hash", async () => {
     const { routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-bad-idem",
@@ -740,7 +1084,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
 
   test("still ignores a parseable but unmapped lifecycle event (no delivery)", async () => {
     const { id: instanceId, routeToken } = await createIntegrationInstance(
-      tenantId,
+      ctxOf(tenantId),
       {
         catalogType: "ASAAS",
         name: "asaas-lifecycle",
@@ -786,6 +1130,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
     strategy: InboundAuthStrategy;
     secretRef?: string | null;
     enabled?: boolean;
+    config?: Record<string, string>;
   }): Promise<{ token: string; id: bigint }> {
     const minted = generateRouteToken();
     const row = await suDb.integrationInstance.create({
@@ -794,7 +1139,7 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
         catalogType: "ASAAS",
         name: `diag-${minted.hash.slice(0, 10)}`,
         enabled: spec.enabled ?? true,
-        config: {},
+        config: spec.config ?? {},
         inboundAuthStrategy: spec.strategy,
         inboundSecretRef: spec.secretRef ?? null,
         routeTokenHash: minted.hash,
@@ -961,6 +1306,119 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       reason: "route_disabled",
       instanceId: String(id),
     });
+  });
+
+  // Issue #362, end to end and through the reader the route actually holds. Written against a row
+  // created directly, because that is the case the write-side refusal cannot reach: rows already
+  // carry whatever they carry.
+  test("names the cause when the configured header name is not one, and still answers 401", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "unusable-header-name",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "asaas-access-token " },
+    });
+    const cap = captureWarnings();
+
+    // The native reader, not `headersFrom`: happy-dom's Headers accepts every name, so the record
+    // lookup would answer null and this would pass on `header_missing` — the wrong reason, and the
+    // 500 it exists to pin would never happen.
+    const R =
+      (globalThis as { BunRequest?: typeof Request }).BunRequest ?? Request;
+    const nativeHeaders = new R("https://example.com/", {
+      headers: {
+        "asaas-access-token": "the-secret",
+        [DEFAULT_STATIC_HEADER]: "the-secret",
+      },
+    }).headers;
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        getHeader: (n) => nativeHeaders.get(n),
+        base: appDb,
+        deps: cap.deps,
+      }),
+      // 401, not the 500 the TypeError produced. The status is the whole defect: a caller holding a
+      // route token and no valid secret got 500 where every other refusal gives 401, so the status
+      // itself said "this token resolves to a live instance that is misconfigured".
+    ).rejects.toMatchObject({ statusCode: 401 });
+
+    expect(cap.seen[0]).toMatchObject({ reason: "header_name_unusable" });
+  });
+
+  // And the half that a fallback would quietly break: the correct secret IS present under the
+  // default name in the request above. Authenticating on it would be a 200 on a header the operator
+  // never chose.
+  test("an unusable configured name does not fall back to the default header", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "no-fallback",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "x tok" },
+    });
+    const R =
+      (globalThis as { BunRequest?: typeof Request }).BunRequest ?? Request;
+    const nativeHeaders = new R("https://example.com/", {
+      headers: { [DEFAULT_STATIC_HEADER]: "the-secret" },
+    }).headers;
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        getHeader: (n) => nativeHeaders.get(n),
+        base: appDb,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  // Review round 1 of #370, and the same rule as the two above through a different door: an empty
+  // string is a configured name, and it used to be dropped one layer earlier — so the gate never saw
+  // it and authenticated against `x-webhook-token`, which the row's operator never chose.
+  test("an empty configured name refuses too, and does not authenticate on the default", async () => {
+    const entry = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name: "empty-header-name",
+        secret: encryptJson("the-secret"),
+      },
+      select: { id: true },
+    });
+    const { token } = await rawInstance({
+      strategy: "STATIC_HEADER",
+      secretRef: `vault:${entry.id}`,
+      config: { authHeader: "" },
+    });
+    const cap = captureWarnings();
+
+    await expect(
+      receiveInbound({
+        routeToken: token,
+        rawBody: diagBody,
+        // The correct secret, under the default name. A fallback would answer 200 here.
+        getHeader: headersFrom({ [DEFAULT_STATIC_HEADER]: "the-secret" }),
+        base: appDb,
+        deps: cap.deps,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+
+    expect(cap.seen[0]).toMatchObject({ reason: "header_name_unusable" });
   });
 
   test("the response is identical whichever cause produced it", async () => {

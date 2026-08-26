@@ -1,5 +1,6 @@
 import {
   fitsWithinWindows,
+  localDateKey,
   type Schedule,
 } from "@/modules/business-hours/hours";
 
@@ -192,4 +193,175 @@ export function computeAggregatedSlots(input: AggregateInput): AggregateResult {
     i = j;
   }
   return { slots };
+}
+
+// The UTC offset of an instant in an IANA timezone, in ms (positive east of UTC). Lives here rather
+// than at the call site because both the blocking-calendar reader and the booking rule below need
+// "local midnight of a date", and two copies of zone math is one copy too many.
+function tzOffsetMs(at: number, tz: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(new Date(at));
+  const get = (type: string) =>
+    Number(parts.find((p) => p.type === type)?.value ?? "0");
+  const asUtc = Date.UTC(
+    get("year"),
+    get("month") - 1,
+    get("day"),
+    get("hour") % 24,
+    get("minute"),
+    get("second"),
+  );
+  return asUtc - at;
+}
+
+// The UTC instant a LOCAL wall clock names in an IANA timezone, and whether that wall clock EXISTS.
+// One refinement pass covers an offset shift between the UTC guess and the target instant, which is
+// DST-correct everywhere except the hour a spring-forward SKIPS: 02:30 on a day whose clocks jump
+// 02:00 → 03:00 is not a time, and `ms` is then the instant the shift landed on.
+//
+// The two callers want opposite things with that, which is why it is reported instead of decided
+// here. A day boundary still exists on a day that starts at 01:00, so midnight takes the instant.
+// An appointment does not: guessing which instant Google will pick for a time that does not exist
+// is the divergence between judge and store that this whole path exists to remove.
+export function zonedWallClock(
+  local: string,
+  tz: string,
+): { ms: number; exists: boolean } {
+  const utcGuess = Date.parse(`${local}Z`);
+  if (Number.isNaN(utcGuess)) return { ms: Number.NaN, exists: false };
+  const first = utcGuess - tzOffsetMs(utcGuess, tz);
+  const ms = utcGuess - tzOffsetMs(first, tz);
+  // Round trip: read `ms` back as a wall clock. A skipped hour comes back as a different one.
+  return { ms, exists: ms + tzOffsetMs(ms, tz) === utcGuess };
+}
+
+// The UTC instant of local midnight for a YYYY-MM-DD in an IANA timezone.
+export function zonedMidnightMs(date: string, tz: string): number {
+  return zonedWallClock(`${date}T00:00:00`, tz).ms;
+}
+
+// How many bookable times a refusal offers back. Enough for the model to propose a real choice,
+// small enough that the refusal stays a sentence and not a listing.
+const MAX_ALTERNATIVES = 6;
+
+export interface BookingInput extends Omit<SlotInput, "timeMin" | "timeMax"> {
+  // The requested appointment as INSTANTS, already resolved by the caller. Not the strings it
+  // received: an offset-less `dateTime` is a wall clock in the calendar's timezone, and re-parsing
+  // it here would read it in the server's instead — which is exactly the divergence the caller
+  // resolved it to avoid. One parse, at the boundary.
+  startMs: number;
+  endMs: number;
+}
+
+export interface BookingVerdict {
+  bookable: boolean;
+  // Bookable times in the same local day, nearest to the request first. Empty when the day is full
+  // or closed; that is a real answer, not a failure.
+  alternatives: Slot[];
+}
+
+// The local day containing an instant, as the range the availability read has to cover. The END is
+// widened by one SLOT, so a booking that runs past local midnight is still judged whole instead of
+// being cut by the window that was supposed to hold it. The start needs no such guard: local
+// midnight of the day holding an instant is never after it.
+//
+// One slot, not the requested span: the span is a model argument and nothing bounds it, so widening
+// by it would let a `end` years after `start` turn a one-day freeBusy query into a decades-long one
+// before anything had a chance to refuse it. A request longer than a slot is not a slot either way.
+export function bookingWindow(
+  startMs: number,
+  slotMs: number,
+  timezone: string,
+): { timeMin: string; timeMax: string } {
+  const dayStart = zonedMidnightMs(
+    localDateKey(new Date(startMs), timezone),
+    timezone,
+  );
+  // 36h from local midnight lands inside the next local day whether it is 23, 24 or 25 hours long.
+  const dayEnd = zonedMidnightMs(
+    localDateKey(new Date(dayStart + 36 * 3_600_000), timezone),
+    timezone,
+  );
+  return {
+    timeMin: new Date(dayStart).toISOString(),
+    timeMax: new Date(Math.max(dayEnd, startMs + slotMs)).toISOString(),
+  };
+}
+
+// THE RULE the write path enforces (issue #345), in one sentence: an appointment may only be written
+// on a (start, end) pair that `calendar_check_availability` would have returned for that day.
+//
+// It is expressed as membership in the generated list, not as a second copy of the four conditions
+// (service hours, slot grid, minimum lead, existing bookings). A re-implementation is how the two
+// paths drift: the write would keep honouring a rule the availability path had already changed, and
+// nothing would be red. Here there is one generator, and the write asks it a question.
+//
+// The same list is the refusal's content. A bare "not available" makes the agent apologise and stop;
+// the times it CAN offer are what lets the turn recover, and they cost nothing extra because the
+// availability read that answers the question already covers the whole day.
+export function judgeBooking(input: BookingInput): BookingVerdict {
+  const { startMs, endMs, ...slotInput } = input;
+  const window = bookingWindow(
+    startMs,
+    input.slotMinutes * 60_000,
+    input.schedule.timezone,
+  );
+  const offered = computeAvailableSlots({ ...slotInput, ...window });
+  const bookable = offered.some(
+    (s) => Date.parse(s.start) === startMs && Date.parse(s.end) === endMs,
+  );
+  if (bookable) return { bookable: true, alternatives: [] };
+  const alternatives = offered
+    .map((s) => ({ s, d: Math.abs(Date.parse(s.start) - startMs) }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, MAX_ALTERNATIVES)
+    .map((x) => x.s)
+    .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+  return { bookable: false, alternatives };
+}
+
+// Removes one interval from a busy list, splitting any interval that strictly contains it.
+//
+// It exists for the reschedule: the appointment being moved is itself busy, so judging the new time
+// against a raw freeBusy answer refuses every move as a collision with itself. Dropping the interval
+// that matches the event's hour exactly is NOT enough, because freeBusy MERGES adjacent busy blocks:
+// an appointment at 14:00-15:00 followed by another at 15:00-16:00 comes back as one 14:00-16:00
+// block, and an equality test would leave the whole fused block standing.
+//
+// Apply it to the calendar's OWN bookings only. Applied to the assembled busy list it would punch
+// the same hole through an operator closure that happens to cover the appointment's hour, which is
+// not the appointment and does not move with it. One residual is unavoidable at this resolution:
+// freeBusy carries no event identity, so an event that genuinely OVERLAPS the one being moved loses
+// coverage over the overlap. That is bounded to the span being vacated, on a calendar that was
+// already double-booked there; separating them would mean reading the events themselves, which
+// would put other customers' appointments in reach of a path that today only ever sees busy/free.
+export function subtractWindow(
+  busy: { start: string; end: string }[],
+  cut: { start: string; end: string } | null,
+): { start: string; end: string }[] {
+  if (!cut) return busy;
+  const cs = Date.parse(cut.start);
+  const ce = Date.parse(cut.end);
+  if (Number.isNaN(cs) || Number.isNaN(ce) || ce <= cs) return busy;
+  const out: { start: string; end: string }[] = [];
+  for (const b of busy) {
+    const bs = Date.parse(b.start);
+    const be = Date.parse(b.end);
+    if (Number.isNaN(bs) || Number.isNaN(be) || be <= bs) continue;
+    if (ce <= bs || cs >= be) {
+      out.push(b);
+      continue;
+    }
+    if (bs < cs) out.push({ start: b.start, end: new Date(cs).toISOString() });
+    if (ce < be) out.push({ start: new Date(ce).toISOString(), end: b.end });
+  }
+  return out;
 }
