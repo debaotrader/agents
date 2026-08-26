@@ -1,5 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import type {
+  BaseChatModel,
+  BindToolsInput,
+} from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
@@ -18,7 +21,7 @@ import {
   rebuildPlaygroundTurns,
 } from "@/modules/playground/sessions";
 import { listThreadTurnNotes } from "@/modules/playground/turn-notes";
-import { guardrailModel } from "../utils/scripted-models";
+import { guardrailModel, NudgeReplyModel } from "../utils/scripted-models";
 
 // Issue #136: the playground ran the agent's graph directly and never screened anything, so the
 // operator read a reply the customer would never have received. These tests are written against
@@ -126,9 +129,7 @@ function models(opts: {
     // Counts INVOCATIONS, not constructions. The graph is built before the input direction is
     // screened, so a counter on the factory reports one call for a turn that never ran the agent —
     // which is precisely the claim "the graph was skipped" is supposed to prove.
-    const base = new FakeListChatModel({
-      responses: [opts.emptyReply ? "" : RAW_REPLY],
-    });
+    const base = new NudgeReplyModel(opts.emptyReply ? "" : RAW_REPLY);
     const proxy: unknown = new Proxy(base, {
       get(t, prop, recv) {
         if (prop === "invoke") {
@@ -140,8 +141,22 @@ function models(opts: {
             return inner.invoke(...a);
           };
         }
-        // Keep the count alive through the bind the graph does before invoking.
-        if (prop === "bindTools") return () => proxy;
+        // Keep the count alive through the bind the graph does before invoking. Nudge simulations
+        // must retain NudgeReplyModel's structured finish_nudge call; regular turns keep the proxy.
+        if (prop === "bindTools") {
+          return (tools: BindToolsInput[]) => {
+            const bound = t.bindTools(tools);
+            if (bound === t) return proxy;
+            return {
+              async invoke(...a: unknown[]) {
+                agentInvokes += 1;
+                return (
+                  bound as { invoke: (...args: unknown[]) => unknown }
+                ).invoke(...a);
+              },
+            };
+          };
+        }
         return Reflect.get(t, prop, recv);
       },
     });

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
+import { AIMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -14,7 +14,7 @@ import {
   runPlaygroundTurn,
   toPlaygroundInvokeError,
 } from "@/modules/playground/service";
-import { UsageReportingModel } from "../utils/scripted-models";
+import { NudgeReplyModel, UsageReportingModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -48,7 +48,7 @@ let agentTools = 0n;
 let llmRef = "";
 
 const REPLY = "Oi! Sou o agente de teste.";
-const fakeModel = () => new FakeListChatModel({ responses: [REPLY] });
+const fakeModel = () => new NudgeReplyModel(REPLY);
 const deps = () => ({ makeModel: fakeModel, checkpointer: new MemorySaver() });
 function ctx(t: bigint): TenantContext {
   return { tenantId: t, userId: null, role: "TENANT_ADMIN" };
@@ -371,10 +371,68 @@ describe.skipIf(!dbUp)("playground", () => {
       agentId: agentOk,
       base: appDb,
       deps: {
-        makeModel: () => new FakeListChatModel({ responses: [""] }),
+        makeModel: () => new NudgeReplyModel(""),
         checkpointer: new MemorySaver(),
       },
     });
+    expect(r.reply).toBe("");
+    expect(r.silent).toBe(true);
+  });
+
+  test("a follow-up exposes each terminal tool once and skip remains first-write-wins", async () => {
+    let boundNames: string[] = [];
+    const model = {
+      invoke: async () => new AIMessage(""),
+      bindTools: (tools: Array<{ name: string }>) => {
+        boundNames = tools.map((candidate) => candidate.name);
+        let calls = 0;
+        return {
+          invoke: async () => {
+            calls++;
+            if (calls === 1) {
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "skip_reply",
+                    args: { reason: "already answered" },
+                    id: "call_skip",
+                  },
+                ],
+              });
+            }
+            if (calls === 2) {
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "finish_nudge",
+                    args: { action: "send", message: "must not be returned" },
+                    id: "call_finish",
+                  },
+                ],
+              });
+            }
+            return new AIMessage("");
+          },
+        };
+      },
+    };
+
+    const r = await runPlaygroundFollowup({
+      tenantId,
+      agentId: agentOk,
+      base: appDb,
+      deps: {
+        makeModel: () => model as never,
+        checkpointer: new MemorySaver(),
+      },
+    });
+
+    expect(boundNames.filter((name) => name === "skip_reply")).toHaveLength(1);
+    expect(boundNames.filter((name) => name === "finish_nudge")).toHaveLength(
+      1,
+    );
     expect(r.reply).toBe("");
     expect(r.silent).toBe(true);
   });

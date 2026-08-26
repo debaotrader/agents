@@ -6,7 +6,6 @@ import {
   expect,
   test,
 } from "bun:test";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -15,7 +14,10 @@ import { runAgentNudge } from "@/graph/nudge";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { clearContactAuthState } from "@/modules/contact-auth/state";
 import { seedChatwootInstance } from "../utils/chatwoot";
-import { PromptCapturingModel } from "../utils/scripted-models";
+import {
+  NudgeReplyModel,
+  PromptCapturingModel,
+} from "../utils/scripted-models";
 
 // The gate on the PROACTIVE side: a follow-up is a turn the agent starts, so a contact the reactive
 // gate would refuse must not be reached out to either. A refused nudge ends as "silent", before any
@@ -268,8 +270,7 @@ describe.skipIf(!dbUp)("contact authorization on the proactive nudge", () => {
       nudge: { source: "followup", kind: "inactivity" },
       base: appDb,
       deps: {
-        makeModel: () =>
-          new FakeListChatModel({ responses: ["Pagamento confirmado."] }),
+        makeModel: () => new NudgeReplyModel("Pagamento confirmado."),
         makeClient: s.makeClient,
         checkpointer: new MemorySaver(),
         persistUsage: async () => {},
@@ -306,7 +307,7 @@ describe.skipIf(!dbUp)("contact authorization on the proactive nudge", () => {
       deps: {
         makeModel: () => {
           modelBuilds += 1;
-          return new FakeListChatModel({ responses: ["não devia sair"] });
+          return new NudgeReplyModel("não devia sair");
         },
         makeClient: s.makeClient,
         checkpointer: new MemorySaver(),
@@ -366,8 +367,7 @@ describe.skipIf(!dbUp)("contact authorization on the proactive nudge", () => {
       nudge: { source: "followup", kind: "inactivity" },
       base: appDb,
       deps: {
-        makeModel: () =>
-          new FakeListChatModel({ responses: ["Oi! Tudo bem?"] }),
+        makeModel: () => new NudgeReplyModel("Oi! Tudo bem?"),
         makeClient: s.makeClient,
         checkpointer: new MemorySaver(),
         persistUsage: async () => {},

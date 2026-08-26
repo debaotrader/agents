@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildQuoteResolver,
+  classifyLastPublicMessage,
+  lastPublicMessageIsFromAgentBot,
   parseChatwootMessages,
+  parseChatwootMessagesPage,
   pendingIncoming,
   toRenderable,
 } from "@/modules/chatwoot/messages";
@@ -29,8 +32,25 @@ describe("parseChatwootMessages", () => {
       location: null,
       inReplyTo: null,
       isReaction: false,
+      senderId: null,
+      senderType: null,
     });
     expect(rows[1]?.messageType).toBe("outgoing");
+  });
+
+  test("parses sender identity used by proactive-message eligibility", () => {
+    const [row] = parseChatwootMessages({
+      payload: [
+        {
+          id: 9,
+          content: "Oi!",
+          message_type: 1,
+          sender: { id: 5, type: "agent_bot" },
+        },
+      ],
+    });
+    expect(row?.senderId).toBe(5);
+    expect(row?.senderType).toBe("agent_bot");
   });
 
   test("accepts a bare array and tolerates the webhook string form", () => {
@@ -123,6 +143,126 @@ describe("parseChatwootMessages", () => {
     expect(out).toBe(
       '<localização latitude="-23.5505" longitude="-46.6333" titulo="Padaria do Zé">',
     );
+  });
+});
+
+describe("lastPublicMessageIsFromAgentBot", () => {
+  test("allows only when the last relevant public message is from our bot", () => {
+    const messages = parseChatwootMessages({
+      payload: [
+        {
+          id: 1,
+          content: "Oi!",
+          message_type: 1,
+          sender: { id: 5, type: "agent_bot" },
+        },
+        {
+          id: 2,
+          content: "activity",
+          message_type: 2,
+          sender: { id: 7, type: "user" },
+        },
+        {
+          id: 3,
+          content: "nota",
+          message_type: 1,
+          private: true,
+          sender: { id: 7, type: "user" },
+        },
+      ],
+    });
+
+    expect(lastPublicMessageIsFromAgentBot(messages, 5)).toBe(true);
+  });
+
+  test("blocks the incident shape: contact emoji followed by a human reaction", () => {
+    const messages = parseChatwootMessages({
+      payload: [
+        {
+          id: 10,
+          content: "Tudo certo por aqui.",
+          message_type: 1,
+          sender: { id: 5, type: "agent_bot" },
+        },
+        {
+          id: 11,
+          content: "🫡",
+          message_type: 0,
+          sender: { id: 99, type: "contact" },
+        },
+        {
+          id: 12,
+          content: "👊",
+          message_type: 1,
+          content_attributes: { is_reaction: true },
+          sender: { id: 7, type: "user" },
+        },
+      ],
+    });
+
+    expect(lastPublicMessageIsFromAgentBot(messages, 5)).toBe(false);
+  });
+
+  test("fails closed for missing or malformed sender identity", () => {
+    const messages = parseChatwootMessages({
+      payload: [{ id: 1, content: "Oi!", message_type: 1 }],
+    });
+    expect(lastPublicMessageIsFromAgentBot(messages, 5)).toBe(false);
+    expect(lastPublicMessageIsFromAgentBot([], 5)).toBe(false);
+  });
+});
+
+describe("follow-up message-page attribution", () => {
+  test("rejects a malformed page instead of treating it as an empty history", () => {
+    expect(parseChatwootMessagesPage({ payload: "not-an-array" })).toBeNull();
+    expect(
+      parseChatwootMessagesPage({ payload: [{ content: "missing id" }] }),
+    ).toBeNull();
+  });
+
+  test("classifies exact bot ownership and preserves the observed message id", () => {
+    const page = parseChatwootMessagesPage({
+      payload: [
+        {
+          id: 42,
+          content: "Oi!",
+          message_type: 1,
+          sender: { id: 5, type: "agent_bot" },
+        },
+      ],
+    });
+    expect(page).not.toBeNull();
+    expect(classifyLastPublicMessage(page?.messages ?? [], 5)).toEqual({
+      kind: "ours",
+      messageId: 42,
+    });
+  });
+
+  test("treats an outgoing row without sender identity as uncertain", () => {
+    const page = parseChatwootMessagesPage({
+      payload: [{ id: 43, content: "Oi!", message_type: 1 }],
+    });
+    expect(classifyLastPublicMessage(page?.messages ?? [], 5)).toEqual({
+      kind: "unknown",
+      messageId: 43,
+    });
+  });
+
+  test("a public reaction is definitively non-bot even without sender identity", () => {
+    const page = parseChatwootMessagesPage({
+      payload: [
+        {
+          id: 44,
+          content: "👊",
+          message_type: 1,
+          content_attributes: { is_reaction: true },
+        },
+      ],
+    });
+    expect(classifyLastPublicMessage(page?.messages ?? [], 5)).toEqual({
+      kind: "other",
+      messageId: 44,
+    });
   });
 });
 

@@ -42,7 +42,6 @@ import {
   resolveGraphThreadId,
   threadBelongsToTenant,
 } from "./checkpointer";
-import { lastAssistantText } from "./graph";
 import {
   clearTurnInFlight,
   isTurnInFlight,
@@ -50,6 +49,11 @@ import {
 } from "./inflight";
 import { drainPendingIngest } from "./ingest-drain";
 import { conversationDividerMessage, nudgeMessage } from "./markers";
+import {
+  mergeNudgeDecisionTools,
+  NudgeDecisionState,
+  resolveNudgeDecision,
+} from "./nudge-decision";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -66,9 +70,7 @@ import { buildNativeTools, handoffAnsweredTheTurn } from "./tools/native";
 // neutralized) and the agent decides whether to act. Guardrails:
 //   - assignment gate: a human handling the conversation ⇒ a private note for the human, NEVER a
 //     customer message; the bot handling (pending) ⇒ the agent may message the customer;
-//   - lean-to-send default: the agent is told to follow up unless clearly unwarranted, and signals
-//     "no follow-up" with an explicit sentinel (isNudgeSilent) — NOT an empty/narrated-empty reply,
-//     which used to leak "(empty — …)" to the customer;
+//   - public output is capability-based: only a structured nudge decision may cross into Chatwoot;
 //   - re-check the live assignee at post time (a human may have taken over);
 //   - a pending interrupt ⇒ defer (do not barge into a suspended human-in-the-loop flow).
 
@@ -102,7 +104,11 @@ export type RunAgentNudgeOutcome =
   // can END here — every further step would be equally undeliverable.
   | "noted-window"
   | "silent"
+  // Model never produced a valid terminal decision (missing/invalid/truncated). Nothing was applied.
+  | "invalid-output"
   | "deferred"
+  // Caller-specific eligibility changed after generation; nothing public or deterministic was applied.
+  | "superseded"
   // NOTE: Live-state gate (requireLiveBotOwnership): the conversation is NOT bot-owned in Chatwoot right
   // now (resolved/open/snoozed or a human assigned) — nothing was posted, mirror reconciled.
   | "stale"
@@ -112,8 +118,8 @@ export type RunAgentNudgeOutcome =
   | "no-agent";
 
 // Deterministic, SYSTEM-applied side effects for a nudge (independent of what the agent says): merge
-// label(s) onto the conversation and/or resolve it. Applied on EVERY terminal path — including when
-// the agent stays silent — but only while the bot still owns the conversation (canMessagePost).
+// label(s) onto the conversation and/or resolve it. Applied only after a VALID terminal decision —
+// including an explicit skip — and only while the bot still owns the conversation (canMessagePost).
 export interface NudgePostActions {
   assignLabels?: string[];
   resolve?: boolean;
@@ -132,6 +138,9 @@ export interface RunAgentNudgeParams {
   // this; event nudges (payment received etc.) keep the mirror-only gate — for those, a private
   // note on a human-owned or even resolved conversation is still useful signal.
   requireLiveBotOwnership?: boolean;
+  // Optional caller-owned last-moment gate. Generic inactivity follow-ups use it to verify that the
+  // exact public bot message observed before generation is still the latest public message.
+  beforeDelivery?: () => Promise<"allow" | "superseded" | "unavailable">;
   base?: PrismaClient;
   deps?: RuntimeDeps;
 }
@@ -164,28 +173,6 @@ export const DATA_FENCE = "⟦external-data⟧";
 export const OUTSIDE_WINDOW_NOTE_PREFIX =
   "⏳ Fora da janela de 24h do WhatsApp: a mensagem abaixo NÃO foi enviada ao cliente. " +
   "Para reengajar fora da janela, configure um template aprovado (HSM) na aba Comportamento do agente.\n\n";
-
-// Explicit "no follow-up" signal. We ask the model to emit EXACTLY this token when a proactive
-// message isn't warranted, instead of "reply with an empty message" — models routinely NARRATE
-// their emptiness ("(empty — nothing to do yet)") instead of returning truly empty text, and that
-// non-empty narration would otherwise get posted to the customer. A distinctive sentinel is
-// detectable and is stripped before any post so it can never leak.
-export const FOLLOWUP_SKIP_SENTINEL = "[[SKIP]]";
-
-// True when the model declined to follow up: empty, the skip sentinel (tolerating wrapping quotes),
-// a bare "SKIP", or a parenthetical-only "narrated emptiness" (the failure mode that leaked before).
-export function isNudgeSilent(reply: string): boolean {
-  const trimmed = reply.trim();
-  if (!trimmed) return true;
-  const stripped = trimmed.replace(/^["'`]+|["'`]+$/g, "").trim();
-  if (stripped === FOLLOWUP_SKIP_SENTINEL) return true;
-  if (stripped.toUpperCase() === "SKIP") return true;
-  // A reply that is ONLY a parenthetical starting with empty/nothing/none (pt-BR + EN) → silence.
-  if (/^\((?:empty|vazi|nothing|none|nada|sem|n\/a)[^)]*\)$/i.test(stripped)) {
-    return true;
-  }
-  return false;
-}
 
 // External free-text is UNTRUSTED (the inbound poster controls it). Collapse control chars and
 // newlines to a single line (so it cannot forge multi-line "system" framing), drop the data fence
@@ -227,8 +214,8 @@ export function renderNudge(
     }
   }
   const directive = canMessageCustomer
-    ? `An external system event just occurred for this conversation. By default, send a brief, warm, helpful proactive message to the customer about it — keep it short and natural, in the conversation's language. Lean toward reaching out: a timely follow-up is usually welcome. Stay silent ONLY if a message would clearly be unhelpful, premature, duplicated, or annoying; in that rare case reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`
-    : `A human agent is currently handling this conversation. Do NOT message the customer. If the event is worth flagging, write a short internal note for the human; otherwise reply with EXACTLY ${FOLLOWUP_SKIP_SENTINEL} and nothing else.`;
+    ? "An external system event just occurred for this conversation. By default, prepare a brief, warm, helpful proactive message about it — keep it short and natural, in the conversation's language. Lean toward reaching out: a timely follow-up is usually welcome. Finish ONLY by calling finish_nudge with action=send and the exact single message, or action=skip when a message would clearly be unhelpful, premature, duplicated, or annoying. Never return the public message as ordinary assistant text."
+    : "A human agent is currently handling this conversation. Do NOT message the customer. If the event is worth flagging, prepare a short internal note for the human. Finish ONLY by calling finish_nudge with action=send and the exact note, or action=skip when there is nothing worth flagging. Never return the note as ordinary assistant text.";
   const parts = [
     directive,
     "",
@@ -470,9 +457,15 @@ export async function runAgentNudge(
         { ourAgentBotId: cfg.agentBotId },
       );
 
+  const nudgeDecision = new NudgeDecisionState();
   const handoffState = {
     customerMessage: null as string | null,
     completed: false,
+    onCompleted: (customerMessage: string | null) => {
+      if (customerMessage) {
+        nudgeDecision.record({ action: "send", message: customerMessage });
+      }
+    },
   };
 
   // Asked once before the send and once after moderation, which is why it is a closure and not two
@@ -644,24 +637,35 @@ export async function runAgentNudge(
     cfg = withAuthContextSection(cfg, auth.context ?? null);
   }
 
-  const tools = await buildToolset(
-    cfg,
-    {
-      tenantId,
-      instanceId,
-      base,
-      client,
-      conversationId,
-      threadId: params.threadId,
-      // NOTE: The live probe's answer where this path has one, the mirror's otherwise. resolve_conversation
-      // runs immediately on a nudge turn (no turnState), so this is what tells its close apart from
-      // one that had already happened — but only as a FALLBACK: this snapshot is taken before
-      // `graph.invoke`, and the tool fires during a model call that can run for a minute, so the
-      // tool re-reads the live state itself and falls back here only when that read fails.
-      observed: { status: loaded.status, statusAt: loaded.statusAt },
-      handoffState,
-    },
-    { buildNativeTools, mcp: params.deps?.mcp, flow },
+  const tools = mergeNudgeDecisionTools(
+    await buildToolset(
+      cfg,
+      {
+        tenantId,
+        instanceId,
+        base,
+        client,
+        conversationId,
+        threadId: params.threadId,
+        // NOTE: The live probe's answer where this path has one, the mirror's otherwise. resolve_conversation
+        // runs immediately on a nudge turn (no turnState), so this is what tells its close apart from
+        // one that had already happened — but only as a FALLBACK: this snapshot is taken before
+        // `graph.invoke`, and the tool fires during a model call that can run for a minute, so the
+        // tool re-reads the live state itself and falls back here only when that read fails.
+        observed: { status: loaded.status, statusAt: loaded.statusAt },
+        handoffState,
+      },
+      {
+        buildNativeTools: (ctx, allowed) => [
+          ...buildNativeTools(ctx, allowed).filter(
+            (candidate) => candidate.name !== "skip_reply",
+          ),
+        ],
+        mcp: params.deps?.mcp,
+        flow,
+      },
+    ),
+    nudgeDecision,
   );
 
   // 3. Model + graph + callbacks (node="nudge").
@@ -773,22 +777,36 @@ export async function runAgentNudge(
       makeModel: params.deps?.makeModel,
     })("output", text);
 
-  // What the transfer promised the customer, delivered on the way OUT of the turn — whatever the way
-  // out is. Called once on the normal path and once from the failure path, because the tool can
-  // complete the transfer and the model's next step can then throw, leaving the line in local state
-  // with nobody to deliver it and no later attempt able to: the conversation reads `open` from the
-  // moment the tool set it, so every retry stops at its own ownership gate.
-  //
-  // Returns what happened, for the caller to stamp and label, or null when there was no promise.
-  //
-  // Two call sites, and they are exclusive: the failure path always rethrows, so the normal one is
-  // unreachable after it. Anything that adds a third owns the at-most-once question, because a
-  // promise delivered twice is the duplicate #158 was about.
-  const deliverPromisedLine = async (): Promise<
-    "messaged" | "noted-window" | "silent" | null
+  const checkBeforeDelivery = async (): Promise<
+    "superseded" | "live-unavailable" | null
   > => {
-    if (!handoffAnsweredTheTurn(handoffState)) return null;
-    const line = handoffState.customerMessage;
+    if (!params.beforeDelivery) return null;
+    try {
+      const outcome = await params.beforeDelivery();
+      if (outcome === "allow") return null;
+      return outcome === "superseded" ? "superseded" : "live-unavailable";
+    } catch (err) {
+      logger.warn(
+        { err, conversationId: String(conversationId) },
+        "agentNudge: caller delivery gate failed — failing closed",
+      );
+      return "live-unavailable";
+    }
+  };
+
+  // A completed handoff may supply the structured customer line for this turn. It is delivered only
+  // after graph completion and terminal-decision validation; graph errors fail closed.
+  const deliverPromisedLine = async (
+    line: string,
+  ): Promise<
+    | "messaged"
+    | "noted-window"
+    | "silent"
+    | "superseded"
+    | "live-unavailable"
+    | null
+  > => {
+    if (!handoffState.completed) return null;
     // Outside the window a free-form send is the one the provider refuses, and an approved template
     // says nothing about a transfer, so neither reaches the customer. The operator gets the sentence
     // instead, explained, like any other proactive text that could not be sent.
@@ -798,6 +816,8 @@ export async function runAgentNudge(
     // needs to read is what the transfer promised. A judge that objected to it has already said so,
     // in its own note on this same conversation.
     const noteOutsideWindow = async () => {
+      const gated = await checkBeforeDelivery();
+      if (gated) return gated;
       await client.sendPrivateNote(
         conversationId,
         `${OUTSIDE_WINDOW_NOTE_PREFIX}${line}`,
@@ -811,9 +831,21 @@ export async function runAgentNudge(
       // against 24 hours except at the boundary, and the boundary is exactly where a follow-up
       // chasing a customer who has gone quiet tends to land.
       if (sendModeNow() !== "freeform") return await noteOutsideWindow();
-      const line2 = screenedText(await screenOutput(line), line);
-      if (line2 === null) return "silent";
+      const guardrailDecision = await screenOutput(line);
+      // Reactive/customer-requested replies retain the shared guardrail's fail-open policy. A
+      // proactive handoff line does not: the transfer already happened and this is the last point
+      // where raw model text could cross without a successful screening.
+      if (guardrailDecision.kind === "unavailable") {
+        return "live-unavailable";
+      }
+      const line2 = screenedText(guardrailDecision, line);
+      if (line2 === null) {
+        const gated = await checkBeforeDelivery();
+        return gated ?? "silent";
+      }
       if (sendModeNow() !== "freeform") return await noteOutsideWindow();
+      const gated = await checkBeforeDelivery();
+      if (gated) return gated;
       await client.sendMessage(conversationId, line2);
       logger.info(
         "agentNudge handed off: conv=%s source=%s",
@@ -822,9 +854,8 @@ export async function runAgentNudge(
       );
       return "messaged";
     } catch (e) {
-      // Best-effort, the semantics the line had while the tool sent it. No later attempt can deliver
-      // it, and throwing would only cost the operator an alert on a thread that was correctly handed
-      // to a human — and on the failure path it must never mask the error that ended the turn.
+      // The transfer already happened, but failed screening/delivery is still not a successful turn:
+      // expose a retryable fail-closed outcome and do not let deterministic post-actions run.
       logger.warn(
         "agentNudge handoff closing line failed to deliver (conv=%s): %s",
         String(conversationId),
@@ -837,12 +868,7 @@ export async function runAgentNudge(
         detail: { outcome: "handoff_closing_line_undelivered" },
         errorMessage: e instanceof Error ? e.message : String(e),
       });
-      // "silent" and not "messaged", because the caller stamps this on the turn trail as an `ok`
-      // row: "messaged" here would tell the operator a sentence reached the customer on the one
-      // path where it demonstrably did not. The union has no member for "tried and failed", and
-      // it does not need one — the error row emitted just above is that record, and "silent" is
-      // already this function's answer for "the customer received nothing from the promise".
-      return "silent";
+      return "live-unavailable";
     }
   };
 
@@ -968,36 +994,50 @@ export async function runAgentNudge(
     // node already prepends the one-and-only system prompt, and a second system message in the thread
     // makes strict providers (Google) reject the call ("System messages are only permitted as the
     // first passed message"). The renderNudge directive + data fence read fine as a human trigger.
-    // The catch is what keeps a handoff's promise from dying with a throw from INSIDE the graph:
-    // the tool can complete the transfer and the model's next step can then fail. The label and the
-    // follow-up stamp are deliberately NOT applied there — the turn failed, and the only thing that
-    // cannot wait for a retry is the sentence the customer was promised.
-    result = await graph
-      .invoke(
-        {
-          messages: [
-            nudgeMessage(
-              renderNudge(params.nudge, canMessagePre),
-              conversationId,
-            ),
-          ],
-        },
-        invokeConfig,
-      )
-      .catch(async (e) => {
-        await deliverPromisedLine();
-        throw e;
-      });
+    result = await graph.invoke(
+      {
+        messages: [
+          nudgeMessage(
+            renderNudge(params.nudge, canMessagePre),
+            conversationId,
+          ),
+        ],
+      },
+      invokeConfig,
+    );
   } finally {
     if (claimedGraphThread) clearTurnInFlight(graphThreadId);
   }
-  // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
-  // stray sentinel occurrence from a real reply so it can't leak into the customer message.
-  const replyRaw = lastAssistantText(result.messages);
-  const silent = isNudgeSilent(replyRaw);
-  const reply = silent
-    ? ""
-    : replyRaw.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+  // A completed handoff records its customerMessage at the instant the transfer completes. This
+  // fallback is defensive for a hand-built/legacy state, but may only fill an empty terminal state:
+  // a finish_nudge/skip_reply that happened first remains terminal and cannot be overwritten.
+  if (handoffAnsweredTheTurn(handoffState) && nudgeDecision.decision === null) {
+    nudgeDecision.record({
+      action: "send",
+      message: handoffState.customerMessage,
+    });
+  }
+  const outputDecision = resolveNudgeDecision(nudgeDecision, result.messages);
+  if (outputDecision === null) {
+    logger.warn(
+      { conversationId: String(conversationId), source: params.nudge.source },
+      "agentNudge: missing, invalid, or truncated terminal output — failing closed",
+    );
+    emitFlowEvent(flow, {
+      stage: "generate",
+      status: "ok",
+      level: "warn",
+      detail: {
+        trigger: params.nudge.source,
+        outcome: "invalid-output",
+        invalidOutput: true,
+        ...(params.nudge.step != null ? { step: params.nudge.step } : {}),
+      },
+    });
+    return "invalid-output";
+  }
+  const silent = outputDecision.action === "skip";
+  const reply = outputDecision.action === "send" ? outputDecision.message : "";
 
   // 5. Re-check ownership at post time (a human may have taken over during model execution). Needed
   // for BOTH the customer message AND the deterministic post-actions. The live-gated path re-probes
@@ -1012,7 +1052,7 @@ export async function runAgentNudge(
   // so every retry path stops at its own ownership gate. "Never message over a human" is the rule
   // these checks exist for, and it does not reach the one conversation we just handed to one. Every
   // OTHER kind of proactive text is still decided by them.
-  const handedOff = handoffAnsweredTheTurn(handoffState);
+  const handedOff = handoffState.completed;
 
   let canMessagePost: boolean;
   if (handedOff) {
@@ -1041,8 +1081,11 @@ export async function runAgentNudge(
   // applies here: there is no silence to respect (the transfer spoke for this turn), and no
   // ownership left to protect (we are the ones who just handed the conversation over). It does
   // respect the 24h service window, which the tool's own send used to walk straight past.
-  const promised = await deliverPromisedLine();
+  const promised = handedOff && reply ? await deliverPromisedLine(reply) : null;
   if (promised) {
+    if (promised === "superseded" || promised === "live-unavailable") {
+      return promised;
+    }
     if (promised !== "silent") markFollowUp(promised);
     await applyPostActions({ canMessage: canMessagePost });
     return promised;
@@ -1053,6 +1096,8 @@ export async function runAgentNudge(
   if (silent || !reply) {
     // Keyed on the TRANSFER, not on the suppression: a conversation the human queue now owns is not
     // ours to close, even when the closing line never made it out.
+    const gated = await checkBeforeDelivery();
+    if (gated) return gated;
     await applyPostActions({ canMessage: canMessagePost });
     return "silent";
   }
@@ -1126,6 +1171,8 @@ export async function runAgentNudge(
     }
 
     if (screened === null) {
+      const gated = await checkBeforeDelivery();
+      if (gated) return gated;
       await applyPostActions({ canMessage: canMessagePost });
       return "silent";
     }
@@ -1135,6 +1182,8 @@ export async function runAgentNudge(
     // where the reply can still fall through to the template/note branch below instead of being
     // lost to that rejection — on the handoff path, permanently.
     if (canMessagePost && sendModeNow() === "freeform") {
+      const gated = await checkBeforeDelivery();
+      if (gated) return gated;
       await client.sendMessage(conversationId, screened);
       logger.info(
         "agentNudge messaged: conv=%s source=%s",
@@ -1157,6 +1206,8 @@ export async function runAgentNudge(
         cfg.contactName,
       );
       if (payload) {
+        const gated = await checkBeforeDelivery();
+        if (gated) return gated;
         await client.sendTemplate(conversationId, payload);
         logger.info(
           "agentNudge templated (outside 24h window): conv=%s source=%s template=%s",
@@ -1172,6 +1223,8 @@ export async function runAgentNudge(
     // Outside the window with no usable template → leave the intended message as an internal note,
     // EXPLAINED (pt-BR, same register as the test-mode/out-of-hours notices): an unexplained yellow
     // note reads as a bug to the operator (community post "Followup indo como conversa privada").
+    const gated = await checkBeforeDelivery();
+    if (gated) return gated;
     await client.sendPrivateNote(
       conversationId,
       `${OUTSIDE_WINDOW_NOTE_PREFIX}${reply}`,
@@ -1185,6 +1238,8 @@ export async function runAgentNudge(
     await applyPostActions({ canMessage: canMessagePost, allowResolve: false });
     return "noted-window";
   }
+  const gated = await checkBeforeDelivery();
+  if (gated) return gated;
   await client.sendPrivateNote(conversationId, reply);
   logger.info(
     "agentNudge noted: conv=%s source=%s",

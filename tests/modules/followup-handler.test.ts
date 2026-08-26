@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
+import { AIMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -48,14 +48,63 @@ const CHATWOOT_INBOX_ID = 42;
 const REPLY = "Olá! Posso ajudar?";
 
 function fakeModel() {
-  return new FakeListChatModel({ responses: [REPLY] });
+  return terminalNudgeModel(REPLY);
 }
 
-function stubClient(over: { liveMeta?: Record<string, unknown> } = {}) {
+function terminalNudgeModel(message: string) {
+  return {
+    invoke: async () => new AIMessage(message),
+    bindTools: () => {
+      let decided = false;
+      return {
+        invoke: async () => {
+          if (decided) return new AIMessage("");
+          decided = true;
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              message
+                ? {
+                    name: "finish_nudge",
+                    args: { action: "send", message },
+                    id: "call_finish_nudge",
+                  }
+                : {
+                    name: "finish_nudge",
+                    args: { action: "skip" },
+                    id: "call_finish_nudge",
+                  },
+            ],
+          });
+        },
+      };
+    },
+  } as never;
+}
+
+function invalidNudgeModel() {
+  return {
+    invoke: async () => new AIMessage("internal reasoning"),
+    bindTools: () => ({
+      invoke: async () => new AIMessage("internal reasoning"),
+    }),
+  } as never;
+}
+
+function stubClient(
+  over: {
+    liveMeta?: Record<string, unknown>;
+    messages?:
+      | unknown
+      | ((call: number, opts?: { before?: number }) => unknown);
+    messagesError?: Error;
+  } = {},
+) {
   const sent: Array<[number, string]> = [];
   const notes: Array<[number, string]> = [];
   const labelSets: string[][] = [];
   const resolved: number[] = [];
+  let messageCalls = 0;
   let currentLabels: string[] = [];
   const client = {
     // NOTE: `liveMeta` lets a test make the LIVE state (the requireLiveBotOwnership probe) agree
@@ -65,6 +114,28 @@ function stubClient(over: { liveMeta?: Record<string, unknown> } = {}) {
       status: "pending",
       meta: over.liveMeta ?? {},
     }),
+    getMessages: async (
+      _conversationId: number,
+      opts?: { before?: number },
+    ) => {
+      messageCalls++;
+      if (over.messagesError) throw over.messagesError;
+      return (
+        (typeof over.messages === "function"
+          ? over.messages(messageCalls, opts)
+          : over.messages) ?? {
+          payload: [
+            {
+              id: 1,
+              content: "Posso ajudar?",
+              message_type: 1,
+              private: false,
+              sender: { id: 5, type: "agent_bot" },
+            },
+          ],
+        }
+      );
+    },
     sendMessage: async (c: number, t: string) => {
       sent.push([c, t]);
       return {};
@@ -84,7 +155,14 @@ function stubClient(over: { liveMeta?: Record<string, unknown> } = {}) {
       return {};
     },
   } as unknown as ChatwootClient;
-  return { sent, notes, labelSets, resolved, makeClient: async () => client };
+  return {
+    sent,
+    notes,
+    labelSets,
+    resolved,
+    messageCalls: () => messageCalls,
+    makeClient: async () => client,
+  };
 }
 
 function threadOf(convId: number) {
@@ -329,6 +407,290 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     expect((wm as Date).getTime()).toBeGreaterThan(followedUp.getTime());
   });
 
+  test("contact emoji followed by a human reaction blocks before the model", async () => {
+    await seedConversation(1012, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({
+      messages: {
+        payload: [
+          {
+            id: 10,
+            content: "Tudo certo por aqui.",
+            message_type: 1,
+            sender: { id: 5, type: "agent_bot" },
+          },
+          {
+            id: 11,
+            content: "🫡",
+            message_type: 0,
+            sender: { id: 99, type: "contact" },
+          },
+          {
+            id: 12,
+            content: "👊",
+            message_type: 1,
+            content_attributes: { is_reaction: true },
+            sender: { id: 7, type: "user" },
+          },
+        ],
+      },
+    });
+    let modelCalls = 0;
+
+    const result = await followUpHandler(jobFor(1012), appDb, {
+      makeModel: () => {
+        modelCalls++;
+        return terminalNudgeModel("não deve sair");
+      },
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result).toEqual({ outcome: "done" });
+    expect(modelCalls).toBe(0);
+    expect(s.sent).toEqual([]);
+    expect(await lastFollowUpOf(1012)).not.toBeNull();
+  });
+
+  test("message-author lookup failure retries the same step before the model", async () => {
+    await seedConversation(1014, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({ messagesError: new Error("history unavailable") });
+    let modelCalls = 0;
+
+    const result = await followUpHandler(jobFor(1014), appDb, {
+      makeModel: () => {
+        modelCalls++;
+        return terminalNudgeModel("não deve sair");
+      },
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result.outcome).toBe("reschedule");
+    if (result.outcome === "reschedule") {
+      expect(result.payload).toMatchObject({
+        threadId: threadOf(1014),
+        nudgeRetries: 1,
+      });
+    }
+    expect(modelCalls).toBe(0);
+    expect(s.sent).toEqual([]);
+    expect(await lastFollowUpOf(1014)).toBeNull();
+  });
+
+  test("invalid model output retries without stamping the episode", async () => {
+    await seedConversation(1019, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient();
+
+    const result = await followUpHandler(jobFor(1019), appDb, {
+      makeModel: () => invalidNudgeModel(),
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result.outcome).toBe("reschedule");
+    if (result.outcome === "reschedule") {
+      expect(result.payload).toMatchObject({
+        threadId: threadOf(1019),
+        nudgeRetries: 1,
+      });
+    }
+    expect(await lastFollowUpOf(1019)).toBeNull();
+    expect(s.sent).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  test("message-author lookup stamps the episode when retries are exhausted", async () => {
+    await seedConversation(1015, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({ messagesError: new Error("history unavailable") });
+    const job = jobFor(1015);
+    job.payload = { ...job.payload, nudgeRetries: 7 };
+
+    const result = await followUpHandler(job, appDb, {
+      makeModel: () => terminalNudgeModel("não deve sair"),
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent).toEqual([]);
+    expect(await lastFollowUpOf(1015)).not.toBeNull();
+  });
+
+  test("message-author lookup pages past activity and private-note-only pages", async () => {
+    await seedConversation(1016, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({
+      messages: (_call: number, opts?: { before?: number }) =>
+        opts?.before == null
+          ? {
+              payload: [
+                {
+                  id: 31,
+                  content: "activity",
+                  message_type: 2,
+                  sender: { id: 7, type: "user" },
+                },
+                {
+                  id: 30,
+                  content: "nota",
+                  message_type: 1,
+                  private: true,
+                  sender: { id: 7, type: "user" },
+                },
+              ],
+            }
+          : {
+              payload: [
+                {
+                  id: 20,
+                  content: "Posso ajudar?",
+                  message_type: 1,
+                  private: false,
+                  sender: { id: 5, type: "agent_bot" },
+                },
+              ],
+            },
+    });
+
+    const result = await followUpHandler(jobFor(1016), appDb, {
+      makeModel: fakeModel,
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.sent).toEqual([[1016, REPLY]]);
+    expect(s.messageCalls()).toBeGreaterThanOrEqual(4);
+  });
+
+  test("message-author lookup fails closed when the bounded lookback is exhausted", async () => {
+    await seedConversation(1018, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({
+      messages: (call: number) => ({
+        payload: [
+          {
+            id: 100 - call,
+            content: "activity",
+            message_type: 2,
+            sender: { id: 7, type: "user" },
+          },
+        ],
+      }),
+    });
+    let modelCalls = 0;
+
+    const result = await followUpHandler(jobFor(1018), appDb, {
+      makeModel: () => {
+        modelCalls++;
+        return terminalNudgeModel("não deve sair");
+      },
+      makeClient: s.makeClient,
+      checkpointer: new MemorySaver(),
+      persistUsage: async () => {},
+    });
+
+    expect(result.outcome).toBe("reschedule");
+    expect(modelCalls).toBe(0);
+    expect(s.messageCalls()).toBe(5);
+    expect(s.sent).toEqual([]);
+    expect(await lastFollowUpOf(1018)).toBeNull();
+  });
+
+  test("contact reply during generation blocks public delivery and post-actions", async () => {
+    await setAgentSteps([
+      {
+        delayValue: 1,
+        delayUnit: "minutes",
+        instructions: "",
+        assignLabel: "sem-resposta",
+        resolve: true,
+      },
+    ]);
+    await seedConversation(1017, {
+      lastInboundAt: new Date(Date.now() - 5 * 60_000),
+      lastFollowUpAt: null,
+    });
+    const s = stubClient({
+      messages: (call: number) => ({
+        payload:
+          call === 1
+            ? [
+                {
+                  id: 50,
+                  content: "Posso ajudar?",
+                  message_type: 1,
+                  private: false,
+                  sender: { id: 5, type: "agent_bot" },
+                },
+              ]
+            : [
+                {
+                  id: 50,
+                  content: "Posso ajudar?",
+                  message_type: 1,
+                  private: false,
+                  sender: { id: 5, type: "agent_bot" },
+                },
+                {
+                  id: 51,
+                  content: "🫡",
+                  message_type: 0,
+                  private: false,
+                  sender: { id: 99, type: "contact" },
+                },
+              ],
+      }),
+    });
+    let modelCalls = 0;
+    let result: Awaited<ReturnType<typeof followUpHandler>> | undefined;
+    try {
+      result = await followUpHandler(jobFor(1017), appDb, {
+        makeModel: () => {
+          modelCalls++;
+          return terminalNudgeModel("Ainda precisa de ajuda?");
+        },
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      });
+    } finally {
+      await setAgentSteps([
+        { delayValue: 1, delayUnit: "minutes", instructions: "" },
+      ]);
+    }
+
+    expect(result).toEqual({ outcome: "done" });
+    expect(modelCalls).toBe(1);
+    expect(s.sent).toEqual([]);
+    expect(s.notes).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+    expect(await lastFollowUpOf(1017)).not.toBeNull();
+  });
+
   test("(c) watermark is written even when nudge silences (no message sent)", async () => {
     // Use a model that replies with an empty string → runAgentNudge silences.
     await seedConversation(1003, {
@@ -337,7 +699,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     });
     const s = stubClient();
     await followUpHandler(jobFor(1003), appDb, {
-      makeModel: () => new FakeListChatModel({ responses: [""] }),
+      makeModel: () => terminalNudgeModel(""),
       makeClient: s.makeClient,
       checkpointer: new MemorySaver(),
       persistUsage: async () => {},
@@ -449,7 +811,7 @@ describe.skipIf(!dbUp)("followUpHandler — watermark guard", () => {
     });
     const s = stubClient();
     const result = await followUpHandler(jobFor(1008, 1), appDb, {
-      makeModel: () => new FakeListChatModel({ responses: [""] }), // silent
+      makeModel: () => terminalNudgeModel(""), // silent
       makeClient: s.makeClient,
       checkpointer: new MemorySaver(),
       persistUsage: async () => {},

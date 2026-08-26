@@ -7,12 +7,13 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { lastAssistantText } from "@/graph/graph";
 import type { ResolvedModelConfig } from "@/graph/models";
+import type { AgentNudge } from "@/graph/nudge";
+import { renderNudge } from "@/graph/nudge";
 import {
-  type AgentNudge,
-  FOLLOWUP_SKIP_SENTINEL,
-  isNudgeSilent,
-  renderNudge,
-} from "@/graph/nudge";
+  mergeNudgeDecisionTools,
+  NudgeDecisionState,
+  resolveNudgeDecision,
+} from "@/graph/nudge-decision";
 import {
   type AgentConfig,
   type AgentConfigOverrides,
@@ -296,6 +297,7 @@ async function buildPlaygroundGraph(params: {
     dropped: number;
     tokens: number;
   }) => void;
+  nudgeDecision?: NudgeDecisionState;
 }) {
   const { tenantId, agentId, threadId, base } = params;
   const loaded = await loadPlaygroundConfig({
@@ -312,7 +314,15 @@ async function buildPlaygroundGraph(params: {
     deps: params.deps,
   });
   const toolMocks = params.overrides?.toolMocks;
-  const tools = applyToolMocks(rawTools, toolMocks);
+  const mockedTools = applyToolMocks(rawTools, toolMocks);
+  const seen = new Set<string>();
+  const tools = params.nudgeDecision
+    ? mergeNudgeDecisionTools(mockedTools, params.nudgeDecision)
+    : mockedTools.filter((candidate) => {
+        if (seen.has(candidate.name)) return false;
+        seen.add(candidate.name);
+        return true;
+      });
   // Trace labels: which tool names are mocked (operator) vs simulated (conversation natives that the
   // agent actually has, minus any the operator mocked — the mock takes precedence).
   const mockedNames = new Set(Object.keys(toolMocks ?? {}));
@@ -762,6 +772,7 @@ export async function runPlaygroundFollowup(
 
   // One id correlates the tool-call logs and the Langfuse trace for this simulated follow-up.
   const turnId = crypto.randomUUID();
+  const nudgeDecision = new NudgeDecisionState();
   // Flow telemetry tagged source=playground (never pages an alert channel, stays out of the
   // dashboard) so the simulated follow-up's tool calls show up in the Logs page (item 3). Built
   // before the graph because the graph's retry callback writes to it.
@@ -782,6 +793,7 @@ export async function runPlaygroundFollowup(
       deps: params.deps,
       overrides: params.overrides,
       turnId,
+      nudgeDecision,
       onModelRetry: ({ attempt }) =>
         emitFlowEvent(flow, {
           stage: "generate",
@@ -845,13 +857,9 @@ export async function runPlaygroundFollowup(
     if (e instanceof AppError) throw e;
     throw toPlaygroundInvokeError(e);
   }
-  // Same silence contract as production (runAgentNudge): the skip sentinel / narrated-emptiness is
-  // "stayed silent", and a stray sentinel is stripped so it never shows in the simulated reply.
-  const replyRaw = lastAssistantText(result.messages);
-  const silentByChoice = isNudgeSilent(replyRaw);
-  const drafted = silentByChoice
-    ? ""
-    : replyRaw.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+  // Same capability boundary as production: only finish_nudge/skip_reply state is renderable.
+  const decision = resolveNudgeDecision(nudgeDecision, result.messages);
+  const drafted = decision?.action === "send" ? decision.message : "";
   // OUTPUT direction only, exactly as the inbox's proactive path (issue #160): a follow-up answers
   // no question, so there is no customer message for the relevance check to judge, and the gate
   // drops that check structurally when none is passed. A `silent` verdict reads as silence here for

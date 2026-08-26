@@ -13,6 +13,12 @@ import {
   parseSchedule,
 } from "@/modules/business-hours/hours";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
+import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { loadAgentBot, loadChatwootClient } from "@/modules/chatwoot/instance";
+import {
+  classifyLastPublicMessage,
+  parseChatwootMessagesPage,
+} from "@/modules/chatwoot/messages";
 import { isFollowUpLive } from "@/modules/followups/eligibility";
 import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
@@ -51,9 +57,43 @@ const NUDGE_RETRY_BACKOFF_MS = 900_000;
 // posting — dead-lettering alone would loop, because the sweep re-enqueues any conversation with
 // no stamp; the stamp keeps it away until the customer speaks again (which starts a new episode).
 const NUDGE_RETRY_LIMIT = 8;
+const LAST_PUBLIC_LOOKBACK_PAGES = 5;
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
+}
+
+type LatestPublicAuthor =
+  | { kind: "ours"; messageId: number }
+  | { kind: "other"; messageId: number }
+  | { kind: "unknown" };
+
+async function latestPublicAuthor(
+  client: ChatwootClient,
+  conversationId: number,
+  agentBotId: number,
+): Promise<LatestPublicAuthor> {
+  let before: number | undefined;
+  for (let pageIndex = 0; pageIndex < LAST_PUBLIC_LOOKBACK_PAGES; pageIndex++) {
+    const page = parseChatwootMessagesPage(
+      await client.getMessages(
+        conversationId,
+        before === undefined ? undefined : { before },
+      ),
+    );
+    if (!page) return { kind: "unknown" };
+    const attribution = classifyLastPublicMessage(page.messages, agentBotId);
+    if (attribution.kind !== "none" && attribution.kind !== "unknown") {
+      return attribution;
+    }
+    if (attribution.kind === "unknown") return { kind: "unknown" };
+    const nextBefore = page.oldestMessageId;
+    if (nextBefore === null || (before !== undefined && nextBefore >= before)) {
+      return { kind: "unknown" };
+    }
+    before = nextBefore;
+  }
+  return { kind: "unknown" };
 }
 
 async function sweepHandler(
@@ -292,7 +332,13 @@ export async function followUpHandler(
           select: { windows: true, exceptions: true, timezone: true },
         })
       : null;
-    return { conv, followUpCfg, hours, armedAt: agent.followUpArmedAt };
+    return {
+      conv,
+      followUpCfg,
+      hours,
+      armedAt: agent.followUpArmedAt,
+      agentId: inbox.agentId,
+    };
   });
   if (!ctx) return { outcome: "done" };
 
@@ -326,6 +372,37 @@ export async function followUpHandler(
   const step = steps[stepIndex];
   if (!step) return { outcome: "done" };
   const isLast = stepIndex === steps.length - 1;
+
+  const stampEpisode = () =>
+    runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.conversation.update({
+        where: { id: ctx.conv.id },
+        data: { lastFollowUpAt: new Date() },
+      }),
+    );
+  const retryOrAbandon = async (reason: string): Promise<JobResult> => {
+    const priorRetries =
+      typeof job.payload.nudgeRetries === "number" &&
+      Number.isInteger(job.payload.nudgeRetries)
+        ? job.payload.nudgeRetries
+        : 0;
+    if (priorRetries + 1 >= NUDGE_RETRY_LIMIT) {
+      logger.warn(
+        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
+        stepIndex,
+        priorRetries + 1,
+        reason,
+        threadId,
+      );
+      await stampEpisode();
+      return { outcome: "done" };
+    }
+    return {
+      outcome: "reschedule",
+      runAt: new Date(Date.now() + NUDGE_RETRY_BACKOFF_MS),
+      payload: { ...job.payload, nudgeRetries: priorRetries + 1 },
+    };
+  };
 
   const { lastFollowUpAt, lastInboundAt, lastEventAt } = ctx.conv;
 
@@ -404,6 +481,70 @@ export async function followUpHandler(
     };
   }
 
+  // A generic inactivity follow-up exists only while OUR Agent Bot still owns the unanswered last
+  // public turn. The mirror timestamps cannot distinguish a contact emoji from a bot message, nor a
+  // human reaction from an activity row, so inspect the current Chatwoot page before spending model
+  // tokens. Unknown identity, malformed payload, or a failed GET all fail closed. Appointment
+  // reminders and channel redirects deliberately do not use this gate; they have different semantics.
+  let bot: NonNullable<Awaited<ReturnType<typeof loadAgentBot>>>;
+  let client: ChatwootClient;
+  let observedMessageId: number;
+  try {
+    const loadedBot = await loadAgentBot(
+      tenantId,
+      instanceId,
+      ctx.agentId,
+      base,
+    );
+    if (!loadedBot) return retryOrAbandon("author-unavailable");
+    bot = loadedBot;
+    client = await loadChatwootClient(tenantId, instanceId, {
+      base,
+      makeClient: deps?.makeClient,
+      botToken: bot.accessToken,
+    });
+    const author = await latestPublicAuthor(
+      client,
+      conversationId,
+      bot.chatwootAgentBotId,
+    );
+    if (author.kind === "other") {
+      await stampEpisode();
+      return { outcome: "done" };
+    }
+    if (author.kind === "unknown") {
+      return retryOrAbandon("author-unavailable");
+    }
+    observedMessageId = author.messageId;
+  } catch (err) {
+    logger.warn(
+      { err, conversationId: String(conversationId) },
+      "followUpHandler: could not verify last public author — failing closed",
+    );
+    return retryOrAbandon("author-unavailable");
+  }
+
+  const beforeDelivery = async () => {
+    try {
+      const author = await latestPublicAuthor(
+        client,
+        conversationId,
+        bot.chatwootAgentBotId,
+      );
+      if (author.kind === "unknown") return "unavailable" as const;
+      if (author.kind === "ours" && author.messageId === observedMessageId) {
+        return "allow" as const;
+      }
+      return "superseded" as const;
+    } catch (err) {
+      logger.warn(
+        { err, conversationId: String(conversationId) },
+        "followUpHandler: last public author changed or could not be rechecked",
+      );
+      return "unavailable" as const;
+    }
+  };
+
   const idleMin = lastEventAt
     ? Math.round((Date.now() - lastEventAt.getTime()) / 60_000)
     : stepDelayMinutes(step);
@@ -430,6 +571,7 @@ export async function followUpHandler(
     // be stale forever (a lost resolve webhook has no reconciliation), and following up a resolved
     // conversation was the community-reported incident this gate exists for.
     requireLiveBotOwnership: true,
+    beforeDelivery,
     base,
     deps,
   });
@@ -437,47 +579,24 @@ export async function followUpHandler(
   // NOTE: Live gate: the conversation is no longer bot-owned in Chatwoot (resolved / human took over) —
   // the episode is moot. No watermark, no next step; the reconciled mirror keeps the sweep away.
   if (nudgeOutcome === "stale") return { outcome: "done" };
-  // NOTE: Nothing was posted: the live-state GET failed (fail-closed) or a pending human-in-the-loop
-  // interrupt deferred the nudge. Retry the SAME step later instead of stamping a follow-up that
-  // never happened — but bounded (NUDGE_RETRY_LIMIT): on exhaustion, abandon the episode with a
-  // stamp so the sweep stays away until the customer speaks again.
-  if (nudgeOutcome === "live-unavailable" || nudgeOutcome === "deferred") {
-    const priorRetries =
-      typeof job.payload.nudgeRetries === "number" &&
-      Number.isInteger(job.payload.nudgeRetries)
-        ? job.payload.nudgeRetries
-        : 0;
-    if (priorRetries + 1 >= NUDGE_RETRY_LIMIT) {
-      logger.warn(
-        "followUpHandler: giving up on step %d after %d %s retries (thread=%s) — stamping without posting",
-        stepIndex,
-        priorRetries + 1,
-        nudgeOutcome,
-        threadId,
-      );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
-      return { outcome: "done" };
-    }
-    return {
-      outcome: "reschedule",
-      runAt: new Date(Date.now() + NUDGE_RETRY_BACKOFF_MS),
-      payload: { ...job.payload, nudgeRetries: priorRetries + 1 },
-    };
+  if (nudgeOutcome === "superseded") {
+    await stampEpisode();
+    return { outcome: "done" };
+  }
+  // NOTE: Nothing was posted: live state/screening was unavailable, a pending human-in-the-loop
+  // interrupt deferred the nudge, or the model produced no valid terminal decision. Retry the SAME
+  // step instead of stamping success — bounded by NUDGE_RETRY_LIMIT, then abandon with a stamp.
+  if (
+    nudgeOutcome === "live-unavailable" ||
+    nudgeOutcome === "deferred" ||
+    nudgeOutcome === "invalid-output"
+  ) {
+    return retryOrAbandon(nudgeOutcome);
   }
 
   // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
   // cadence anchors here and the episode-interruption check works.
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
-    db.conversation.update({
-      where: { id: ctx.conv.id },
-      data: { lastFollowUpAt: new Date() },
-    }),
-  );
+  await stampEpisode();
 
   // NOTE: The outside-window fallback note ENDS the sequence: with no usable template, every further step
   // would be equally undeliverable (only a customer reply reopens the 24h window, and that reply

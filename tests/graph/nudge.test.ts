@@ -6,7 +6,7 @@ import {
   HumanMessage,
 } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
+import { FakeListChatModel as LangChainFakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -21,8 +21,6 @@ import {
   stampedConversationId,
 } from "@/graph/markers";
 import {
-  FOLLOWUP_SKIP_SENTINEL,
-  isNudgeSilent,
   OUTSIDE_WINDOW_NOTE_PREFIX,
   parseThreadId,
   renderNudge,
@@ -36,10 +34,53 @@ import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
   guardrailModel,
+  HandoffThenNudgeDecisionModel,
   HandoffThenReplyModel,
   HandoffThenThrowModel,
+  NudgeDecisionThenHandoffModel,
   ResolveThenReplyModel,
+  SkipThenReplyModel,
 } from "../utils/scripted-models";
+
+// Most integration cases are about gates around a valid nudge message. This adapter makes their
+// existing string fixtures exercise the new capability boundary by issuing finish_nudge once.
+class FakeListChatModel extends LangChainFakeListChatModel {
+  override bindTools(tools: unknown[]) {
+    if (
+      !tools.some(
+        (candidate) => (candidate as { name?: string }).name === "finish_nudge",
+      )
+    ) {
+      return super.bindTools(tools as never);
+    }
+    let decided = false;
+    return {
+      invoke: async (input: unknown, options?: unknown) => {
+        if (decided) return new AIMessage("");
+        const response = await this.invoke(input as never, options as never);
+        decided = true;
+        const text =
+          typeof response.content === "string" ? response.content.trim() : "";
+        return new AIMessage({
+          content: "",
+          tool_calls: [
+            text
+              ? {
+                  name: "finish_nudge",
+                  args: { action: "send", message: text },
+                  id: "call_finish_nudge",
+                }
+              : {
+                  name: "finish_nudge",
+                  args: { action: "skip" },
+                  id: "call_finish_nudge",
+                },
+          ],
+        });
+      },
+    } as never;
+  }
+}
 
 describe("renderNudge (prompt-injection boundary)", () => {
   test("directive comes first and is authoritative", () => {
@@ -49,12 +90,13 @@ describe("renderNudge (prompt-injection boundary)", () => {
     expect(out).toContain("UNTRUSTED external event data");
   });
 
-  test("leans toward sending and signals no-follow-up via the sentinel (not 'empty')", () => {
+  test("requires a structured terminal decision instead of free-form output", () => {
     const out = renderNudge({ source: "followup", kind: "inactivity" }, true);
-    expect(out).toContain(FOLLOWUP_SKIP_SENTINEL);
+    expect(out).toContain("finish_nudge");
+    expect(out).toContain("action=send");
+    expect(out).toContain("action=skip");
     expect(out.toLowerCase()).toContain("by default");
-    // It must NOT instruct the brittle "reply with an empty message" anymore.
-    expect(out.toLowerCase()).not.toContain("empty message");
+    expect(out).not.toContain("[[SKIP]]");
   });
 
   test("malicious multiline summary cannot forge a system block", () => {
@@ -78,27 +120,6 @@ describe("renderNudge (prompt-injection boundary)", () => {
     // the override text never appears on its own line
     expect(
       out.split("\n").some((l) => l.trim().startsWith("SYSTEM OVERRIDE")),
-    ).toBe(false);
-  });
-});
-
-describe("isNudgeSilent", () => {
-  test("treats empty, the sentinel, bare SKIP and narrated-emptiness as silence", () => {
-    expect(isNudgeSilent("")).toBe(true);
-    expect(isNudgeSilent("   ")).toBe(true);
-    expect(isNudgeSilent(FOLLOWUP_SKIP_SENTINEL)).toBe(true);
-    expect(isNudgeSilent(`"${FOLLOWUP_SKIP_SENTINEL}"`)).toBe(true);
-    expect(isNudgeSilent("skip")).toBe(true);
-    // The exact failure mode that leaked before (model narrated its emptiness).
-    expect(
-      isNudgeSilent("(empty — the conversation just started and no nudge yet)"),
-    ).toBe(true);
-    expect(isNudgeSilent("(vazio: nada a fazer)")).toBe(true);
-  });
-
-  test("a real proactive message is NOT silence", () => {
-    expect(
-      isNudgeSilent("Oi! Vi que seu pagamento venceu, posso ajudar?"),
     ).toBe(false);
   });
 });
@@ -335,6 +356,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     );
     const claimedDuringInvoke: boolean[] = [];
     class ObservingModel extends BaseChatModel {
+      calls = 0;
       constructor() {
         super({});
       }
@@ -342,10 +364,28 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         return "fake-observing";
       }
       async _generate(): Promise<ChatResult> {
-        claimedDuringInvoke.push(isTurnInFlight(graphThreadId));
+        if (this.calls === 0) {
+          claimedDuringInvoke.push(isTurnInFlight(graphThreadId));
+        }
+        this.calls++;
         return {
           generations: [
-            { text: "Tudo certo?", message: new AIMessage("Tudo certo?") },
+            {
+              text: "",
+              message:
+                this.calls === 1
+                  ? new AIMessage({
+                      content: "",
+                      tool_calls: [
+                        {
+                          name: "finish_nudge",
+                          args: { action: "send", message: "Tudo certo?" },
+                          id: "call_finish_nudge",
+                        },
+                      ],
+                    })
+                  : new AIMessage(""),
+            },
           ],
         };
       }
@@ -420,6 +460,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     );
     const seen: string[] = [];
     class ContextObservingModel extends BaseChatModel {
+      calls = 0;
       constructor() {
         super({});
       }
@@ -428,9 +469,25 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       }
       async _generate(messages: BaseMessage[]): Promise<ChatResult> {
         seen.push(messages.map((m) => String(m.content)).join("\n"));
+        this.calls++;
         return {
           generations: [
-            { text: "Tudo certo?", message: new AIMessage("Tudo certo?") },
+            {
+              text: "",
+              message:
+                this.calls === 1
+                  ? new AIMessage({
+                      content: "",
+                      tool_calls: [
+                        {
+                          name: "finish_nudge",
+                          args: { action: "send", message: "Tudo certo?" },
+                          id: "call_finish_nudge",
+                        },
+                      ],
+                    })
+                  : new AIMessage(""),
+            },
           ],
         };
       }
@@ -572,6 +629,67 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     // The transfer lands before the line now, because the caller cannot deliver until the tool call
     // returns. Chatwoot never shows a status change to the customer.
     expect(s.order).toEqual(["resolve", "message", "label"]);
+  });
+
+  test.each([
+    ["skip", { action: "skip" } as const],
+    [
+      "a different send",
+      { action: "send", message: "Texto posterior incorreto." } as const,
+    ],
+  ])(
+    "handoff customerMessage wins over a later %s terminal decision",
+    async (_label, decision) => {
+      const conversationId = decision.action === "skip" ? 9981 : 9982;
+      await seedConv(conversationId, null);
+      const s = stub();
+      const outcome = await runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        nudge: { source: "followup", kind: "inactivity", step: 1 },
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new HandoffThenNudgeDecisionModel(
+              "Um humano vai te atender.",
+              decision,
+            ) as never,
+          makeClient: s.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      });
+
+      expect(outcome).toBe("messaged");
+      expect(s.messages).toEqual([
+        [conversationId, "Um humano vai te atender."],
+      ]);
+    },
+  );
+
+  test("a terminal skip prevents a later handoff and its customer message", async () => {
+    const conversationId = 9983;
+    await seedConv(conversationId, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:${conversationId}`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new NudgeDecisionThenHandoffModel(
+            "Esta linha posterior não pode sair.",
+          ) as never,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+
+    expect(outcome).toBe("silent");
+    expect(s.messages).toEqual([]);
+    expect(s.resolved).toEqual([]);
   });
 
   test("invokes on the per-contact-inbox memory thread, not the per-conversation thread (unification)", async () => {
@@ -722,9 +840,17 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       "Custa R$ 250,00.",
     ]);
     expect(cut.open.some((m) => isNudgeTurn(m))).toBe(true);
-    expect(cut.open.some((m) => String(m.content) === "Tudo certo?")).toBe(
-      true,
-    );
+    expect(
+      cut.open.some(
+        (m) =>
+          m.getType() === "ai" &&
+          (m as AIMessage).tool_calls?.some(
+            (call) =>
+              call.name === "finish_nudge" &&
+              (call.args as { message?: string }).message === "Tudo certo?",
+          ),
+      ),
+    ).toBe(true);
 
     // The divider is prompt content, and it rides in the nudge's OWN invoke: written separately just
     // before it, the invoke would save the channel it had already loaded and erase it.
@@ -1084,10 +1210,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(logged).toBe(true);
   });
 
-  // Same failure on the proactive path: the tool completes the transfer and the model's next step
-  // throws. The label and the follow-up stamp are deliberately not applied — the turn failed — but
-  // the sentence the customer was promised is the one thing no retry can deliver later.
-  test("a throw after the transfer still delivers the promised line", async () => {
+  test("a throw after the transfer fails closed without a public message", async () => {
     await seedConv(9911, null);
     const s = stub();
     await expect(
@@ -1106,7 +1229,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         },
       }),
     ).rejects.toThrow();
-    expect(s.messages).toEqual([[9911, "Um humano vai te atender."]]);
+    expect(s.messages).toEqual([]);
     expect(s.labelSets).toEqual([]);
   });
 
@@ -1208,11 +1331,9 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     );
   });
 
-  // A follow-up that did not hand off throws on a failed send, so the job's retry can deliver it. A
-  // handed-off one cannot be retried into existence — the transfer set the conversation to `open`,
-  // so the next attempt stops at the ownership gate — and throwing would only cost the operator an
-  // alert on a thread that was correctly handed to a human.
-  test("a proactive handoff whose closing line fails to send does not fail the job", async () => {
+  // The handoff may already have transferred ownership, but a failed closing-line delivery must
+  // remain observable as retryable and must not unlock any deterministic post-actions.
+  test("a proactive handoff whose closing line fails closed without post-actions", async () => {
     await seedConv(9908, null);
     const s = stub();
     const inner = await s.makeClient();
@@ -1239,13 +1360,9 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         persistUsage: async () => {},
       },
     });
-    // "silent", not "messaged": the customer received nothing, and this outcome is what the caller
-    // stamps on the turn trail as an `ok` row. The failure has its own error row (emitted inside
-    // deliverPromisedLine), so reporting a delivery here would be the operator's only record of the
-    // send saying it worked.
-    expect(outcome).toBe("silent");
-    expect(s.labelSets).toEqual([["follow-up"]]);
-    // The resolve still falls with the transfer: the only status call is the handoff's own `open`.
+    expect(outcome).toBe("live-unavailable");
+    expect(s.labelSets).toEqual([]);
+    // The handoff's own status transition already happened; no later resolve post-action ran.
     expect(s.resolved).toEqual([9908]);
     // And the trail carries no `messaged` line for this step. Checked after the run returned, so
     // there is no write left in flight: markFollowUp is called synchronously or not at all.
@@ -1292,9 +1409,8 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     ).rejects.toThrow();
   });
 
-  // And with nothing to say either way, the episode really is silent: the deterministic actions fire
-  // and the customer hears nothing, because there was nothing the transfer promised them.
-  test("a handoff with no closing line and no final text stays silent", async () => {
+  // With no terminal message decision, the output is invalid and deterministic actions remain gated.
+  test("a handoff with no closing line has invalid output and no post-actions", async () => {
     await seedConv(9906, null);
     const s = stub();
     const outcome = await runAgentNudge({
@@ -1310,9 +1426,9 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
         persistUsage: async () => {},
       },
     });
-    expect(outcome).toBe("silent");
+    expect(outcome).toBe("invalid-output");
     expect(s.messages).toEqual([]);
-    expect(s.labelSets).toEqual([["follow-up"]]);
+    expect(s.labelSets).toEqual([]);
     expect(s.resolved).toEqual([9906]);
   });
 
@@ -2355,6 +2471,118 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     );
   });
 
+  test("an unavailable handoff guardrail fails closed without post-actions", async () => {
+    await withGuardrails(
+      {
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        input: { enabled: false },
+        output: {
+          enabled: true,
+          action: "template",
+          checks: {
+            toxicity: true,
+            unsafeContent: false,
+            competitorMentions: false,
+            promptAdherence: false,
+          },
+          templateMessage: "TEMPLATE-NUDGE",
+        },
+      },
+      async () => {
+        await seedConv(9984, null);
+        const s = stub();
+        const outcome = await runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:9984`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          postActions: { assignLabels: ["must-not-apply"], resolve: true },
+          base: appDb,
+          deps: {
+            makeModel: ((cfg: { model: string }) =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    throw new Error("guardrail provider unavailable");
+                  })
+                : (new HandoffThenReplyModel(
+                    "Vou te encaminhar!",
+                    "Um humano vai te atender.",
+                  ) as unknown as BaseChatModel)) as never,
+            makeClient: s.makeClient,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+
+        expect(outcome).toBe("live-unavailable");
+        expect(s.messages).toEqual([]);
+        expect(s.labelSets).toEqual([]);
+      },
+    );
+  });
+
+  test("a handoff delivery exception is retryable and applies no post-actions", async () => {
+    await withGuardrails(
+      {
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        input: { enabled: false },
+        output: {
+          enabled: true,
+          action: "template",
+          checks: {
+            toxicity: true,
+            unsafeContent: false,
+            competitorMentions: false,
+            promptAdherence: false,
+          },
+          templateMessage: "TEMPLATE-NUDGE",
+        },
+      },
+      async () => {
+        await seedConv(9985, null);
+        const s = stub();
+        const inner = await s.makeClient();
+        const client = {
+          ...inner,
+          sendMessage: async () => {
+            throw new Error("chatwoot send failed");
+          },
+        } as unknown as ChatwootClient;
+        const outcome = await runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:9985`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          postActions: { assignLabels: ["must-not-apply"], resolve: true },
+          base: appDb,
+          deps: {
+            makeModel: guardBranch(
+              JSON.stringify({
+                violated: false,
+                categories: [],
+                rationale: "",
+                suggestedReply: null,
+              }),
+              new HandoffThenReplyModel(
+                "Vou te encaminhar!",
+                "Um humano vai te atender.",
+              ) as unknown as BaseChatModel,
+            ) as never,
+            makeClient: async () => client,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+
+        expect(outcome).toBe("live-unavailable");
+        expect(s.messages).toEqual([]);
+        expect(s.labelSets).toEqual([]);
+      },
+    );
+  });
+
   // The 24h window is the second thing this path reads before the judge and spends after it, and it
   // is the one that expires on its own: the ownership recheck above answers "did a human arrive",
   // these two answer "is the window still open". A screening has a 15s ceiling, so at the boundary
@@ -2801,7 +3029,35 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(s.notes).toEqual([]);
   });
 
-  test("skip sentinel → silent (nothing posted)", async () => {
+  test("free-form reasoning without a terminal decision does not leak", async () => {
+    await seedConv(905, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:905`,
+      nudge: { source: "followup", kind: "inactivity" },
+      postActions: { assignLabels: ["must-not-apply"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new LangChainFakeListChatModel({
+            responses: [
+              "The customer has already replied, so I should skip this follow-up. I must not send another message, but I need to inspect the conversation before deciding what to do next.",
+            ],
+          }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("invalid-output");
+    expect(s.messages).toEqual([]);
+    expect(s.notes).toEqual([]);
+    expect(s.labelSets).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  test("skip_reply followed by model text sends nothing", async () => {
     await seedConv(904, null);
     const s = stub();
     const outcome = await runAgentNudge({
@@ -2811,7 +3067,7 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       base: appDb,
       deps: {
         makeModel: () =>
-          new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
+          new SkipThenReplyModel("internal text after skip") as never,
         makeClient: s.makeClient,
         checkpointer: new MemorySaver(),
         persistUsage: async () => {},
@@ -2822,49 +3078,72 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(s.notes).toEqual([]);
   });
 
-  test("narrated-emptiness reply does not leak to the customer", async () => {
-    await seedConv(905, null);
-    const s = stub();
-    const outcome = await runAgentNudge({
-      tenantId,
-      threadId: `${tenantId}:${instanceId}:905`,
-      nudge: { source: "followup", kind: "inactivity" },
-      base: appDb,
-      deps: {
-        makeModel: () =>
-          new FakeListChatModel({
-            responses: ["(empty — nothing to follow up on yet)"],
-          }),
-        makeClient: s.makeClient,
-        checkpointer: new MemorySaver(),
-        persistUsage: async () => {},
-      },
-    });
-    expect(outcome).toBe("silent");
-    expect(s.messages).toEqual([]);
-    expect(s.notes).toEqual([]);
-  });
-
-  test("a stray sentinel is stripped from a real reply before posting", async () => {
+  test("finish_reason=length fails closed after a send tool call", async () => {
     await seedConv(906, null);
     const s = stub();
+    const model = {
+      invoke: async () => new AIMessage(""),
+      bindTools: () => {
+        let calls = 0;
+        return {
+          invoke: async () => {
+            calls++;
+            return calls === 1
+              ? new AIMessage({
+                  content: "",
+                  response_metadata: { finish_reason: "length" },
+                  tool_calls: [
+                    {
+                      name: "finish_nudge",
+                      args: { action: "send", message: "texto truncado" },
+                      id: "call_finish_nudge",
+                    },
+                  ],
+                })
+              : new AIMessage("");
+          },
+        };
+      },
+    };
     const outcome = await runAgentNudge({
       tenantId,
       threadId: `${tenantId}:${instanceId}:906`,
       nudge: { source: "followup", kind: "inactivity" },
       base: appDb,
       deps: {
-        makeModel: () =>
-          new FakeListChatModel({
-            responses: [`Oi! Tudo bem? ${FOLLOWUP_SKIP_SENTINEL}`],
-          }),
+        makeModel: () => model as never,
         makeClient: s.makeClient,
         checkpointer: new MemorySaver(),
         persistUsage: async () => {},
       },
     });
-    expect(outcome).toBe("messaged");
-    expect(s.messages).toEqual([[906, "Oi! Tudo bem?"]]);
+    expect(outcome).toBe("invalid-output");
+    expect(s.messages).toEqual([]);
+  });
+
+  test("appointment reminder and channel redirect share the structured frontier", async () => {
+    for (const [conversationId, source] of [
+      [920, "appointment_reminder"],
+      [921, "channel-redirect"],
+    ] as const) {
+      await seedConv(conversationId, null);
+      const s = stub();
+      const expected = `mensagem ${source}`;
+      const outcome = await runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:${conversationId}`,
+        nudge: { source },
+        base: appDb,
+        deps: {
+          makeModel: () => new FakeListChatModel({ responses: [expected] }),
+          makeClient: s.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      });
+      expect(outcome).toBe("messaged");
+      expect(s.messages).toEqual([[conversationId, expected]]);
+    }
   });
 
   test("post-actions apply on a sent message, AFTER it (message → resolve)", async () => {

@@ -3,6 +3,61 @@ import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import type { ChatResult } from "@langchain/core/outputs";
 
+function hasFinishNudge(tools: unknown): boolean {
+  return (
+    Array.isArray(tools) &&
+    tools.some(
+      (candidate) =>
+        (candidate as { name?: string } | null)?.name === "finish_nudge",
+    )
+  );
+}
+
+function finishNudgeMessage(reply: string): AIMessage {
+  return new AIMessage({
+    content: "",
+    tool_calls: [
+      reply.trim()
+        ? {
+            name: "finish_nudge",
+            args: { action: "send", message: reply.trim() },
+            id: "call_finish_nudge",
+          }
+        : {
+            name: "finish_nudge",
+            args: { action: "skip" },
+            id: "call_finish_nudge",
+          },
+    ],
+  });
+}
+
+export class NudgeReplyModel extends BaseChatModel {
+  constructor(private readonly reply: string) {
+    super({});
+  }
+  _llmType() {
+    return "fake-nudge-reply";
+  }
+  async _generate(): Promise<ChatResult> {
+    return {
+      generations: [{ text: this.reply, message: new AIMessage(this.reply) }],
+    };
+  }
+  override bindTools(tools: BindToolsInput[]) {
+    if (!hasFinishNudge(tools)) return this;
+    const reply = this.reply;
+    let decided = false;
+    return {
+      async invoke(): Promise<AIMessage> {
+        if (decided) return new AIMessage("");
+        decided = true;
+        return finishNudgeMessage(reply);
+      },
+    } as never;
+  }
+}
+
 // A provider that answers 200 with no completion on its first N calls and then works. Extends the
 // REAL BaseChatModel on purpose: the failure of issue #63 is not an error the provider returns, it
 // is a TypeError LangChain raises afterwards reading `generations[0][0].message`, so a hand-built
@@ -17,6 +72,21 @@ export class EmptyThenReplyModel extends BaseChatModel {
   }
   _llmType() {
     return "fake-empty";
+  }
+  override bindTools(tools: BindToolsInput[]) {
+    if (!hasFinishNudge(tools)) return this;
+    const self = this;
+    let decided = false;
+    return {
+      async invoke(input: unknown): Promise<AIMessage> {
+        if (decided) return new AIMessage("");
+        const reply = await self.invoke(input as never);
+        decided = true;
+        return finishNudgeMessage(
+          typeof reply.content === "string" ? reply.content : "",
+        );
+      },
+    } as never;
   }
   async _generate(): Promise<ChatResult> {
     this.calls += 1;
@@ -86,8 +156,20 @@ export class PromptCapturingModel extends BaseChatModel {
   }
   // The graph binds tools before invoking; without this the bound copy is a different object and
   // the turn's own call would be recorded nowhere.
-  override bindTools(_tools: BindToolsInput[]) {
-    return this;
+  override bindTools(tools: BindToolsInput[]) {
+    if (!hasFinishNudge(tools)) return this;
+    const self = this;
+    let decided = false;
+    return {
+      async invoke(input: unknown): Promise<AIMessage> {
+        if (decided) return new AIMessage("");
+        const reply = await self.invoke(input as never);
+        decided = true;
+        return finishNudgeMessage(
+          typeof reply.content === "string" ? reply.content : "",
+        );
+      },
+    } as never;
   }
   async _generate(messages: BaseMessage[]): Promise<ChatResult> {
     const system = messages.find((m) => m.getType() === "system");
@@ -109,20 +191,23 @@ export class ResolveThenReplyModel {
   async invoke(): Promise<AIMessage> {
     return new AIMessage(this.reply);
   }
-  bindTools(_tools: unknown) {
+  bindTools(tools: unknown) {
     const self = this;
     let n = 0;
+    const nudge = hasFinishNudge(tools);
     return {
       async invoke(): Promise<AIMessage> {
         n++;
-        return n === 1
-          ? new AIMessage({
-              content: "",
-              tool_calls: [
-                { name: "resolve_conversation", args: {}, id: "call_resolve" },
-              ],
-            })
-          : new AIMessage(self.reply);
+        if (n === 1) {
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              { name: "resolve_conversation", args: {}, id: "call_resolve" },
+            ],
+          });
+        }
+        if (nudge && n === 2) return finishNudgeMessage(self.reply);
+        return nudge ? new AIMessage("") : new AIMessage(self.reply);
       },
     };
   }
@@ -187,6 +272,95 @@ export class HandoffThenReplyModel {
               ],
             })
           : new AIMessage(self.reply);
+      },
+    };
+  }
+}
+
+// Completes a real handoff, then deliberately violates terminality with another nudge decision.
+// The transfer's structured customerMessage must remain the sole public output.
+export class HandoffThenNudgeDecisionModel {
+  constructor(
+    private customerMessage: string,
+    private decision: { action: "skip" } | { action: "send"; message: string },
+  ) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage("");
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 1) {
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "handoff_to_human",
+                args: { customerMessage: self.customerMessage },
+                id: "call_handoff",
+              },
+            ],
+          });
+        }
+        if (n === 2) {
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "finish_nudge",
+                args: self.decision,
+                id: "call_finish_nudge",
+              },
+            ],
+          });
+        }
+        return new AIMessage("");
+      },
+    };
+  }
+}
+
+// Records a terminal skip first, then tries to hand off with a customer line. The later tool must
+// never transfer or replace the first terminal decision.
+export class NudgeDecisionThenHandoffModel {
+  constructor(private customerMessage: string) {}
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage("");
+  }
+  bindTools(_tools: unknown) {
+    const self = this;
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 1) {
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "finish_nudge",
+                args: { action: "skip" },
+                id: "call_finish_nudge",
+              },
+            ],
+          });
+        }
+        if (n === 2) {
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "handoff_to_human",
+                args: { customerMessage: self.customerMessage },
+                id: "call_handoff",
+              },
+            ],
+          });
+        }
+        return new AIMessage("");
       },
     };
   }

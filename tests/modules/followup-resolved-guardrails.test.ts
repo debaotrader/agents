@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -20,6 +19,7 @@ import {
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import { getJobHandler } from "@/modules/scheduler/worker";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { NudgeReplyModel } from "../utils/scripted-models";
 
 // NOTE: Guardrails da cadeia "follow-up em conversa resolvida" (post da comunidade "Followup indo como
 // conversa privada", 2026-08-06). O incidente: espelho local preso em `pending` (resolve perdido /
@@ -139,11 +139,22 @@ async function mirroredConv(convId: number) {
   });
 }
 
-function stubClient(liveState: () => unknown) {
+function stubClient(liveState: () => unknown, botId = INBOX_A) {
   const sent: Array<[number, string]> = [];
   const notes: Array<[number, string]> = [];
   const client = {
     getConversation: async (_c: number) => liveState(),
+    getMessages: async () => ({
+      payload: [
+        {
+          id: 1,
+          content: "Como posso ajudar?",
+          message_type: 1,
+          private: false,
+          sender: { id: botId, type: "agent_bot" },
+        },
+      ],
+    }),
     sendMessage: async (c: number, t: string) => {
       sent.push([c, t]);
       return {};
@@ -161,8 +172,7 @@ function stubClient(liveState: () => unknown) {
 
 function handlerDeps(s: ReturnType<typeof stubClient>) {
   return {
-    makeModel: () =>
-      new FakeListChatModel({ responses: ["Oi! Ainda posso ajudar?"] }),
+    makeModel: () => new NudgeReplyModel("Oi! Ainda posso ajudar?"),
     makeClient: s.makeClient,
     checkpointer: new MemorySaver(),
     persistUsage: async () => {},
@@ -727,7 +737,10 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
       lastEventAt: new Date(Date.now() - 25 * HOUR),
       lastInboundAt: new Date(Date.now() - 25 * HOUR),
     });
-    const s = stubClient(() => ({ id: CONV, status: "pending", meta: {} }));
+    const s = stubClient(
+      () => ({ id: CONV, status: "pending", meta: {} }),
+      INBOX_B,
+    );
     const result = await followUpHandler(jobFor(CONV), appDb, handlerDeps(s));
 
     // Sequência de 2 steps ENCERRADA no primeiro: done, não reschedule para o step 2.
@@ -863,7 +876,10 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
     body: unknown;
   }
 
-  function wireFetch(conversationBody: () => Record<string, unknown>) {
+  function wireFetch(
+    conversationBody: () => Record<string, unknown>,
+    botId = INBOX_A,
+  ) {
     const calls: WireCall[] = [];
     const fetchImpl = (async (input: URL | RequestInfo, init?: RequestInit) => {
       const url = String(input);
@@ -881,6 +897,25 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
           status: 200,
           headers: { "content-type": "application/json" },
         });
+      }
+      if (method === "GET" && url.endsWith("/messages")) {
+        return new Response(
+          JSON.stringify({
+            payload: [
+              {
+                id: 1,
+                content: "Como posso ajudar?",
+                message_type: 1,
+                private: false,
+                sender: { id: botId, type: "agent_bot" },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          },
+        );
       }
       if (method === "POST" && url.endsWith("/messages")) {
         return new Response("{}", { status: 200 });
@@ -940,8 +975,7 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
 
   function wireDeps(fetchImpl: typeof fetch) {
     return {
-      makeModel: () =>
-        new FakeListChatModel({ responses: ["Oi! Ainda posso ajudar?"] }),
+      makeModel: () => new NudgeReplyModel("Oi! Ainda posso ajudar?"),
       // Client REAL construído com o config resolvido do banco (deployment baseUrl + tokens
       // descriptografados) — só o transporte é fake.
       makeClient: async (
@@ -985,7 +1019,7 @@ describe.skipIf(!dbUp)("follow-up em conversa resolvida — guardrails", () => {
       lastEventAt: new Date(Date.now() - 25 * HOUR),
       lastInboundAt: new Date(Date.now() - 25 * HOUR),
     });
-    const w = wireFetch(() => restShowPayload(CONV, "pending", null));
+    const w = wireFetch(() => restShowPayload(CONV, "pending", null), INBOX_B);
     const result = await followUpHandler(
       jobFor(CONV),
       appDb,

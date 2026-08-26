@@ -101,6 +101,9 @@ export interface HandoffTurnState {
   customerMessage: string | null;
   // The conversation left `pending`, so the human queue owns it and the bot is done talking.
   completed: boolean;
+  // Proactive nudges use the instant the transfer completes to record its customerMessage in the
+  // same first-write-wins terminal state as finish_nudge/skip_reply. Reactive turns do not need it.
+  onCompleted?: (customerMessage: string | null) => void;
 }
 
 // Whether the handoff supplies this turn's customer-facing text, which is the ONE question both
@@ -299,6 +302,7 @@ function handoffTool(ctx: ToolCtx) {
           ctx.handoffState.customerMessage = customerMessage.trim();
         }
         ctx.handoffState.completed = true;
+        ctx.handoffState.onCompleted?.(ctx.handoffState.customerMessage);
       }
 
       // Optional targeting (best-effort: the handoff already happened, so an assignment failure must

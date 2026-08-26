@@ -36,10 +36,21 @@ export interface ChatwootMessageRow {
   inReplyTo: number | null;
   // content_attributes.is_reaction — true when this message is an emoji reaction (content = emoji).
   isReaction: boolean;
+  // REST sender identity. AgentBot messages use type="agent_bot"; human agents use "user";
+  // contacts may use "contact" or omit the type. Missing/malformed identity stays null so callers
+  // that need attribution can fail closed.
+  senderId?: number | null;
+  senderType?: string | null;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function messageList(raw: unknown): unknown[] | null {
+  if (Array.isArray(raw)) return raw;
+  if (isRecord(raw) && Array.isArray(raw.payload)) return raw.payload;
+  return null;
 }
 
 function num(v: unknown): number | null {
@@ -125,11 +136,7 @@ function attachmentTypesFrom(attachments: unknown): string[] {
 // Parses the raw response into normalized rows sorted by id ascending (Chatwoot ids are globally
 // increasing per account, so id order is chronological and drives the watermark comparison).
 export function parseChatwootMessages(raw: unknown): ChatwootMessageRow[] {
-  const list: unknown[] = Array.isArray(raw)
-    ? raw
-    : isRecord(raw) && Array.isArray(raw.payload)
-      ? raw.payload
-      : [];
+  const list = messageList(raw) ?? [];
   const out: ChatwootMessageRow[] = [];
   for (const item of list) {
     if (!isRecord(item)) continue;
@@ -138,6 +145,7 @@ export function parseChatwootMessages(raw: unknown): ChatwootMessageRow[] {
     const ca = isRecord(item.content_attributes)
       ? item.content_attributes
       : null;
+    const sender = isRecord(item.sender) ? item.sender : null;
     out.push({
       id,
       content: typeof item.content === "string" ? item.content : "",
@@ -151,10 +159,83 @@ export function parseChatwootMessages(raw: unknown): ChatwootMessageRow[] {
       location: locationFrom(item.attachments),
       inReplyTo: ca ? num(ca.in_reply_to) : null,
       isReaction: ca?.is_reaction === true,
+      senderId: sender ? num(sender.id) : null,
+      senderType:
+        sender && typeof sender.type === "string"
+          ? sender.type.trim().toLowerCase()
+          : null,
     });
   }
   out.sort((a, b) => a.id - b.id);
   return out;
+}
+
+export interface ChatwootMessagePage {
+  messages: ChatwootMessageRow[];
+  oldestMessageId: number | null;
+}
+
+// Strict page parser for decisions that depend on message authorship. The generic parser above is
+// deliberately tolerant for rendering; eligibility must distinguish malformed data from no data.
+export function parseChatwootMessagesPage(
+  raw: unknown,
+): ChatwootMessagePage | null {
+  const list = messageList(raw);
+  if (!list) return null;
+  const messages = parseChatwootMessages(list);
+  if (messages.length !== list.length) return null;
+  if (new Set(messages.map((message) => message.id)).size !== messages.length) {
+    return null;
+  }
+  return {
+    messages,
+    oldestMessageId: messages[0]?.id ?? null,
+  };
+}
+
+export type LastPublicMessageAttribution =
+  | { kind: "ours"; messageId: number }
+  | { kind: "other"; messageId: number }
+  | { kind: "unknown"; messageId: number }
+  | { kind: "none" };
+
+export function classifyLastPublicMessage(
+  messages: ChatwootMessageRow[],
+  ourAgentBotId: number,
+): LastPublicMessageAttribution {
+  const last = messages.findLast(
+    (message) => !message.private && message.messageType !== "activity",
+  );
+  if (!last) return { kind: "none" };
+  // Chatwoot reactions are public human/contact activity even when older REST payloads omit the
+  // sender object. Their explicit reaction bit is enough to end the unanswered-bot episode.
+  if (last.isReaction) return { kind: "other", messageId: last.id };
+  if (last.messageType === "incoming") {
+    return { kind: "other", messageId: last.id };
+  }
+  if (last.messageType !== "outgoing" && last.messageType !== "template") {
+    return { kind: "unknown", messageId: last.id };
+  }
+  if (last.senderType === "agent_bot" && typeof last.senderId === "number") {
+    return {
+      kind: last.senderId === ourAgentBotId ? "ours" : "other",
+      messageId: last.id,
+    };
+  }
+  if (last.senderType === "user" || last.senderType === "contact") {
+    return { kind: "other", messageId: last.id };
+  }
+  return { kind: "unknown", messageId: last.id };
+}
+
+// Generic follow-up eligibility is intentionally stricter than message rendering: only the bot's
+// own latest public message leaves an unanswered episode to follow up. Activity rows and private
+// notes do not participate; every unknown author/type fails closed.
+export function lastPublicMessageIsFromAgentBot(
+  messages: ChatwootMessageRow[],
+  ourAgentBotId: number,
+): boolean {
+  return classifyLastPublicMessage(messages, ourAgentBotId).kind === "ours";
 }
 
 // Build a quote resolver from a fetched page: message id → its effective text (content, or the STT
