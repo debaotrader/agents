@@ -17,6 +17,7 @@ import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { collectCredentialRefWrites } from "@/modules/agents/credential-paths";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
+import { invalidToolPreconditions } from "@/modules/agents/tool-preconditions";
 import { isOutOfHoursNow, parseSchedule } from "@/modules/business-hours/hours";
 import { renameAgentBots } from "@/modules/chatwoot/provisioning";
 import { invalidateRouteTokenCache } from "@/modules/chatwoot/route-token-cache";
@@ -317,6 +318,72 @@ export class DebugWindowTooLongError extends AppError {
   }
 }
 
+export class InvalidToolPreconditionError extends AppError {
+  constructor(toolName: string) {
+    super(
+      `settings.toolPreconditions.${toolName} is not a valid precondition`,
+      400,
+      "errors.invalidToolPrecondition",
+      { tool: toolName },
+      `toolPreconditions.${toolName}`,
+    );
+  }
+}
+
+// A precondition that does not parse is REFUSED here rather than dropped at turn time, and the two
+// halves are the same parse on purpose. The cost of the other arrangement is specific: the operator
+// saves a rule, the console shows it saved, and the runtime treats the tool as ungoverned — a tool
+// the operator believes is fenced and is not, which is worse than never having offered the fence.
+//
+// Only what the write CHANGES is refused. A bag stored before this shipped keeps its bad entries
+// (dropped at read time) and an unrelated PATCH is not the moment to make the operator fix them,
+// because the field they would have to fix is not the field they came to edit.
+export function assertSettingsToolPreconditions(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const next = invalidToolPreconditions(settings);
+  if (next.length === 0) return;
+  // NOTE: Compared by VALUE, not by name. A name that was already invalid and is now invalid DIFFERENTLY
+  // is an edit, and an edit is exactly what this refuses: comparing name membership would accept the
+  // operator rewriting a broken rule into another broken rule and reading it as saved.
+  // NOTE: The BAG itself being the wrong shape is not a per-name question — `invalidToolPreconditions`
+  // answers it with a synthetic name that appears in neither value map, so a name-wise comparison
+  // finds "unchanged" and lets an array or a string through. Compared as a whole, once.
+  if (next.length === 1 && next[0] === "toolPreconditions") {
+    const nextBag = JSON.stringify(rawPreconditionBag(settings));
+    if (nextBag === JSON.stringify(rawPreconditionBag(stored))) return;
+    throw new InvalidToolPreconditionError("toolPreconditions");
+  }
+  const before = storedPreconditionValues(stored);
+  const now = storedPreconditionValues(settings);
+  const introduced = next.find((name) => now.get(name) !== before.get(name));
+  if (introduced === undefined) return;
+  throw new InvalidToolPreconditionError(introduced);
+}
+
+// The raw entries, serialized, so "did this one change?" is one comparison. `undefined` for a name
+// that is not there, which is what makes an ADDED invalid entry differ from an absent one.
+function rawPreconditionBag(settings: unknown): unknown {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return undefined;
+  }
+  return (settings as Record<string, unknown>).toolPreconditions;
+}
+
+function storedPreconditionValues(settings: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return out;
+  }
+  const bag = (settings as Record<string, unknown>).toolPreconditions;
+  if (!bag || typeof bag !== "object" || Array.isArray(bag)) return out;
+  for (const [name, raw] of Object.entries(bag as Record<string, unknown>)) {
+    out.set(name, JSON.stringify(raw) ?? "undefined");
+  }
+  return out;
+}
+
 // A FALLBACK IS A PROVIDER AND A MODEL, OR IT IS NOTHING — and the write is the only place that can
 // say so, because every reader downstream agrees a half-named block is no fallback and none of them
 // has anywhere to say it.
@@ -605,6 +672,7 @@ export async function updateAgent(
     assertSettingsTextSizes(rest.settings, before?.settings);
     assertSettingsDebugWindow(rest.settings, before?.settings);
     assertSettingsModelFallback(rest.settings, before?.settings, "replace");
+    assertSettingsToolPreconditions(rest.settings, before?.settings);
     // NOTE: Inside the lock and against the same row, for the reason above: "did this write change
     // the ref" has to be asked of the value this write replaces. It also rewrites `rest` in place,
     // so the normalization below copies the canonical bag rather than the submitted one.
@@ -740,6 +808,7 @@ export async function createAgent(
   assertSettingsTextSizes(input.settings, undefined);
   assertSettingsDebugWindow(input.settings, undefined);
   assertSettingsModelFallback(input.settings, undefined, "replace");
+  assertSettingsToolPreconditions(input.settings, undefined);
   const data = parseInput(agentCreateSchema, input);
   validateModelConfigForWrite(data.modelConfig);
   const bhId =

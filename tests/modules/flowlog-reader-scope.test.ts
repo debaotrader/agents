@@ -12,11 +12,28 @@ import { describe, expect, test } from "bun:test";
 //          test of the same file, never another file.
 //   WAIT   even a correctly scoped reader can run before the row lands, because nothing awaits the
 //          write.
+//   CLEAR  a test that EMPTIES the table empties it of the rows that exist. A write the previous case
+//          only scheduled lands after the DELETE, into a table this case believes it owns, and
+//          `orderBy: { id: "asc" }` hands that row back FIRST (issue #375).
 //
-// This file guards the first obligation only, and says so rather than implying a clean bill of
-// health. The second cannot be read off the source: "is there a wait" is a question about control
-// flow, and a poll loop is only correct when the assertion is that a line EXISTS — polling for an
-// absence just spends the timeout before answering. Those live as comments at the call sites.
+// This file guards the first and the third. The second cannot be read off the source: "is there a
+// wait" is a question about control flow, and a poll loop is only correct when the assertion is that
+// a line EXISTS — polling for an absence just spends the timeout before answering. Those live as
+// comments at the call sites.
+//
+// The third is checkable because it has one correct spelling: `clearFlowLog` (tests/utils/flowlog.ts)
+// settles the scheduled writes and then deletes. A raw DELETE is the defect, so the guard is that
+// there are no raw ones rather than a per-site judgement.
+//
+// WHAT IT DOES NOT COVER, said out loud rather than left to be discovered: 29 files end with a loop
+// over a table list, `execution_logs` among the entries and the name interpolated into
+// `DELETE FROM ${table}`, so the literal never sits next to the verb and no widening of the pattern
+// below reaches it. Those are TEARDOWNS — nothing reads the table after them — so they cannot produce
+// the failure this obligation is about. What they can produce is a log line arriving after its tenant
+// was deleted, and that was measured on both sides rather than argued: ONE swallowed
+// `execution_logs_tenant_id_fkey` per full-suite run, in 8 of 8 runs of the base, and converting all
+// 29 loops to a settling helper left it at exactly one. A guard for them would be enforcing a rule
+// with no measured effect, so this file does not pretend to have one.
 //
 // The ledger is per file with a count, following tests/lib/storable-write-sweep.test.ts: a NEW
 // reader in an already-listed file trips this too, not only a new file. The classification is the
@@ -146,7 +163,12 @@ export function flowlogReaders(source: string): Reader[] {
 //               emit in the path, so neither obligation applies
 //   tenant-wide the subject is the table, not a turn. Scoping would defeat the assertion: the
 //               retention sweep proves WHICH rows survived it, which only an exhaustive read of the
-//               tenant can say. Safe because the file holds a single test.
+//               tenant can say. This entry USED to justify itself with "the file holds a single
+//               test", which was true of one of the four files carrying it — the others hold 7, 18
+//               and 23, and all four empty the table between cases. What makes it safe is the CLEAR
+//               obligation above, not the file being short: a tenant-wide reader answers with
+//               whatever is in the tenant, so it is exactly the reader that cannot survive a clear
+//               that left a neighbour's row behind.
 type Scoping = "turn" | "agent" | "seeded" | "tenant-wide";
 
 export function isScoped(reader: Reader, scoping: Scoping): boolean {
@@ -173,6 +195,7 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/flowlog-debug-mode-e2e.test.ts": 2,
   "tests/modules/flowlog-detail-pii.test.ts": 1,
   "tests/modules/flowlog-retention.test.ts": 1,
+  "tests/modules/flowlog-settle.test.ts": 1,
   "tests/modules/flowlog.test.ts": 1,
   "tests/modules/guardrail-health.test.ts": 1,
   "tests/modules/memory-compaction.test.ts": 3,
@@ -182,6 +205,7 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/stt.test.ts": 1,
   "tests/modules/tts-normalize-observability.test.ts": 1,
   "tests/modules/terminal-failure-announces.test.ts": 1,
+  "tests/modules/tool-precondition-alerting.test.ts": 1,
   "tests/modules/tts.test.ts": 2,
   "tests/modules/vision-retry.test.ts": 1,
   "tests/modules/webhooks-outbound-dead-alert.test.ts": 1,
@@ -194,6 +218,39 @@ const FLOWLOG_READERS: Record<string, number> = {
 //
 // The one file the scan skips, because its fixtures below are unscoped reads written on purpose.
 const SELF = "tests/modules/flowlog-reader-scope.test.ts";
+
+// A clear of `execution_logs` written by hand, in any spelling a test has reached for. `TRUNCATE` is
+// listed because it is the same act under a different verb, and a guard that only knew `DELETE`
+// would wave it through. `\s` inside the pattern rather than a literal space for the same reason
+// the scan below is whole-file: `executionLog\n  .deleteMany(…)` and a `DELETE\nFROM execution_logs`
+// inside a template literal are what the formatter produces on a long enough line, and a predicate
+// run per line would report the file as clean.
+const RAW_CLEAR =
+  /executionLog\s*\.\s*deleteMany\s*\(|(?:DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+"?execution_logs"?/gi;
+
+export function rawClearLines(src: string): number[] {
+  const out: number[] = [];
+  // A fresh regex per call: a `g` pattern carries `lastIndex` between calls, so a shared instance
+  // would start the second file mid-way through and miss whatever sits before that offset.
+  const re = new RegExp(RAW_CLEAR.source, "gi");
+  for (;;) {
+    const hit = re.exec(src);
+    if (!hit) return out;
+    // The line the match STARTS on, counted from the offset rather than from a per-line loop, which
+    // is what lets the match itself span lines.
+    out.push(src.slice(0, hit.index).split("\n").length);
+  }
+}
+
+// `clearFlowLog` is the one correct spelling. Three files are exempt and each for its own reason:
+// the helper IS the spelling; the settle file's subject is what a clear that does not settle leaves
+// behind, so it has to write the wrong one to assert what it costs; and this file, like the reader
+// scan above it, holds fixtures of the very thing it flags.
+const CLEAR_EXEMPT = new Set([
+  "tests/utils/flowlog.ts",
+  "tests/modules/flowlog-settle.test.ts",
+  SELF,
+]);
 
 async function scanTests(): Promise<Map<string, Reader[]>> {
   const { Glob } = await import("bun");
@@ -315,5 +372,82 @@ describe("every flow-log reader in the suite is accounted for", () => {
       }
     }
     expect(unscoped).toEqual([]);
+  });
+});
+
+describe("nothing empties the flow log by hand", () => {
+  test("it flags a raw deleteMany and a raw DELETE, and both spellings of TRUNCATE", () => {
+    expect(
+      rawClearLines("await db.executionLog.deleteMany({ where });"),
+    ).toEqual([1]);
+    expect(
+      rawClearLines(
+        "await db.$executeRawUnsafe(`DELETE FROM execution_logs WHERE x`);",
+      ),
+    ).toEqual([1]);
+    expect(
+      rawClearLines('await db.$executeRawUnsafe("TRUNCATE execution_logs");'),
+    ).toEqual([1]);
+    expect(
+      rawClearLines(
+        'await db.$executeRawUnsafe(`TRUNCATE TABLE "execution_logs"`);',
+      ),
+    ).toEqual([1]);
+  });
+
+  test("the spellings the formatter produces do not escape it", () => {
+    // The hole round 1 of review found, pinned. The predicate was applied per line, so any clear the
+    // formatter had broken across lines read as clean — and these are not exotic spellings, they are
+    // what Biome emits once the chain or the template is long enough.
+    expect(
+      rawClearLines("await suDb.executionLog\n  .deleteMany({ where });"),
+    ).toEqual([1]);
+    expect(
+      rawClearLines(
+        "await db.$executeRawUnsafe(`DELETE\n  FROM execution_logs\n  WHERE x`);",
+      ),
+    ).toEqual([1]);
+    expect(
+      rawClearLines(
+        "const a = 1;\nconst b = 2;\nawait db.executionLog.deleteMany({ w });",
+      ),
+    ).toEqual([3]);
+    // Two of them, so the scan cannot stop at the first and call the rest of the file clean.
+    expect(
+      rawClearLines(
+        "await db.executionLog.deleteMany({ a });\nawait db.executionLog.deleteMany({ b });",
+      ),
+    ).toEqual([1, 2]);
+  });
+
+  test("it does not flag the helper call, nor another table's clear", () => {
+    // The positive control above is what makes this line mean something: a predicate that flagged
+    // nothing would pass this test and the sweep below without reading anything.
+    expect(rawClearLines("await clearFlowLog(suDb, { tenantId });")).toEqual(
+      [],
+    );
+    expect(
+      rawClearLines("await suDb.alertDelivery.deleteMany({ where });"),
+    ).toEqual([]);
+    expect(
+      rawClearLines(
+        "await suDb.$executeRawUnsafe(`DELETE FROM alert_deliveries WHERE x`);",
+      ),
+    ).toEqual([]);
+  });
+
+  test("every clear in the suite goes through clearFlowLog", async () => {
+    const { Glob } = await import("bun");
+    const offenders: string[] = [];
+    for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
+      const path = `tests/${rel}`;
+      if (CLEAR_EXEMPT.has(path)) continue;
+      for (const line of rawClearLines(await Bun.file(path).text())) {
+        offenders.push(`${path}:${line}`);
+      }
+    }
+    // A raw clear empties the table of the rows that exist and of nothing else, so the case that runs
+    // next inherits whatever the case before it had only scheduled. `clearFlowLog` settles first.
+    expect(offenders).toEqual([]);
   });
 });

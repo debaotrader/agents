@@ -10,6 +10,7 @@ import {
 import { type AuthUser, authPlugin } from "@/api/lib/auth";
 import { translate } from "@/api/lib/i18n";
 import { doc, errors } from "@/api/lib/openapi";
+import { parseQueryCount, parseQueryId } from "@/api/lib/query-filters";
 import config from "@/config";
 import { UnauthorizedError } from "@/lib/errors";
 import {
@@ -36,7 +37,12 @@ function resolveScope(
   paramTenantId: string | undefined,
 ): bigint | null {
   if (user.role === "SUPER_ADMIN") {
-    return paramTenantId ? BigInt(paramTenantId) : null;
+    // NOTE: `=== undefined`, not truthiness. `?tenantId=` is what the Users-tab filter submits when
+    // its select is cleared, and reading it as "no filter" answers a request narrowed to one tenant
+    // with the WHOLE FLEET. And `parseQueryId`, never `BigInt`: that spelling accepts an id past
+    // 2^63-1 and lets Postgres answer the malformed value with a 500.
+    if (paramTenantId === undefined) return null;
+    return parseQueryId(paramTenantId, "tenantId") ?? null;
   }
   return user.tenantId;
 }
@@ -84,7 +90,7 @@ export const adminController = new Elysia({
         "Admin stats",
         "Return user and admin counts for the resolved tenant scope.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .get(
@@ -94,7 +100,7 @@ export const adminController = new Elysia({
       // response stays a single shape and the treaty type for `data.users` is non-optional.
       const user = await getAuthUser();
       if (!user) throw new UnauthorizedError();
-      const page = Number(query.page) || 1;
+      const page = parseQueryCount(query.page, "page") ?? 1;
       const search = query.search?.trim() || undefined;
       const result = await getUsers(
         resolveScope(user, query.tenantId),
@@ -136,7 +142,7 @@ export const adminController = new Elysia({
         "List users",
         "Return a paginated, optionally filtered list of users.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .patch(
@@ -361,7 +367,7 @@ export const adminController = new Elysia({
         "List invitations",
         "Return pending invitations for the resolved tenant scope.",
       ),
-      response: errors(401, 403),
+      response: errors(400, 401, 403),
     },
   )
   .delete(

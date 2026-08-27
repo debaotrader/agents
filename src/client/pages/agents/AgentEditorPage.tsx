@@ -105,6 +105,10 @@ import {
 } from "./observabilityFormState";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
+import {
+  parseToolPreconditionRows,
+  serializeToolPreconditions,
+} from "./ToolPreconditionsEditor";
 import { ToolsTab } from "./ToolsTab";
 import { readTtsFormState, ttsSettingsFrom } from "./ttsFormState";
 import type {
@@ -112,6 +116,7 @@ import type {
   HandoffUiState,
   Hours,
   ToolCatalog,
+  ToolPreconditionRow,
   ToolSelectionView,
   VaultEntry,
 } from "./types";
@@ -306,6 +311,7 @@ function readBehaviorState(a: Agent) {
     customAttributeInstructions: str(tg.set_custom_attribute),
     labelInstructions: str(tg.assign_label),
     updateKanbanTaskInstructions: str(tg.update_kanban_task),
+    toolPreconditions: parseToolPreconditionRows(s.toolPreconditions),
     businessHoursId: a.businessHoursId ?? "",
     followUpHoursId: a.followUpHoursId ?? "",
     settings: s,
@@ -742,6 +748,11 @@ function AgentEditor() {
   const [labelInstructions, setLabelInstructions] = useState("");
   // Operator usage guidance for update_kanban_task (Tools-tab config). Persisted in
   // agent.settings.toolGuidance.update_kanban_task; synced only by syncToolConfig.
+  // Per-tool preconditions (Tools tab, same lifecycle as the guidance above). Held as a LIST while
+  // editing and stored as a map keyed by tool name — see ToolPreconditionsEditor.
+  const [toolPreconditions, setToolPreconditions] = useState<
+    ToolPreconditionRow[]
+  >([]);
   const [updateKanbanTaskInstructions, setUpdateKanbanTaskInstructions] =
     useState("");
   // Model config (flattened). Cost tracking comes from Langfuse, so there is no
@@ -864,6 +875,7 @@ function AgentEditor() {
     setCustomAttributeInstructions(b.customAttributeInstructions);
     setLabelInstructions(b.labelInstructions);
     setUpdateKanbanTaskInstructions(b.updateKanbanTaskInstructions);
+    setToolPreconditions(b.toolPreconditions);
   }, []);
 
   // Full reset of the general + behavior form state from a synced agent. Used on load and discard-all
@@ -1281,6 +1293,7 @@ function AgentEditor() {
       customAttributeInstructions,
       labelInstructions,
       updateKanbanTaskInstructions,
+      toolPreconditions,
     }),
     knowledge: canonicalGrants(grants.filter((g) => g.source === "RAG")),
   };
@@ -2260,11 +2273,16 @@ function AgentEditor() {
       if (updateKanbanNote)
         toolGuidanceJson.update_kanban_task = updateKanbanNote;
       else delete toolGuidanceJson.update_kanban_task;
+      const toolPreconditionsJson = serializeToolPreconditions(
+        toolPreconditions,
+        syncedSettings.toolPreconditions,
+      );
       const toolsSettings = {
         ...syncedSettings,
         handoff: handoffJson,
         kanban: kanbanJson,
         toolGuidance: toolGuidanceJson,
+        toolPreconditions: toolPreconditionsJson,
       };
       // The WHOLE bag, not just this tab's fields: the PATCH resends every block, so text typed on
       // another tab would refuse it just the same — after the grants had already been written.
@@ -2323,6 +2341,10 @@ function AgentEditor() {
         handoff: handoffJson,
         kanban: kanbanJson,
         toolGuidance: toolGuidanceJson,
+        // The SAME value that was just written, not a recomputation. Left out, the shared bag keeps
+        // the pre-save map, and the next Behavior save spreads it back over the rules that were just
+        // stored — with the Tools tab still showing them as saved.
+        toolPreconditions: toolPreconditionsJson,
       }));
       markSynced(String(agentRes.data.agent.updatedAt));
       bumpSync("tools", "knowledge");
@@ -2912,6 +2934,8 @@ function AgentEditor() {
                 labelInstructions={labelInstructions}
                 setLabelInstructions={setLabelInstructions}
                 updateKanbanTaskInstructions={updateKanbanTaskInstructions}
+                toolPreconditions={toolPreconditions}
+                setToolPreconditions={setToolPreconditions}
                 setUpdateKanbanTaskInstructions={
                   setUpdateKanbanTaskInstructions
                 }
