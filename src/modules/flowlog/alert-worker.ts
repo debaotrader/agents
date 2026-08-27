@@ -146,7 +146,8 @@ async function claimDue(
           AND (
             (a2.next_attempt_at IS NOT NULL AND a2.next_attempt_at <= now())
             OR (a2.next_attempt_at IS NULL
-                AND a2.created_at <= now() - make_interval(secs => ${coalesceSeconds}))
+                AND (${coalesceSeconds} = 0
+                     OR a2.created_at <= now() - make_interval(secs => ${coalesceSeconds})))
           )
           ${tenantClause}
         ORDER BY a2.next_attempt_at NULLS FIRST, a2.id
